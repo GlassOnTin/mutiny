@@ -11,6 +11,7 @@ use gtk4::prelude::*;
 use mutiny::action::{ACTIONS, build_menubar_model, by_slug};
 use mutiny::app::AppController;
 use mutiny::config::{self, Overrides};
+use mutiny::http_mcp::{self, HttpMcpConfig};
 use mutiny::ipc::{
     ConsentMode, IpcRequest, IpcResponse, agent_socket_path, default_audit_path,
     default_socket_path, send_request,
@@ -62,6 +63,17 @@ struct Cli {
     /// GUI only: start empty instead of restoring the saved session.
     #[arg(long)]
     no_restore: bool,
+
+    /// GUI only: serve authenticated MCP over HTTP on this address. Off by
+    /// default. Name an explicit interface (a WireGuard or SSH-tunneled IP);
+    /// a wildcard bind is refused. Requires a pairing token.
+    #[arg(long)]
+    http_bind: Option<std::net::SocketAddr>,
+
+    /// GUI only: pairing token for --http-bind. Generated and printed once if
+    /// omitted. Clients send it as `Authorization: Bearer <token>`.
+    #[arg(long)]
+    http_token: Option<String>,
 
     #[command(subcommand)]
     command: Option<TopCommand>,
@@ -280,6 +292,10 @@ fn main() -> ExitCode {
             cli.shell,
             cli.agent_consent.into(),
             cli.no_restore,
+            cli.http_bind.map(|bind| HttpOptions {
+                bind,
+                token: cli.http_token,
+            }),
             Overrides {
                 font_family: cli.font,
                 font_size: cli.font_size,
@@ -452,12 +468,20 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
     }
 }
 
+/// GUI-only settings for the authenticated HTTP MCP carrier. Grouped into one
+/// argument so the listener stays optional without widening `run_gui_app`.
+struct HttpOptions {
+    bind: std::net::SocketAddr,
+    token: Option<String>,
+}
+
 fn run_gui_app(
     socket_path: PathBuf,
     initial_cwd: Option<PathBuf>,
     shell_prog: Option<String>,
     agent_consent: ConsentMode,
     no_restore: bool,
+    http: Option<HttpOptions>,
     overrides: Overrides,
 ) -> ExitCode {
     if socket_path.exists()
@@ -514,6 +538,39 @@ fn run_gui_app(
         }
     }
 
+    // Authenticated HTTP MCP carrier. Off unless explicitly bound, and it
+    // forwards to the agent socket only, so a network peer can never be
+    // assigned Operator.
+    let mut http_handle = None;
+    if let Some(http) = http {
+        let token = match http.token {
+            Some(token) => token,
+            None => match http_mcp::generate_token() {
+                Ok(token) => {
+                    eprintln!("mutiny: HTTP MCP pairing token: {token}");
+                    token
+                }
+                Err(err) => {
+                    // An empty token is refused by spawn, so a failed CSPRNG
+                    // read leaves the listener down rather than open.
+                    eprintln!("warning: could not generate a pairing token: {err}");
+                    String::new()
+                }
+            },
+        };
+        match http_mcp::spawn(HttpMcpConfig {
+            bind: http.bind,
+            token,
+            agent_socket: agent_socket_path(&socket_path),
+        }) {
+            Ok(handle) => {
+                eprintln!("mutiny: HTTP MCP listening on {}", handle.local_addr);
+                http_handle = Some(handle);
+            }
+            Err(err) => eprintln!("warning: HTTP MCP listener not started: {err}"),
+        }
+    }
+
     let ctrl_startup = Rc::clone(&controller);
     app.connect_startup(move |gtk_app| {
         ctrl_startup.attach_gtk_app(gtk_app);
@@ -542,6 +599,9 @@ fn run_gui_app(
     });
 
     let code = app.run_with_args::<&str>(&[]);
+    if let Some(mut handle) = http_handle {
+        handle.stop();
+    }
     // Save on clean exit. A crash loses changes since the last save, which is
     // the accepted consequence of having no multiplexer daemon.
     if let Err(err) = controller.save_session() {

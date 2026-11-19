@@ -485,7 +485,7 @@ impl MutinyWindow {
             };
             let title = ws
                 .pane(tab.active_pane)
-                .map(|e| format!("Mutiny — {}", e.title()))
+                .map(|e| format!("Mutiny: {}", e.title()))
                 .unwrap_or_else(|| String::from("Mutiny"));
             (
                 wm.menubar_visible,
@@ -582,7 +582,7 @@ impl MutinyWindow {
             if let Some(ap) = wm.active_pane().and_then(|p| ws.pane(p)) {
                 self.inner
                     .gtk_window
-                    .set_title(Some(&format!("Mutiny — {}", ap.title())));
+                    .set_title(Some(&format!("Mutiny: {}", ap.title())));
             }
             wm.active_tab
         };

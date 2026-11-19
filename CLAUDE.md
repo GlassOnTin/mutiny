@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v16). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore is shipped; the next rung is the quick terminal, then the authenticated HTTP MCP listener. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v17). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; the next rung is the quick terminal. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,8 +14,9 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 103 tests: 61 unit + 7 config + 11 e2e + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 110 tests: 65 unit + 7 config + 11 e2e + 3 http + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
+cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
@@ -108,6 +109,16 @@ Processes are never restored. That is the no-daemon contract, not a missing feat
 Save is atomic (temp file plus rename) and happens on clean exit in `main.rs`, not in `shutdown_ipc`, so tests do not write to the user's real state directory. Tests must call `set_session_path` with a temp path. Load rejects an unknown version and reports corrupt files rather than half-restoring.
 
 `replay_scrollback` feeds plain text through `advance_bytes`, so it fabricates no command records or prompt markers. Text containing a literal ESC could be reinterpreted on replay; that is a known edge of text-only restore.
+
+### The HTTP carrier is a third path with a lower ceiling
+
+`src/http_mcp.rs` is a carrier, not a second MCP implementation: it authenticates, then hands the body to `McpBridge::handle_line`, the same JSON-RPC handler stdio uses. It runs on its own threads (one per connection, 5 s IO timeouts) because it must not touch the `Rc`/`RefCell` GUI state; it reaches the controller only through the agent Unix socket.
+
+The never-Operator guarantee is structural. `HttpMcpConfig` carries an `agent_socket` and nothing else, so there is no code path from this module to the operator socket. The effective mode is whatever `--agent-consent` pinned at launch. Do not add an operator path here, and do not let a JSON-RPC body field influence the mode.
+
+Pairing is checked before the body is read, so an unpaired client cannot make the listener allocate or forward. `validate_bind` refuses a wildcard address. Token comparison is length-independent over equal-length slices.
+
+Two limits to keep in view. Requests are stateless (no MCP session id), so `initialize`'s client name does not persist and every call audits as `http-peer`. And because the agent socket sees the mutiny process as the peer, all HTTP clients share one `PeerIdentity`; under `ask`, one Allow Session tap would grant them all. Per-peer identity for this carrier is unfinished work, not a solved problem.
 
 ### Damage-driven redraw
 

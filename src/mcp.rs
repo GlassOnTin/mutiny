@@ -128,56 +128,55 @@ impl McpBridge {
             if n == 0 {
                 break;
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            if let Some(reply) = self.handle_line(&line) {
+                writer.write_all(reply.as_bytes())?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
             }
-
-            let parsed: Result<JsonRpcRequest, _> = serde_json::from_str(trimmed);
-            let req = match parsed {
-                Ok(r) => r,
-                Err(err) => {
-                    let reply = JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id: Value::Null,
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32700,
-                            message: format!("invalid JSON-RPC payload: {err}"),
-                        }),
-                    };
-                    serde_json::to_writer(&mut *writer, &reply)?;
-                    writer.write_all(b"\n")?;
-                    writer.flush()?;
-                    continue;
-                }
-            };
-
-            let Some(id) = req.id.clone() else {
-                // JSON-RPC notifications (e.g. notifications/initialized) produce no response.
-                continue;
-            };
-
-            let reply = match self.dispatch(&req.method, &req.params) {
-                Ok(result) => JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(result),
-                    error: None,
-                },
-                Err((code, message)) => JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: None,
-                    error: Some(JsonRpcError { code, message }),
-                },
-            };
-
-            serde_json::to_writer(&mut *writer, &reply)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
         }
         Ok(())
+    }
+
+    /// Handles one JSON-RPC line and returns the serialized reply, or None for
+    /// a notification or blank line. Shared by the stdio transport and the
+    /// HTTP carrier so both speak identical JSON-RPC.
+    pub fn handle_line(&mut self, line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
+            Ok(req) => req,
+            Err(err) => {
+                let reply = JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: Value::Null,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("invalid JSON-RPC payload: {err}"),
+                    }),
+                };
+                return serde_json::to_string(&reply).ok();
+            }
+        };
+        // Notifications (e.g. notifications/initialized) produce no response.
+        let id = req.id.clone()?;
+        let reply = match self.dispatch(&req.method, &req.params) {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err((code, message)) => JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(JsonRpcError { code, message }),
+            },
+        };
+        serde_json::to_string(&reply).ok()
     }
 
     fn call_ipc(

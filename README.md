@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore is shipped; quick terminal and authenticated HTTP MCP remain. The engine, pane mobility, and agent surface are covered by 103 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 110 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -21,8 +21,9 @@ Working today:
 - A ring of the last eight exited panes keeps the final screen and exit code, so a session that fails on startup is still diagnosable.
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
-- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 21 IPC verbs, 17 MCP tools, 4 MCP resources, held at parity by tests.
+- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 22 IPC verbs, 18 MCP tools, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
 - Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
+- An authenticated HTTP MCP listener, off by default, so a peer such as Haven can drive the desktop terminal from a phone. It refuses an unpaired client and can never assign Operator. See [Remote agents over HTTP](#remote-agents-over-http).
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
@@ -40,6 +41,7 @@ Not built yet:
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
 - Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
+- The HTTP MCP carrier is a slice: no SSE, no session management, and no per-peer identity, so all HTTP clients share one grant identity. It has not been tested against a real Haven client over a tunnel.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
 
@@ -124,6 +126,33 @@ Override the operator path with `--socket` or `MUTINY_SOCKET`; the agent path is
 The GUI flag `--agent-consent ask|paired|observe-only` (default `ask`) pins the mode the agent carrier assigns. It is an operator-side grant. A bridge cannot raise it.
 
 Identifiers are stable regardless of the public product name, which is still open: application id `dev.mutiny.Terminal`, environment `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID`, MCP resources under `ui://mutiny/*`.
+
+### Remote agents over HTTP
+
+Nothing listens on the network unless you ask for it. `--http-bind` names an explicit interface address, normally a WireGuard or SSH-tunneled IP:
+
+```sh
+mutiny --http-bind 100.64.0.5:8730 --agent-consent paired
+# mutiny: HTTP MCP pairing token: 9f2c...   (generated once, printed to stderr)
+```
+
+A wildcard bind (`0.0.0.0` or `[::]`) is refused, because the listener is meant to sit on a named interface rather than every interface. Pass `--http-token` to supply your own token; otherwise one is generated from the kernel CSPRNG and printed once.
+
+Clients POST JSON-RPC to `/mcp` with `Authorization: Bearer <token>`:
+
+```sh
+curl -s http://100.64.0.5:8730/mcp \
+  -H 'Authorization: Bearer 9f2c...' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+An unpaired client gets `401` before its body is read, so it cannot make the listener allocate or forward anything. Only `POST /mcp` is served; anything else is `404`.
+
+**A network client can never be assigned Operator.** The listener forwards to the agent socket only, and the agent carrier's mode is pinned at GUI launch by `--agent-consent`. This module has no path to the operator socket at all, so the guarantee is structural rather than a check that could be forgotten. A `consent_mode` field in the JSON-RPC body is ignored, exactly as it is refused on the Unix envelope.
+
+This is a bounded slice. Each request is stateless: there is no MCP session id, so the name sent in `initialize` does not persist and every call is audited as `http-peer`. SSE streaming, session management, and `DELETE` are not implemented.
+
+One trust gap is worth stating plainly. The agent socket sees the mutiny process as the peer, so every HTTP client shares one peer identity. Session grants key on that identity, which means an Allow Session tap under `--agent-consent ask` would grant every HTTP client rather than the one that prompted. Prefer `paired` (one token, one trust level) or `observe-only` for a network listener until per-peer identity exists for this carrier.
 
 ## Configuration
 
@@ -228,10 +257,12 @@ Ask mode fails closed when no GUI window is open to present a prompt. Consent ch
 
 One limit is worth stating plainly: same-uid processes are mutually trusted under the Unix model. Any process running as you can reach the operator socket and act as the operator. The uid check closes the cross-user hole, not that one.
 
+The HTTP carrier adds a third path with a lower ceiling. It reaches the agent socket only, so the mode pinned by `--agent-consent` is the most a network peer can ever hold, and Operator is unreachable by construction. Pairing is a bearer token checked before the body is read.
+
 ## Development
 
 ```sh
-cargo test                    # 103 tests, no display required
+cargo test                    # 110 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

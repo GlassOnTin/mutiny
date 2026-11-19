@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod engine;
 pub mod graphics;
+pub mod http_mcp;
 pub mod ipc;
 pub mod mcp;
 pub mod notify;

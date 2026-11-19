@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v16, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. **M1 is complete.** M2 is open: session restore is shipped; quick terminal and the authenticated HTTP MCP listener remain.
+Status: draft v17, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. **M1 is complete.** M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal and Tier 3 standing policies remain.
 
 ## Thesis
 
@@ -78,7 +78,9 @@ Two carriers, because one socket cannot serve both trust paths:
 
 - **Operator socket** (`$XDG_RUNTIME_DIR/mutiny.sock`). A same-uid peer is assigned `Operator`. `mutiny ctl` arrives here. The human running it *is* the consent.
 - **Agent socket** (`mutiny-agent.sock` beside it). Every connection is assigned the mode the operator pinned at GUI launch with `--agent-consent` (default `ask`). `mutiny mcp` arrives here by default. A bridge's own `--consent` flag is a local ceiling it enforces before forwarding; it can be more restrictive than the carrier, never less. A bridge asking for `paired` against an `observe-only` carrier is denied and audited.
-- **Network (M2, forward-looking).** `Paired` only after an explicit pairing token, bound to an explicitly configured interface. A network transport can never assign `Operator`.
+- **Network (M2, shipped as a bounded slice).** Authenticated streamable-HTTP MCP, off unless `--http-bind` names an explicit interface; a wildcard bind is refused. Every request must carry the pairing token, checked before the body is read. It forwards to the agent socket only, so the mode pinned by `--agent-consent` is the most a network peer can hold and `Operator` is unreachable by construction rather than by a check.
+
+The network carrier inherits the agent carrier's ceiling and adds one gap of its own. The agent socket sees the mutiny process as the peer, so every HTTP client shares one `PeerIdentity`, and a session grant under `ask` would apply to all of them. Until per-peer identity exists for this carrier, `paired` or `observe-only` is the honest configuration for a network listener. Requests are stateless in this slice, so the name sent in `initialize` does not persist and every call audits as `http-peer`.
 
 Session grants key on a kernel-verified `PeerIdentity` (uid, pid, and `/proc` start time), never on the `client` label. The label is display and audit text; it is not an input to the consent decision at all, so there is no value it could take that would make a grant apply. Start time is included so a recycled pid does not inherit a dead process's grant. A grant therefore lives as long as the granted process: restarting an MCP bridge requires re-approval, which is the intended trade. The audit records the peer alongside the label, so the trail shows which process actually acted.
 
@@ -114,11 +116,11 @@ One thread, one 4 ms tick, no async runtime. Deferred replies are queues holding
 A plan needs a diagnosis. Against the M0 bootstrap commit:
 
 - **Commitment 1, engine: exercising well.** Chunked OSC 133 capture across read boundaries and scrollback rotation, OSC 7 cwd, OSC 9;4 progress, quiescence, and named-key encoding are implemented and tested. Two claims are ahead of the code. "Line-level damage tracking" exists as `has_damaged_lines`/`reset_damage` with no callers, so rendering is full-frame. The Kitty encoder honours disambiguation and report-all-keys, not all five flags.
-- **Commitment 2, off-widget state: shipped and load-bearing.** Detach and move preserve scrollback and the running child, verified by test. The seam is split geometry: `SplitNode.ratio` is carried through tree surgery but never applied to the `GtkPaned`, and user drags are not written back.
+- **Commitment 2, off-widget state: shipped and load-bearing.** Detach and move preserve scrollback and the running child, verified by test. Split geometry is closed: `SplitNode.ratio` is applied to the `GtkPaned`, written back on drag, and carried through tree surgery and session restore. The GTK gesture wiring itself is still not covered by tests; the model operations it calls are.
 - **Commitment 3, desktop citizenship: partly unverified.** SSD is left to KWin by construction and the chrome controls persist. The KDE global menu export has not been checked at runtime on a Plasma session; treat it as unproven until it is.
-- **Commitment 4, presence: shipped for Tiers 1 and 2, trust boundary in place.** Snapshots, search, exited ring, notices, and the audit viewer work. Consent mode is carrier-assigned, peer uid is checked, session grants bind to kernel-verified peer identity, and the audit is durable. Remaining: Tiers 3 and 4 are not implemented, and same-uid processes remain mutually trusted on the operator carrier.
-- **Commitment 5, one binary: shipped.** Three entry points, two carriers, MCP as adapter. The envelope carries a version and refuses a mismatch; MCP `initialize` negotiates against a supported revision set instead of echoing.
-- **Commitment 6, parity: test-locked, not generated.** 21 IPC verbs, 17 MCP tools, 4 static resources. `list_actions` and `ui://mutiny/actions` close the slug-discovery hole; `read_screen_text` and `wait_prompt` close the two verbs that previously had no MCP counterpart. Tests assert both directions of the mapping. The four lists are still hand-maintained.
+- **Commitment 4, presence: shipped for Tiers 1 and 2, trust boundary in place.** Snapshots, search, exited ring, notices, and the audit viewer work. Consent mode is carrier-assigned, peer uid is checked, session grants bind to kernel-verified peer identity, and the audit is durable. A third path now exists: the authenticated HTTP carrier reaches the agent socket only, so a network peer can never hold `Operator`. Remaining: Tiers 3 and 4 are not implemented, same-uid processes remain mutually trusted on the operator carrier, and all HTTP clients share one peer identity, so a grant under `ask` would cover all of them.
+- **Commitment 5, one binary: shipped.** Three entry points, two Unix carriers plus an optional HTTP carrier, MCP as adapter. The envelope carries a version and refuses a mismatch; MCP `initialize` negotiates against a supported revision set instead of echoing.
+- **Commitment 6, parity: test-locked, not generated.** 22 IPC verbs, 18 MCP tools, 4 static resources plus a per-pane snapshot resource. `list_actions` and `ui://mutiny/actions` close the slug-discovery hole; `read_screen_text` and `wait_prompt` close the two verbs that previously had no MCP counterpart. Tests assert both directions of the mapping. The four lists are still hand-maintained.
 
 ## Juxtapositions: surfaces that look unified and are not
 
@@ -233,10 +235,19 @@ Processes are not restored, and that is the contract rather than a gap: there is
 
 Evidence: `tests/session_restore.rs` builds a three-pane session with distinct cwds and history, saves it, restores into a fresh controller, and asserts window/tab/pane identity, tree shape and both split ratios, per-pane grid size, cwd, and scrollback content. It then writes a command to a restored pane and asserts a fresh shell executes it, making the no-daemon contract visible. A second test asserts a missing file restores nothing and a corrupt file is reported without half-restoring. Disabling scrollback replay makes the first test fail.
 
-**Next rung: quick terminal.** A Yakuake-style drop-down via `gtk4-layer-shell`, toggled over IPC/MCP or a global shortcut.
-- Authenticated streamable-HTTP MCP listener, off by default, bound to an explicitly configured WireGuard or SSH-tunneled interface, with pairing tokens and rate-capped Tier 3 standing policies.
+**Shipped rung: the authenticated HTTP MCP listener.** `src/http_mcp.rs` serves `POST /mcp` on an explicitly named interface, off unless `--http-bind` is passed. A wildcard bind is refused. Every request needs `Authorization: Bearer <token>`, compared before the body is read; the token is supplied with `--http-token` or generated from the kernel CSPRNG and printed once. It authenticates on its own threads and forwards to the agent Unix socket through the same `McpBridge::handle_line` stdio uses, so it is a carrier rather than a second implementation.
 
-Done when: the quick terminal toggles from a global shortcut, and the HTTP listener refuses an unpaired client and can never assign `Operator`. Session restore is already met.
+A network client can never be assigned `Operator`. The config carries an agent socket path and nothing else, so no code path reaches the operator socket, and the effective mode is whatever `--agent-consent` pinned at launch. This is the composition joint for Haven driving the desktop terminal from a phone.
+
+Evidence: `tests/http_mcp_carrier.rs` asserts that no token and a wrong token both get 401 while the right token is served, that a `consent_mode: operator` field in the JSON-RPC body changes nothing and the audit records the carrier as the pinned agent mode, that a refused request adds no audited verb, and that an `observe-only` carrier denies an Act verb over HTTP. Both security assertions were mutation-checked: wiring the carrier to the operator socket fails two tests with `"carrier":"operator"` in the audit, and removing the pairing gate fails two tests with a 200 where 401 was required. Four unit tests cover wildcard refusal, token comparison, token generation, and spawn validation. The real binary was also driven under Xvfb: 401 without a token, 401 with a wrong one, 200 with the right one, `initialize` negotiating 2025-06-18, `list_workspace` returning the live tree, `GET` refused with 404, and an Act verb under the default `ask` carrier timing out on the consent prompt rather than acting.
+
+Limits of the slice, stated rather than implied: no SSE streaming, no MCP session management, no `DELETE`. Requests are stateless, so `initialize`'s client name does not persist and every call audits as `http-peer`. All HTTP clients share one `PeerIdentity` because the agent socket sees this process as the peer, so a session grant under `ask` would cover all of them; per-peer identity for this carrier is unfinished. It has not been exercised against a real Haven client over a WireGuard or SSH tunnel, only over loopback.
+
+**Next rung: quick terminal.** A Yakuake-style drop-down via `gtk4-layer-shell`, toggled over IPC/MCP or a global shortcut.
+
+Still open in M2: rate-capped Tier 3 standing policies, and per-peer identity for the network carrier.
+
+Done when: the quick terminal toggles from a global shortcut. Session restore and the HTTP listener's refusal and never-Operator conditions are already met.
 
 ## Contracts that must not drift
 
