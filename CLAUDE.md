@@ -93,6 +93,12 @@ OSC 10/11 report `reported_bg` / `reported_fg`, which the controller sets from c
 
 `query_replies_sent()` counts replies. The fish startup test asserts it is non-zero, which is what makes the test discriminate: some fish versions time out their queries and proceed anyway, so "fish ran a command" alone passes even with responses disabled.
 
+### PTY teardown is bounded
+
+alacritty's `Pty::drop` sends SIGHUP and then blocks in `child.wait()`. A shell that does not exit on SIGHUP hangs teardown forever. This surfaced as a CI hang in tests that create and drop several PTYs, and it would hang app shutdown the same way. `PaneEngine` now implements `Drop`: SIGHUP, poll `waitpid(WNOHANG)` for up to 100 ms, then SIGKILL and reap. Reaping here makes alacritty's later `wait()` return ECHILD instead of blocking.
+
+Do not remove that Drop or replace it with a plain SIGHUP. Exit-code capture is unaffected because `drain_pty` observes `ChildExited` before the engine is dropped.
+
 ### Session restore
 
 `src/session.rs` captures geometry by reusing the live `WindowModel`/`SplitNode` types, so ratios and tree shape serialize verbatim rather than being re-derived. Pane content is title, cwd, grid size, and scrollback as plain text. `Workspace::restore_from_session` replaces the model with saved ids and counters; `AppController::restore_session` spawns the engines first, then installs the tree that references them.

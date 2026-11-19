@@ -337,6 +337,36 @@ pub struct PaneEngine {
     search: Option<ScrollbackSearch>,
 }
 
+impl Drop for PaneEngine {
+    fn drop(&mut self) {
+        // alacritty's Pty::drop sends SIGHUP and then blocks in child.wait().
+        // A shell that does not exit on SIGHUP hangs shutdown forever, which
+        // showed up as a CI hang in tests that create and drop several PTYs.
+        // Give it a short grace period, then escalate to SIGKILL so teardown
+        // is always bounded. Reaping here makes the later wait() return
+        // ECHILD instead of blocking.
+        let Some(pty) = self.pty.as_ref() else {
+            return;
+        };
+        let pid = pty.child().id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGHUP);
+        }
+        for _ in 0..20 {
+            let mut status = 0i32;
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid || reaped < 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
 impl PaneEngine {
     pub fn new_headless(cols: usize, rows: usize) -> Self {
         Self::new_headless_with_scrollback(cols, rows, 10_000)
