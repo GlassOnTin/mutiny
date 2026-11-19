@@ -67,6 +67,15 @@ pub enum ConsentResolution {
     Deny,
 }
 
+/// One relay carrier for an HTTP peer token. The identity is assigned when the
+/// operator configures the peer, not by anything the remote client sends.
+struct HttpPeerCarrier {
+    listener: UnixListener,
+    path: PathBuf,
+    identity: PeerIdentity,
+    label: String,
+}
+
 pub struct AppController {
     pub workspace: RefCell<Workspace>,
     gtk_app: RefCell<Option<gtk4::Application>>,
@@ -75,6 +84,9 @@ pub struct AppController {
     socket_path: RefCell<Option<PathBuf>>,
     agent_listener: RefCell<Option<UnixListener>>,
     agent_socket_path: RefCell<Option<PathBuf>>,
+    /// One relay carrier per HTTP peer token, each assigning a distinct
+    /// token-derived identity. Empty unless the HTTP listener is enabled.
+    http_peers: RefCell<Vec<HttpPeerCarrier>>,
     /// Mode the agent carrier assigns to every connection it accepts. Pinned
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
@@ -147,6 +159,7 @@ impl AppController {
             ipc_listener: RefCell::new(None),
             socket_path: RefCell::new(None),
             agent_listener: RefCell::new(None),
+            http_peers: RefCell::new(Vec::new()),
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
@@ -313,6 +326,27 @@ impl AppController {
         Ok(())
     }
 
+    /// Binds a relay carrier for one HTTP peer token, assigning the identity
+    /// that token maps to. The HTTP carrier connects here after verifying the
+    /// token, so the identity is fixed by operator configuration rather than
+    /// anything the remote client writes. Grants and audit key on it, which is
+    /// what makes two peers distinguishable.
+    pub fn start_http_peer_listener(
+        &self,
+        path: &Path,
+        token: &str,
+        label: &str,
+    ) -> io::Result<()> {
+        let listener = bind_socket(path)?;
+        self.http_peers.borrow_mut().push(HttpPeerCarrier {
+            listener,
+            path: path.to_path_buf(),
+            identity: PeerIdentity::for_token(token, server_uid()),
+            label: label.to_owned(),
+        });
+        Ok(())
+    }
+
     /// Binds the agent carrier and pins the mode it assigns. Separate from the
     /// operator socket so an agent transport can never arrive on the carrier
     /// that grants `Operator`.
@@ -332,6 +366,9 @@ impl AppController {
         *self.agent_listener.borrow_mut() = None;
         if let Some(path) = self.agent_socket_path.borrow_mut().take() {
             let _ = std::fs::remove_file(path);
+        }
+        for peer in self.http_peers.borrow_mut().drain(..) {
+            let _ = std::fs::remove_file(peer.path);
         }
     }
 
@@ -957,9 +994,29 @@ impl AppController {
     /// same-uid peer; the agent socket assigns the mode the operator pinned at
     /// launch. Neither reads a mode from the request.
     fn accept_ipc_clients(self: &Rc<Self>) {
-        self.accept_carrier(&self.ipc_listener, ConsentMode::Operator, "ctl");
+        self.accept_carrier(&self.ipc_listener, ConsentMode::Operator, "ctl", None);
         let agent_mode = self.agent_mode.get();
-        self.accept_carrier(&self.agent_listener, agent_mode, "mcp-agent");
+        self.accept_carrier(&self.agent_listener, agent_mode, "mcp-agent", None);
+        self.accept_http_peer_carriers(agent_mode);
+    }
+
+    /// Services one carrier per HTTP peer token. Each assigns the identity its
+    /// token was verified for, so two peers are distinct in the audit trail and
+    /// in the grant set. The mode is the agent carrier's, never `Operator`.
+    fn accept_http_peer_carriers(self: &Rc<Self>, agent_mode: ConsentMode) {
+        let peers = self.http_peers.borrow();
+        for peer in peers.iter() {
+            loop {
+                let accepted = peer.listener.accept();
+                match accepted {
+                    Ok((stream, _)) => {
+                        self.handle_accepted(stream, agent_mode, &peer.label, Some(peer.identity))
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     fn accept_carrier(
@@ -967,6 +1024,7 @@ impl AppController {
         cell: &RefCell<Option<UnixListener>>,
         carrier: ConsentMode,
         default_label: &str,
+        identity_override: Option<PeerIdentity>,
     ) {
         loop {
             let accepted = {
@@ -978,7 +1036,9 @@ impl AppController {
             };
 
             match accepted {
-                Ok((stream, _)) => self.handle_accepted(stream, carrier, default_label),
+                Ok((stream, _)) => {
+                    self.handle_accepted(stream, carrier, default_label, identity_override)
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
@@ -990,6 +1050,7 @@ impl AppController {
         mut stream: UnixStream,
         carrier: ConsentMode,
         default_label: &str,
+        identity_override: Option<PeerIdentity>,
     ) {
         // Identity comes from the kernel, before anything the client wrote is
         // trusted. A peer from another uid is refused outright.
@@ -1014,7 +1075,11 @@ impl AppController {
                 return;
             }
         };
-        let peer = PeerIdentity::from_credentials(&cred);
+        // A token-peer carrier assigns the identity it verified the token for.
+        // The kernel check above still applies: the relaying process must be
+        // same-uid. The remote client never chooses this identity, it only
+        // presents a token, and the token-to-carrier mapping is fixed at launch.
+        let peer = identity_override.unwrap_or_else(|| PeerIdentity::from_credentials(&cred));
 
         let env_req = match read_envelope(&mut stream) {
             Ok(env) => env,

@@ -561,6 +561,16 @@ pub struct PeerIdentity {
     pub uid: u32,
     pub pid: i32,
     pub start_time: u64,
+    /// Set when the peer's credential is a pairing token rather than a kernel
+    /// uid/pid, as on the HTTP carrier. HTTP has no `SO_PEERCRED` equivalent, so
+    /// the token is the credential and this fingerprint is the identity derived
+    /// from it. `pid` stays 0, which is never a live process, so a token peer can
+    /// neither collide with nor inherit a Unix process's grant.
+    ///
+    /// Absent for kernel-verified peers and for entries written before this
+    /// field existed, so the trail stays loadable and unchanged for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_peer: Option<u64>,
 }
 
 impl PeerIdentity {
@@ -569,8 +579,43 @@ impl PeerIdentity {
             uid: cred.uid,
             pid: cred.pid,
             start_time: process_start_time(cred.pid),
+            token_peer: None,
         }
     }
+
+    /// Identity for a peer authenticated by a pairing token. Assigned by the
+    /// carrier that verified the token, never chosen by the client.
+    pub fn for_token(token: &str, uid: u32) -> Self {
+        Self {
+            uid,
+            pid: 0,
+            start_time: 0,
+            token_peer: Some(token_fingerprint(token)),
+        }
+    }
+
+    /// True when this identity came from a pairing token rather than the kernel.
+    pub fn is_token_peer(&self) -> bool {
+        self.token_peer.is_some()
+    }
+}
+
+/// Stable 64-bit FNV-1a over the token bytes.
+///
+/// Not a cryptographic hash, deliberately: the fingerprint is an identifier,
+/// not a secret, and it is only ever computed from a token the carrier has
+/// already accepted by exact constant-time comparison. An attacker cannot
+/// present an arbitrary token to aim at a collision, so collision resistance
+/// buys nothing here. FNV-1a is chosen because it is tiny, dependency-free, and
+/// fixed for all time, which matters for a durable trail: identities must stay
+/// comparable across restarts and compiler versions.
+pub fn token_fingerprint(token: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in token.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Field 22 of `/proc/<pid>/stat`: clock ticks since boot at process start.
@@ -953,6 +998,7 @@ mod tests {
             uid: 1000,
             pid,
             start_time,
+            token_peer: None,
         }
     }
 
@@ -1002,6 +1048,56 @@ mod tests {
             consent_outcome(ConsentTier::Act, ConsentMode::Ask, recycled, &grants, true),
             ConsentOutcome::Park
         );
+    }
+
+    /// Per-peer consent attribution: a grant installed for one HTTP peer must
+    /// not cover another, and a token peer must never collide with a process.
+    #[test]
+    fn token_peer_grants_are_per_peer_and_never_cross_to_a_process() {
+        use crate::action::ConsentTier;
+        use std::collections::HashSet;
+
+        let a = PeerIdentity::for_token("token-a", 1000);
+        let b = PeerIdentity::for_token("token-b", 1000);
+        assert_ne!(a, b, "two tokens must be two identities");
+        assert_eq!(
+            a,
+            PeerIdentity::for_token("token-a", 1000),
+            "stable across calls"
+        );
+        assert!(a.is_token_peer() && b.is_token_peer());
+        assert_eq!(a.pid, 0, "a token peer is not a process");
+        assert!(!peer(111, 5_000).is_token_peer());
+        assert_ne!(a, peer(111, 5_000));
+
+        let mut grants = HashSet::new();
+        grants.insert(a);
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Ask, a, &grants, true),
+            ConsentOutcome::Allow(AuditDecision::ApprovedSession),
+            "the granted peer acts"
+        );
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Ask, b, &grants, true),
+            ConsentOutcome::Park,
+            "another peer must still be asked"
+        );
+        // A process peer does not inherit a token peer's grant either.
+        assert_eq!(
+            consent_outcome(
+                ConsentTier::Act,
+                ConsentMode::Ask,
+                peer(111, 5_000),
+                &grants,
+                true
+            ),
+            ConsentOutcome::Park
+        );
+        // Observe-only still denies a token peer regardless of any grant.
+        assert!(matches!(
+            consent_outcome(ConsentTier::Act, ConsentMode::ObserveOnly, a, &grants, true),
+            ConsentOutcome::Deny(_)
+        ));
     }
 
     #[test]

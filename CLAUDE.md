@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v17). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; the next rung is the quick terminal. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v18). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; the next rung is the quick terminal. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 110 tests: 65 unit + 7 config + 11 e2e + 3 http + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 114 tests: 68 unit + 7 config + 11 e2e + 4 http + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test detach_split                  # single test, by name substring
@@ -118,7 +118,11 @@ The never-Operator guarantee is structural. `HttpMcpConfig` carries an `agent_so
 
 Pairing is checked before the body is read, so an unpaired client cannot make the listener allocate or forward. `validate_bind` refuses a wildcard address. Token comparison is length-independent over equal-length slices.
 
-Two limits to keep in view. Requests are stateless (no MCP session id), so `initialize`'s client name does not persist and every call audits as `http-peer`. And because the agent socket sees the mutiny process as the peer, all HTTP clients share one `PeerIdentity`; under `ask`, one Allow Session tap would grant them all. Per-peer identity for this carrier is unfinished work, not a solved problem.
+Per-peer identity works by giving each token its own relay carrier. `start_http_peer_listener` binds one Unix socket per configured peer and fixes a `PeerIdentity::for_token` on it; `accept_http_peer_carriers` accepts on each with that identity as an override, still after the same-uid kernel check. The HTTP carrier authenticates the token, then dials that peer's socket. So the identity is assigned by a carrier, exactly as on the Unix path, and nothing the remote client writes can select it. `PeerIdentity.token_peer` carries a stable FNV-1a fingerprint of the token; `pid` stays 0 so a token peer can never collide with or inherit a process's grant. Because `consent_outcome` already keys grants on `PeerIdentity`, per-peer grants came free with per-peer identity.
+
+Do not collapse these back into one socket: that is precisely the shared-identity bug, and `two_peer_tokens_produce_two_distinct_audit_identities` fails if you do.
+
+Two limits remain. Requests are stateless (no MCP session id), so `initialize`'s client name does not persist; calls audit under the peer's configured label. And the consent *mode* is still one setting for the whole listener, because every relay carrier reads the same `agent_mode`. Per-peer mode means storing a mode per `HttpPeerCarrier` and a CLI way to set it; the identity and grant half is done.
 
 ### Damage-driven redraw
 
@@ -252,7 +256,7 @@ These look closer to done than they are:
 - **No in-app settings UI.** The TOML file is the only config surface.
 - **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Processes are never restored, by contract.
 - **No quick terminal yet (M2).**
-- **The HTTP MCP carrier is a slice.** No SSE, session management, or DELETE. Requests are stateless, so every call audits as `http-peer`. All HTTP clients share one `PeerIdentity`, so a session grant under `ask` covers all of them; `paired` or `observe-only` is the honest configuration until per-peer identity exists. Driven end to end from Haven on a phone over an SSH local forward: unpaired 401, paired 200, a command sent and its output read back, `spawn_pane` and `present_notice` accepted, and both Act verbs denied when the carrier was pinned to `observe-only`. Also driven over a real WireGuard tunnel with the listener bound to the workstation's WG address, so both named transports are exercised.
+- **The HTTP MCP carrier is a slice.** No SSE, session management, or DELETE. Requests are stateless. Identity and session grants are per token, but the consent mode is one setting for the whole listener, so one peer cannot be `paired` while another is `observe-only`. Driven end to end from Haven on a phone over an SSH local forward: unpaired 401, paired 200, a command sent and its output read back, `spawn_pane` and `present_notice` accepted, and both Act verbs denied when the carrier was pinned to `observe-only`. Also driven over a real WireGuard tunnel with the listener bound to the workstation's WG address, so both named transports are exercised.
 - **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.
 - **Tests skip when prerequisites are absent.** CI installs fish and asserts `fish --version`, and runs under Xvfb with CJK/emoji fonts, so the fish, IME, and graphics render tests execute there. Locally the fish test needs `MUTINY_TEST_FISH` or fish on PATH, and the GTK tests need a display.
 - **The release workflow is unexercised.** `.github/workflows/release.yml` is tag-triggered and gated on CI, but no tag has been pushed.

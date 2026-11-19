@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 110 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 114 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -41,7 +41,7 @@ Not built yet:
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
 - Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
-- The HTTP MCP carrier is a slice: no SSE, no session management, and no per-peer identity, so all HTTP clients share one grant identity. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
+- The HTTP MCP carrier is a slice: no SSE and no session management. Peer identity and session grants are per token; the consent mode is still one setting for the whole listener. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
 
@@ -154,7 +154,18 @@ An unpaired client gets `401` before its body is read, so it cannot make the lis
 
 This is a bounded slice. Each request is stateless: there is no MCP session id, so the name sent in `initialize` does not persist and every call is audited as `http-peer`. SSE streaming, session management, and `DELETE` are not implemented.
 
-One trust gap is worth stating plainly. The agent socket sees the mutiny process as the peer, so every HTTP client shares one peer identity. Session grants key on that identity, which means an Allow Session tap under `--agent-consent ask` would grant every HTTP client rather than the one that prompted. Prefer `paired` (one token, one trust level) or `observe-only` for a network listener until per-peer identity exists for this carrier.
+HTTP has no `SO_PEERCRED` equivalent, so the pairing token is the peer credential. Name each peer and give it its own token:
+
+```sh
+mutiny --http-bind 10.1.0.4:18740 \
+  --http-peer phone=9f2c... \
+  --http-peer laptop=4b71... \
+  --agent-consent ask
+```
+
+Each peer gets its own relay carrier and its own identity, derived from its token. The audit trail records that identity rather than mutiny's pid, so two devices are distinguishable, and session grants key on it: an Allow Session tap for one peer does not cover another. A peer cannot choose its identity, only present a token; the mapping is fixed by your configuration at launch. `--http-token` still works for a single unnamed peer.
+
+One gap remains. The consent *mode* is one setting for the whole listener, so you cannot yet make one peer `paired` and another `observe-only`. Per-peer mode needs a mode per relay carrier; the identity and grant half is done.
 
 #### Driving it from Haven
 
@@ -294,7 +305,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 110 tests, no display required
+cargo test                    # 114 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

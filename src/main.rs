@@ -11,7 +11,7 @@ use gtk4::prelude::*;
 use mutiny::action::{ACTIONS, build_menubar_model, by_slug};
 use mutiny::app::AppController;
 use mutiny::config::{self, Overrides};
-use mutiny::http_mcp::{self, HttpMcpConfig};
+use mutiny::http_mcp::{self, HttpMcpConfig, HttpPeer};
 use mutiny::ipc::{
     ConsentMode, IpcRequest, IpcResponse, agent_socket_path, default_audit_path,
     default_socket_path, send_request,
@@ -70,10 +70,17 @@ struct Cli {
     #[arg(long)]
     http_bind: Option<std::net::SocketAddr>,
 
-    /// GUI only: pairing token for --http-bind. Generated and printed once if
-    /// omitted. Clients send it as `Authorization: Bearer <token>`.
+    /// GUI only: pairing token for --http-bind, as a single unnamed peer.
+    /// Generated and printed once if omitted and no --http-peer is given.
+    /// Clients send it as `Authorization: Bearer <token>`.
     #[arg(long)]
     http_token: Option<String>,
+
+    /// GUI only: a named peer for --http-bind, as `label=token`. Repeatable.
+    /// Each peer gets its own identity in the audit trail and its own session
+    /// grants, so two devices holding different tokens are distinguishable.
+    #[arg(long = "http-peer", value_name = "LABEL=TOKEN")]
+    http_peers: Vec<String>,
 
     #[command(subcommand)]
     command: Option<TopCommand>,
@@ -295,6 +302,7 @@ fn main() -> ExitCode {
             cli.http_bind.map(|bind| HttpOptions {
                 bind,
                 token: cli.http_token,
+                peers: cli.http_peers,
             }),
             Overrides {
                 font_family: cli.font,
@@ -470,9 +478,24 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
 
 /// GUI-only settings for the authenticated HTTP MCP carrier. Grouped into one
 /// argument so the listener stays optional without widening `run_gui_app`.
+/// Relay socket for HTTP peer `index`, beside the agent socket. One per peer so
+/// each carrier can assign that peer's own identity.
+fn http_peer_socket_path(agent_socket: &std::path::Path, index: usize) -> PathBuf {
+    let stem = agent_socket
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("mutiny-agent"));
+    let name = format!("{stem}-peer-{index}.sock");
+    match agent_socket.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 struct HttpOptions {
     bind: std::net::SocketAddr,
     token: Option<String>,
+    peers: Vec<String>,
 }
 
 fn run_gui_app(
@@ -538,33 +561,63 @@ fn run_gui_app(
         }
     }
 
-    // Authenticated HTTP MCP carrier. Off unless explicitly bound, and it
-    // forwards to the agent socket only, so a network peer can never be
-    // assigned Operator.
+    // Authenticated HTTP MCP carrier. Off unless explicitly bound. Each peer
+    // token gets its own relay carrier and identity, and every relay carries the
+    // agent mode, so a network peer can never be assigned Operator.
     let mut http_handle = None;
     if let Some(http) = http {
-        let token = match http.token {
-            Some(token) => token,
-            None => match http_mcp::generate_token() {
-                Ok(token) => {
-                    eprintln!("mutiny: HTTP MCP pairing token: {token}");
-                    token
+        let mut specs: Vec<(String, String)> = Vec::new();
+        for raw in &http.peers {
+            match raw.split_once('=') {
+                Some((label, token)) if !label.trim().is_empty() && !token.is_empty() => {
+                    specs.push((label.trim().to_owned(), token.to_owned()));
                 }
-                Err(err) => {
-                    // An empty token is refused by spawn, so a failed CSPRNG
-                    // read leaves the listener down rather than open.
-                    eprintln!("warning: could not generate a pairing token: {err}");
-                    String::new()
-                }
-            },
-        };
+                _ => eprintln!("warning: ignoring --http-peer {raw:?}: expected LABEL=TOKEN"),
+            }
+        }
+        if specs.is_empty() {
+            let token = match http.token {
+                Some(token) => token,
+                None => match http_mcp::generate_token() {
+                    Ok(token) => {
+                        eprintln!("mutiny: HTTP MCP pairing token: {token}");
+                        token
+                    }
+                    Err(err) => {
+                        // An empty token is refused by validate_peers, so a
+                        // failed CSPRNG read leaves the listener down, not open.
+                        eprintln!("warning: could not generate a pairing token: {err}");
+                        String::new()
+                    }
+                },
+            };
+            specs.push((String::from("http-peer"), token));
+        }
+
+        let agent_base = agent_socket_path(&socket_path);
+        let mut peers = Vec::new();
+        for (index, (label, token)) in specs.iter().enumerate() {
+            let path = http_peer_socket_path(&agent_base, index);
+            match controller.start_http_peer_listener(&path, token, label) {
+                Ok(()) => peers.push(HttpPeer {
+                    label: label.clone(),
+                    token: token.clone(),
+                    socket: path,
+                }),
+                Err(err) => eprintln!("warning: HTTP peer {label:?} not started: {err}"),
+            }
+        }
+        let labels: Vec<String> = peers.iter().map(|p| p.label.clone()).collect();
         match http_mcp::spawn(HttpMcpConfig {
             bind: http.bind,
-            token,
-            agent_socket: agent_socket_path(&socket_path),
+            peers,
         }) {
             Ok(handle) => {
-                eprintln!("mutiny: HTTP MCP listening on {}", handle.local_addr);
+                eprintln!(
+                    "mutiny: HTTP MCP listening on {} for peers: {}",
+                    handle.local_addr,
+                    labels.join(", ")
+                );
                 http_handle = Some(handle);
             }
             Err(err) => eprintln!("warning: HTTP MCP listener not started: {err}"),

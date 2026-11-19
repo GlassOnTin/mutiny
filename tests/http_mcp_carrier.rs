@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use mutiny::app::AppController;
 use mutiny::config::Overrides;
-use mutiny::http_mcp::{HttpMcpConfig, spawn};
+use mutiny::http_mcp::{HttpMcpConfig, HttpPeer, spawn};
 use mutiny::ipc::{ConsentMode, IpcRequest, IpcResponse, send_request};
 use serde_json::{Value, json};
 
@@ -51,16 +51,30 @@ struct Harness {
 }
 
 fn harness(tag: &str, agent_mode: ConsentMode) -> Harness {
+    harness_peers(tag, agent_mode, &[("http-peer", TOKEN)])
+}
+
+/// One relay carrier per peer, so each token maps to its own identity.
+fn harness_peers(tag: &str, agent_mode: ConsentMode, spec: &[(&str, &str)]) -> Harness {
     let dir = std::env::temp_dir().join(format!("mutiny-http-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let operator_sock = dir.join("mutiny.sock");
     let agent_sock = dir.join("mutiny-agent.sock");
 
+    let peers: Vec<HttpPeer> = spec
+        .iter()
+        .enumerate()
+        .map(|(i, (label, token))| HttpPeer {
+            label: (*label).to_owned(),
+            token: (*token).to_owned(),
+            socket: dir.join(format!("mutiny-agent-peer-{i}.sock")),
+        })
+        .collect();
+
     let handle = spawn(HttpMcpConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
-        token: TOKEN.to_owned(),
-        agent_socket: agent_sock.clone(),
+        peers: peers.clone(),
     })
     .expect("spawn http");
     let http_addr = handle.local_addr;
@@ -80,6 +94,10 @@ fn harness(tag: &str, agent_mode: ConsentMode) -> Harness {
         ctrl.start_ipc_listener(&op).expect("operator listener");
         ctrl.start_agent_listener(&ag, agent_mode)
             .expect("agent listener");
+        for peer in &peers {
+            ctrl.start_http_peer_listener(&peer.socket, &peer.token, &peer.label)
+                .expect("peer relay listener");
+        }
         ctrl.create_window(None).expect("pane");
         while stop_rx.try_recv().is_err() {
             ctrl.poll_once();
@@ -268,4 +286,96 @@ fn observe_only_agent_carrier_denies_act_over_http() {
         "observe-only must deny Act: {body}"
     );
     assert!(body.contains("observe-only"));
+}
+
+const TOKEN_A: &str = "peer-token-aaaaaaaaaaaaaaaaaaaa";
+const TOKEN_B: &str = "peer-token-bbbbbbbbbbbbbbbbbbbb";
+
+/// The rung's Done-when: two peer tokens must be two identities in the durable
+/// trail, not one shared mutiny pid.
+#[test]
+fn two_peer_tokens_produce_two_distinct_audit_identities() {
+    let h = harness_peers(
+        "two-identities",
+        ConsentMode::Paired,
+        &[("phone", TOKEN_A), ("laptop", TOKEN_B)],
+    );
+    let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}).to_string();
+
+    assert_eq!(post(h.http_addr, Some(TOKEN_A), &call).0, 200);
+    assert_eq!(post(h.http_addr, Some(TOKEN_B), &call).0, 200);
+    thread::sleep(Duration::from_millis(200));
+
+    let entries = audit_entries(&h);
+    let peer_entries = |label: &str| -> Vec<Value> {
+        entries
+            .iter()
+            .filter(|e| e["client"] == json!(label))
+            .cloned()
+            .collect()
+    };
+    let phone = peer_entries("phone");
+    let laptop = peer_entries("laptop");
+    assert!(
+        !phone.is_empty(),
+        "phone calls must be audited: {entries:?}"
+    );
+    assert!(
+        !laptop.is_empty(),
+        "laptop calls must be audited: {entries:?}"
+    );
+
+    // Each peer's identity is the fingerprint of its own token.
+    assert_eq!(
+        phone[0]["peer"]["token_peer"],
+        json!(mutiny::ipc::token_fingerprint(TOKEN_A)),
+        "identity must be derived from the presented token: {}",
+        phone[0]
+    );
+    assert_eq!(
+        laptop[0]["peer"]["token_peer"],
+        json!(mutiny::ipc::token_fingerprint(TOKEN_B))
+    );
+    assert_ne!(
+        phone[0]["peer"]["token_peer"], laptop[0]["peer"]["token_peer"],
+        "two tokens must give two distinct audit identities"
+    );
+
+    // Stable within a peer, and not the relaying process's pid.
+    for entry in &phone {
+        assert_eq!(entry["peer"]["token_peer"], phone[0]["peer"]["token_peer"]);
+        assert_eq!(
+            entry["peer"]["pid"],
+            json!(0),
+            "a token peer is not a process"
+        );
+    }
+    for entry in phone.iter().chain(laptop.iter()) {
+        assert_ne!(
+            entry["carrier"],
+            json!("operator"),
+            "never Operator: {entry}"
+        );
+        assert_eq!(entry["carrier"], json!("paired"));
+    }
+
+    // A token outside the configured set is still refused, and reaches no verb.
+    let before = entries.len();
+    assert_eq!(
+        post(h.http_addr, Some("peer-token-cccccccccccccccccccc"), &call).0,
+        401
+    );
+    thread::sleep(Duration::from_millis(150));
+    let after = audit_entries(&h);
+    let dispatched = |es: &[Value]| {
+        es.iter()
+            .filter(|e| e["client"] == json!("phone") || e["client"] == json!("laptop"))
+            .count()
+    };
+    assert_eq!(
+        dispatched(&after),
+        dispatched(&entries),
+        "refused token reached a verb"
+    );
+    assert!(after.len() >= before);
 }

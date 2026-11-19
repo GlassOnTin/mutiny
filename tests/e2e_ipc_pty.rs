@@ -646,6 +646,7 @@ impl PeerProcess {
             uid: server_uid(),
             pid: self.pid as i32,
             start_time: mutiny::ipc::process_start_time(self.pid as i32),
+            token_peer: None,
         }
     }
 
