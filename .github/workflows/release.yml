@@ -52,7 +52,7 @@ jobs:
           name="mutiny-${GITHUB_REF_NAME}-linux-x86_64"
           mkdir -p "dist/$name"
           cp target/release/mutiny "dist/$name/"
-          cp LICENSE "dist/$name/"
+          cp LICENSE NOTICE "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           ls -l dist
