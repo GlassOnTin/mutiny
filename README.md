@@ -35,11 +35,11 @@ Not built yet:
 
 - No config editor or in-app settings UI; the TOML file is the only surface.
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
-- Split ratios persist within the session but not across restarts; that arrives with session restore.
+- Restored scrollback is plain text: colors and attributes are not preserved, and a crash loses changes since the last clean save.
 - Drag gestures work, but their GTK wiring is not covered by tests (the model operations they call are).
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
-- No session restore. There is no multiplexer daemon, so a GUI crash kills every shell. `tmux` and `zellij` compose alongside rather than being reimplemented.
+- Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
 
