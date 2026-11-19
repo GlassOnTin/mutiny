@@ -24,6 +24,7 @@ fn main() {
     snapshot_cost();
     scrollback_search_cost();
     search_chunk_budget();
+    render_damage_benefit();
 
     println!("{}", "-".repeat(72));
     println!("engine-only figures exclude GTK rendering, which needs a display.");
@@ -281,4 +282,105 @@ fn search_chunk_budget() {
         }
     );
     assert!(engine.search().expect("search").matches().is_empty());
+}
+
+/// Render-path cost with and without damage. Needs a display, so it skips in a
+/// bare headless run; measure it under Xvfb. This is the cost centre the
+/// damage-tracking rung addressed: rebuilding every row's Pango layouts on
+/// every frame versus reusing cached row nodes.
+fn render_damage_benefit() {
+    use gtk4::prelude::*;
+    if gtk4::init().is_err() {
+        println!("render damage        skipped (no display; run under Xvfb)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("mutiny-bench-render-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctrl = mutiny::app::AppController::with_config(
+        Some((String::from("/bin/sh"), Vec::new())),
+        dir.join("audit.jsonl"),
+        dir.join("config.toml"),
+        mutiny::config::Overrides::default(),
+    );
+    let (_w, _t, pid) = ctrl.create_window(None).expect("pane");
+    let view = mutiny::ui::terminal_view::TerminalView::new(pid, &ctrl);
+    view.size_allocate(&gtk4::gdk::Rectangle::new(0, 0, 1200, 800), -1);
+    while gtk4::glib::MainContext::default().iteration(false) {}
+
+    // Fill the screen so rows have real text runs to shape.
+    let mut buf = String::new();
+    for i in 0..200 {
+        buf.push_str(&format!(
+            "\x1b[32mline {i}\x1b[0m some output text here\r\n"
+        ));
+    }
+    ctrl.workspace
+        .borrow_mut()
+        .pane_mut(pid)
+        .unwrap()
+        .advance_bytes(buf.as_bytes());
+
+    let render = || {
+        let snap = gtk4::Snapshot::new();
+        view.render_snapshot(&snap);
+        let _ = snap.to_node();
+        view.rows_rebuilt_last_frame()
+    };
+    render(); // warm the cache
+
+    let rows = ctrl.workspace.borrow().pane(pid).unwrap().size().rows;
+    let mut idle = Vec::new();
+    let mut idle_rows = 0usize;
+    for _ in 0..50 {
+        let t = Instant::now();
+        idle_rows = render();
+        idle.push(t.elapsed());
+    }
+    let (idle_med, idle_p95, _) = stats(idle);
+
+    let mut changed = Vec::new();
+    let mut changed_rows = 0usize;
+    for i in 0..50 {
+        ctrl.workspace
+            .borrow_mut()
+            .pane_mut(pid)
+            .unwrap()
+            .advance_bytes(format!("\x1b[10;1Hupd {i}\r\n").as_bytes());
+        let t = Instant::now();
+        changed_rows = render();
+        changed.push(t.elapsed());
+    }
+    let (chg_med, chg_p95, _) = stats(changed);
+
+    println!(
+        "render idle          {:>10} median  {:>10} p95   ({idle_rows}/{rows} rows rebuilt)",
+        fmt_us(idle_med),
+        fmt_us(idle_p95)
+    );
+    println!(
+        "render changed       {:>10} median  {:>10} p95   ({changed_rows}/{rows} rows rebuilt)",
+        fmt_us(chg_med),
+        fmt_us(chg_p95)
+    );
+    // What the old full-frame repaint cost: invalidate the cache every frame.
+    let mut full = Vec::new();
+    for _ in 0..30 {
+        view.invalidate_render_cache();
+        let t = Instant::now();
+        render();
+        full.push(t.elapsed());
+    }
+    let (full_med, full_p95, _) = stats(full);
+    println!(
+        "render full repaint  {:>10} median  {:>10} p95   ({rows}/{rows} rows, the old path)",
+        fmt_us(full_med),
+        fmt_us(full_p95)
+    );
+    println!(
+        "  idle {:.1}x cheaper than full repaint; changed {:.1}x",
+        full_med.as_secs_f64() / idle_med.as_secs_f64().max(1e-9),
+        full_med.as_secs_f64() / chg_med.as_secs_f64().max(1e-9)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

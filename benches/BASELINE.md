@@ -1,13 +1,15 @@
-# Engine latency baseline (M0.5)
+# Engine and render latency baseline
 
-Recorded 2026-11-19 so later changes compare against a fixed point rather than
-a feeling. Reproduce with `cargo bench`.
+Recorded 2026-11-19, re-measured after the damage-tracking rung that closed M1.
+Reproduce with `cargo bench`; the render rows need a display, so run it under
+Xvfb (`GDK_BACKEND=x11 xvfb-run -a cargo bench`).
 
 ## Environment
 
 - AMD Ryzen 9 9950X, 32 threads, Linux 7.0.0-38-generic
 - rustc 1.97.1, `bench` profile (optimized)
-- Headless: no GTK, no display. Grid 120x40.
+- Engine rows: headless, 120x40 grid. Render rows: Xvfb with the X11 backend,
+  1200x800 widget, 43-row pane.
 
 ## Numbers
 
@@ -22,10 +24,35 @@ Median and p95 over the iteration counts in `benches/latency.rs`.
 | Scrollback search, hit | 4.7 us | 6.6 us | 20 matches near live screen, early exit |
 | Scrollback search, miss | 3234 us | 3370 us | full 10 000-line scan, worst case |
 | Search chunk (512 lines) | 223 us | 233 us | one tick's worth of the chunked scan |
+| Render, idle frame | 4.9 us | 5.2 us | 1 of 43 rows rebuilt (the cursor line) |
+| Render, changed frame | 36.5 us | 42.7 us | 2 of 43 rows rebuilt |
+| Render, full repaint | 646.9 us | 706.4 us | 43 of 43 rows, the pre-damage path |
 
 Run-to-run variance on VT ingest was about 15% across two runs (2309 us then
 2655 us median) on an otherwise idle machine. Treat differences under roughly
 20% as noise unless they reproduce.
+
+## Damage tracking result
+
+GtkSnapshot is immediate-mode: every `snapshot()` call rebuilds a render-node
+tree for the whole widget, so there is no partial framebuffer update to be had.
+The win comes from caching a render node per row and rebuilding only the rows
+alacritty reports as damaged, then re-appending cached nodes for the rest.
+
+Measured on a 43-row pane full of styled text:
+
+- An idle frame rebuilds 1 row (alacritty re-marks the cursor line on every
+  `damage()` call) and costs 4.9 us, against 646.9 us for a full repaint.
+  Roughly 131x cheaper.
+- A frame with one changed line rebuilds 2 rows and costs 36.5 us, roughly
+  17.7x cheaper than a full repaint.
+- Scroll, resize, font, config, selection, preedit, and graphics changes
+  invalidate the whole cache, because they move or restyle content that line
+  damage does not track. Those frames cost a full repaint, which is correct.
+
+A blank row appends nothing and an empty snapshot yields no node, so each row
+gets a transparent rect to guarantee a cacheable node. Without it every empty
+line rebuilt on every frame.
 
 ## What this covers, and what it does not
 
@@ -35,11 +62,10 @@ PTY echo round trip, snapshot serialization, and scrollback search.
 
 Not covered:
 
-- **GTK rendering.** `TerminalView::render_snapshot` needs a display and is not
-  measured. It repaints every cell and builds a Pango layout per styled run,
-  so it is the likely cost centre and the first thing to measure once a
-  display-bearing benchmark exists. The damage API (`has_damaged_lines`,
-  `reset_damage`) is still unwired.
+- **GTK rendering to a real window.** The render rows above measure
+  `render_snapshot` into a `GtkSnapshot` under Xvfb, which covers node
+  construction and Pango shaping. They do not cover GPU compositing or
+  presentation, which need a real display and a compositor.
 - **End-to-end input latency under load.** The PTY echo figure is measured with
   a tight poll loop and an idle shell. It is a floor, not a loaded percentile.
 - **IPC and MCP round trips.** Socket and JSON costs are not isolated here.

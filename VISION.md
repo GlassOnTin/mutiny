@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v14, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, and OSC 777 notifications are shipped; the growth diagnostic below says which is which. The next rung is damage tracking (see M1).
+Status: draft v15, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. **M1 is complete.** The next milestone is M2, starting with session restore.
 
 ## Thesis
 
@@ -212,11 +212,18 @@ Evidence: `tests/osc777.rs` covers title and body parsing, title-only, ST termin
 
 The D-Bus send itself is not exercised by tests: CI's container has no session bus. Forwarding is verified through the injected notifier, and the no-bus path is verified to return an error rather than panic.
 
-**Next rung: damage tracking.** `has_damaged_lines` and `reset_damage` exist with no callers, and `render_snapshot` repaints every cell and now draws textures too. Wire the damage API into the redraw path, or drop the claim, and measure the render path with a display-bearing benchmark.
+**Shipped rung: damage tracking, which closes M1.** GtkSnapshot is immediate-mode, so there is no partial framebuffer update to be had: every `snapshot()` call rebuilds a render-node tree for the whole widget. The implementation therefore caches one render node per row and rebuilds only the rows alacritty reports damaged, re-appending cached nodes for the rest. `PaneEngine::take_damage` returns viewport row indices and resets the accumulator.
 
-- Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
+A cache key covering grid size, cell metrics, scroll offset, config, graphics generation, preedit, and selection forces a full rebuild when any of those change, because they move or restyle content that line damage does not track. A blank row appends nothing and an empty snapshot yields no node, so each row gets a transparent rect to guarantee a cacheable node; without it every empty line rebuilt every frame.
 
-Done when: a redraw touches only damaged lines and the render path has a measured baseline. Everything else in M1 is met.
+Measured under Xvfb on a 43-row pane of styled text: an idle frame rebuilds 1 row (alacritty re-marks the cursor line on every `damage()` call) at 4.9 us, against 646.9 us for a full repaint, roughly 131x cheaper. A one-line change rebuilds 2 rows at 36.5 us, roughly 17.7x cheaper. Scroll and font changes rebuild every row, which is correct. `tests/damage_tracking.rs` asserts all of this, and ignoring damage makes it fail.
+
+The rung also fixed a real pre-existing bug it exposed: `apply_config_to_views` held a workspace borrow across a `for` loop and then borrowed mutably inside it, which panics on any config reload with a pane open. No earlier test reloaded config with a live pane.
+
+Render measurement covers node construction and Pango shaping under Xvfb, not GPU compositing or presentation, which need a real compositor.
+
+
+M1 is complete. Every item above is shipped and tested; the render path has a measured baseline in `benches/BASELINE.md`.
 
 ### M2: persistence and reach *(forward-looking)*
 

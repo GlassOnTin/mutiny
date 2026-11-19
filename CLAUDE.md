@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v14). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, and OSC 777 notifications are shipped. The next rung is damage tracking. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v15). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete; the next milestone is M2, starting with session restore. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 96 tests: 57 unit + 7 config + 11 e2e + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 1 shell + 7 queries
+cargo test                               # 97 tests: 57 unit + 7 config + 11 e2e + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -92,6 +92,16 @@ Two mechanisms, matching the two sequence families. OSC 10/11 ride the existing 
 OSC 10/11 report `reported_bg` / `reported_fg`, which the controller sets from config at spawn and on reload via `set_reported_colors`, so the answer matches what is rendered. Terminfo answers only `query-os-name` (linux, a fact) and declines everything else with `DCS 0 + r ST`. A decline is a valid answer that unblocks the caller; silence is what blocks it. Do not claim capabilities the engine has not been shown to implement.
 
 `query_replies_sent()` counts replies. The fish startup test asserts it is non-zero, which is what makes the test discriminate: some fish versions time out their queries and proceed anyway, so "fish ran a command" alone passes even with responses disabled.
+
+### Damage-driven redraw
+
+GtkSnapshot is immediate-mode, so "repaint only the damaged region" means caching a render node per row and rebuilding only damaged rows, not partial framebuffer updates. `render_snapshot` keeps `row_cache` plus a `RenderCacheKey`; `PaneEngine::take_damage` returns viewport row indices (alacritty reports them viewport-relative already) and resets the accumulator.
+
+The cache key must cover everything that moves or restyle content without line damage: grid size, cell metrics, scroll offset, config, graphics generation, preedit, selection. Missing one shows up as stale rendering, not as a crash.
+
+Two traps. A blank row appends nothing and `Snapshot::to_node()` returns None for an empty snapshot, so every row needs a transparent rect to be cacheable. And alacritty re-marks the cursor line on every `damage()` call, so an idle frame rebuilds one row, not zero; tests assert `<= 1`, not `== 0`.
+
+`rows_rebuilt_last_frame()` and `invalidate_render_cache()` exist for tests and the render benchmark. The benchmark needs a display: run it with `GDK_BACKEND=x11 xvfb-run -a cargo bench`.
 
 ### OSC 777 notifications
 
@@ -211,10 +221,9 @@ Selection follows the Linux model: drag sets primary selection, middle-click pas
 These look closer to done than they are:
 
 - **Kitty graphics is a slice.** No animation frames, file or shared-memory transmission, unicode placeholders, or cursor-movement policies. Placements drift once scrollback is capped, sharing the OSC 133 marker limitation.
-- **Damage tracking is API-only (next rung).** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell, and now draws textures too.
 - **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
 - **No in-app settings UI.** The TOML file is the only config surface.
-- **No session restore.** A GUI crash kills every shell; there is no multiplexer daemon by design. Split ratios persist in the model across rebuilds but not across restarts.
+- **No session restore (M2, next).** A GUI crash kills every shell; there is no multiplexer daemon by design. Split ratios persist in the model across rebuilds but not across restarts.
 - **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.
 - **Tests skip when prerequisites are absent.** CI installs fish and asserts `fish --version`, and runs under Xvfb with CJK/emoji fonts, so the fish, IME, and graphics render tests execute there. Locally the fish test needs `MUTINY_TEST_FISH` or fish on PATH, and the GTK tests need a display.
 - **The release workflow is unexercised.** `.github/workflows/release.yml` is tag-triggered and gated on CI, but no tag has been pushed.

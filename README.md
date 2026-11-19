@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 96 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 (session restore, quick terminal, authenticated HTTP MCP) is next. The engine, pane mobility, and agent surface are covered by 97 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -26,6 +26,7 @@ Working today:
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
+- Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 131x cheaper than a full repaint, measured under Xvfb.
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
 - Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
 
@@ -223,7 +224,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 96 tests, no display required
+cargo test                    # 97 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

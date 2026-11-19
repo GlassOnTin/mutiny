@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener, OnResize, WindowSize};
+pub use alacritty_terminal::grid::Scroll as GridScroll;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -230,6 +231,15 @@ impl ScrollbackSearch {
         self.done = self.needle.is_empty() || self.max_matches == 0;
         self.output_seq = output_seq;
     }
+}
+
+/// Which viewport rows changed since the last `take_damage`. alacritty reports
+/// these as viewport-relative row indices already, so no scroll conversion is
+/// needed. A scroll invalidates the whole cache in the renderer regardless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowDamage {
+    Full,
+    Rows(Vec<usize>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,6 +637,18 @@ impl PaneEngine {
 
     pub fn size(&self) -> GridSize {
         self.size
+    }
+
+    /// Takes the accumulated damage and resets it, so the next frame only
+    /// rebuilds what changed. Returning grid lines keeps the engine free of
+    /// viewport concerns.
+    pub fn take_damage(&mut self) -> RowDamage {
+        let damage = match self.term.damage() {
+            TermDamage::Full => RowDamage::Full,
+            TermDamage::Partial(iter) => RowDamage::Rows(iter.map(|b| b.line).collect()),
+        };
+        self.term.reset_damage();
+        damage
     }
 
     pub fn has_damaged_lines(&mut self) -> bool {

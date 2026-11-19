@@ -231,7 +231,10 @@ impl AppController {
             let cfg = self.config.borrow();
             (cfg.background, cfg.foreground)
         };
-        for pid in self.workspace.borrow().pane_ids() {
+        // Collect first: a temporary borrow in the `for` expression lives for
+        // the whole loop, so borrowing mutably inside it would panic.
+        let pane_ids = self.workspace.borrow().pane_ids();
+        for pid in pane_ids {
             if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid) {
                 eng.set_reported_colors(bg, fg);
             }

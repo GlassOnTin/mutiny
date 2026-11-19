@@ -42,6 +42,13 @@ mod imp {
         /// store's generation changes so images are not decoded every frame.
         pub texture_cache: RefCell<std::collections::HashMap<u32, gdk::Texture>>,
         pub graphics_generation: Cell<u64>,
+        /// Per-row render nodes. GtkSnapshot is immediate-mode, so "repaint only
+        /// the damaged region" means rebuilding only damaged row nodes and
+        /// re-appending cached ones, not partial framebuffer updates.
+        pub row_cache: RefCell<Vec<Option<gtk4::gsk::RenderNode>>>,
+        pub(crate) cache_key: RefCell<Option<RenderCacheKey>>,
+        /// Rows rebuilt by the most recent snapshot. Test instrumentation.
+        pub rows_rebuilt: Cell<usize>,
     }
 
     #[glib::object_subclass]
@@ -472,7 +479,6 @@ impl TerminalView {
         let (Some(pid), Some(ctrl)) = (self.pane_id(), self.upgrade_controller()) else {
             return;
         };
-        // One config read per frame; nothing here parses or allocates per cell.
         let cfg = ctrl.config_ref();
         let padding = cfg.padding_px;
         let bg = cfg.background;
@@ -489,132 +495,202 @@ impl TerminalView {
             .clone()
             .unwrap_or_else(|| pango::FontDescription::from_string(&cfg.font_description));
 
+        // Take damage before the immutable render borrow; it needs &mut Term.
+        let damage = ctrl
+            .workspace
+            .borrow_mut()
+            .pane_mut(pid)
+            .map(|e| e.take_damage());
+
         let ws = ctrl.workspace.borrow();
         let is_active_pane = ws.active_pane_id() == Some(pid);
         let Some(eng) = ws.pane(pid) else {
             return;
         };
-
         let term = eng.term();
         let grid = term.grid();
         let display_offset = grid.display_offset() as i32;
         let cols = eng.size().cols;
         let rows = eng.size().rows;
         let sel_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+        let preedit = self.imp().preedit.borrow().clone();
+
+        let key = RenderCacheKey {
+            cols,
+            rows,
+            cell_w: cw,
+            cell_h: ch,
+            display_offset: grid.display_offset(),
+            config: cfg.clone(),
+            graphics_generation: eng.graphics().generation(),
+            preedit: preedit.clone(),
+            selection: sel_range.as_ref().map(|r| {
+                (
+                    r.start.line.0,
+                    r.start.column.0,
+                    r.end.line.0,
+                    r.end.column.0,
+                )
+            }),
+        };
+        let full_invalidate = self.imp().cache_key.borrow().as_ref() != Some(&key);
+        *self.imp().cache_key.borrow_mut() = Some(key);
+
+        let mut dirty = vec![full_invalidate; rows];
+        if !full_invalidate {
+            match damage {
+                Some(crate::engine::RowDamage::Full) | None => dirty.fill(true),
+                Some(crate::engine::RowDamage::Rows(list)) => {
+                    for r in list {
+                        if r < rows {
+                            dirty[r] = true;
+                        }
+                    }
+                }
+            }
+        }
 
         let pango_ctx = self.pango_context();
         let layout = pango::Layout::new(&pango_ctx);
 
-        for row_idx in 0..rows {
-            let line = Line(row_idx as i32 - display_offset);
-            let grid_row = &grid[line];
-            let y = padding + (row_idx as f32) * ch;
+        let mut rebuilt = 0usize;
+        {
+            let mut cache = self.imp().row_cache.borrow_mut();
+            cache.resize(rows, None);
+            for row_idx in 0..rows {
+                if dirty[row_idx] || cache[row_idx].is_none() {
+                    let sub = gtk4::Snapshot::new();
+                    let line = Line(row_idx as i32 - display_offset);
+                    let grid_row = &grid[line];
+                    let y = padding + (row_idx as f32) * ch;
 
-            // Pass 1: contiguous non-default background runs + selection highlight
-            let mut col = 0usize;
-            while col < cols {
-                let cell = &grid_row[Column(col)];
-                let pt = Point::new(line, Column(col));
-                let selected = sel_range.is_some_and(|r| r.contains(pt));
-                let inverse = cell.flags.contains(CellFlags::INVERSE);
-                let bg_rgb = if selected {
-                    cfg.selection
-                } else if inverse {
-                    resolve_color(cell.fg, fg, &cfg)
-                } else {
-                    resolve_color(cell.bg, bg, &cfg)
-                };
+                    // A blank row appends nothing, and an empty snapshot yields
+                    // no node, which would defeat caching for every empty line.
+                    // A transparent rect guarantees a node without drawing.
+                    sub.append_color(
+                        &gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
+                        &graphene::Rect::new(0.0, y, w, ch),
+                    );
 
-                if bg_rgb != bg {
-                    let start_col = col;
-                    col += 1;
+                    // Pass 1: contiguous non-default background runs + selection highlight
+                    let mut col = 0usize;
                     while col < cols {
-                        let next_cell = &grid_row[Column(col)];
-                        let next_sel =
-                            sel_range.is_some_and(|r| r.contains(Point::new(line, Column(col))));
-                        let next_bg = if next_sel {
+                        let cell = &grid_row[Column(col)];
+                        let pt = Point::new(line, Column(col));
+                        let selected = sel_range.is_some_and(|r| r.contains(pt));
+                        let inverse = cell.flags.contains(CellFlags::INVERSE);
+                        let bg_rgb = if selected {
                             cfg.selection
-                        } else if next_cell.flags.contains(CellFlags::INVERSE) {
-                            resolve_color(next_cell.fg, fg, &cfg)
+                        } else if inverse {
+                            resolve_color(cell.fg, fg, &cfg)
                         } else {
-                            resolve_color(next_cell.bg, bg, &cfg)
+                            resolve_color(cell.bg, bg, &cfg)
                         };
-                        if next_bg != bg_rgb {
-                            break;
+
+                        if bg_rgb != bg {
+                            let start_col = col;
+                            col += 1;
+                            while col < cols {
+                                let next_cell = &grid_row[Column(col)];
+                                let next_sel = sel_range
+                                    .is_some_and(|r| r.contains(Point::new(line, Column(col))));
+                                let next_bg = if next_sel {
+                                    cfg.selection
+                                } else if next_cell.flags.contains(CellFlags::INVERSE) {
+                                    resolve_color(next_cell.fg, fg, &cfg)
+                                } else {
+                                    resolve_color(next_cell.bg, bg, &cfg)
+                                };
+                                if next_bg != bg_rgb {
+                                    break;
+                                }
+                                col += 1;
+                            }
+                            let span_w = ((col - start_col) as f32) * cw;
+                            sub.append_color(
+                                &rgb_to_gdk(bg_rgb, 1.0),
+                                &graphene::Rect::new(
+                                    padding + (start_col as f32) * cw,
+                                    y,
+                                    span_w,
+                                    ch,
+                                ),
+                            );
+                        } else {
+                            col += 1;
                         }
+                    }
+
+                    // Pass 2: styled text runs rendered as GskTextNode via Pango Layout
+                    let mut col = 0usize;
+                    let mut run_text = String::new();
+                    while col < cols {
+                        let cell = &grid_row[Column(col)];
+                        if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                            col += 1;
+                            continue;
+                        }
+                        if cell.c == ' ' && !cell.flags.contains(CellFlags::UNDERLINE) {
+                            col += 1;
+                            continue;
+                        }
+
+                        let start_col = col;
+                        let style = RunStyle::from_cell(cell, &cfg);
+                        run_text.clear();
+                        run_text.push(cell.c);
+                        let underline = cell.flags.contains(CellFlags::UNDERLINE);
                         col += 1;
+
+                        while col < cols {
+                            let next = &grid_row[Column(col)];
+                            if next.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                                col += 1;
+                                continue;
+                            }
+                            if RunStyle::from_cell(next, &cfg) != style
+                                || next.flags.contains(CellFlags::UNDERLINE) != underline
+                            {
+                                break;
+                            }
+                            run_text.push(next.c);
+                            col += 1;
+                        }
+
+                        let mut desc = base_font.clone();
+                        if style.bold {
+                            desc.set_weight(pango::Weight::Bold);
+                        }
+                        if style.italic {
+                            desc.set_style(pango::Style::Italic);
+                        }
+                        layout.set_font_description(Some(&desc));
+                        layout.set_text(&run_text);
+
+                        let x = padding + (start_col as f32) * cw;
+                        sub.save();
+                        sub.translate(&graphene::Point::new(x, y));
+                        sub.append_layout(&layout, &rgb_to_gdk(style.fg, 1.0));
+                        sub.restore();
+
+                        if underline {
+                            let span_w = ((col - start_col) as f32) * cw;
+                            sub.append_color(
+                                &rgb_to_gdk(style.fg, 0.85),
+                                &graphene::Rect::new(x, y + ch - 1.5, span_w, 1.0),
+                            );
+                        }
                     }
-                    let span_w = ((col - start_col) as f32) * cw;
-                    snapshot.append_color(
-                        &rgb_to_gdk(bg_rgb, 1.0),
-                        &graphene::Rect::new(padding + (start_col as f32) * cw, y, span_w, ch),
-                    );
-                } else {
-                    col += 1;
-                }
-            }
 
-            // Pass 2: styled text runs rendered as GskTextNode via Pango Layout
-            let mut col = 0usize;
-            let mut run_text = String::new();
-            while col < cols {
-                let cell = &grid_row[Column(col)];
-                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                    col += 1;
-                    continue;
+                    cache[row_idx] = sub.to_node();
+                    rebuilt += 1;
                 }
-                if cell.c == ' ' && !cell.flags.contains(CellFlags::UNDERLINE) {
-                    col += 1;
-                    continue;
-                }
-
-                let start_col = col;
-                let style = RunStyle::from_cell(cell, &cfg);
-                run_text.clear();
-                run_text.push(cell.c);
-                let underline = cell.flags.contains(CellFlags::UNDERLINE);
-                col += 1;
-
-                while col < cols {
-                    let next = &grid_row[Column(col)];
-                    if next.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                        col += 1;
-                        continue;
-                    }
-                    if RunStyle::from_cell(next, &cfg) != style
-                        || next.flags.contains(CellFlags::UNDERLINE) != underline
-                    {
-                        break;
-                    }
-                    run_text.push(next.c);
-                    col += 1;
-                }
-
-                let mut desc = base_font.clone();
-                if style.bold {
-                    desc.set_weight(pango::Weight::Bold);
-                }
-                if style.italic {
-                    desc.set_style(pango::Style::Italic);
-                }
-                layout.set_font_description(Some(&desc));
-                layout.set_text(&run_text);
-
-                let x = padding + (start_col as f32) * cw;
-                snapshot.save();
-                snapshot.translate(&graphene::Point::new(x, y));
-                snapshot.append_layout(&layout, &rgb_to_gdk(style.fg, 1.0));
-                snapshot.restore();
-
-                if underline {
-                    let span_w = ((col - start_col) as f32) * cw;
-                    snapshot.append_color(
-                        &rgb_to_gdk(style.fg, 0.85),
-                        &graphene::Rect::new(x, y + ch - 1.5, span_w, 1.0),
-                    );
+                if let Some(node) = &cache[row_idx] {
+                    snapshot.append_node(node);
                 }
             }
         }
+        self.imp().rows_rebuilt.set(rebuilt);
 
         // Pass 3: Cursor (visible when at bottom of scrollback)
         if display_offset == 0 {
@@ -703,6 +779,18 @@ impl TerminalView {
             );
         }
     }
+
+    /// Rows rebuilt by the most recent `render_snapshot`. Zero means the frame
+    /// reused every cached row node.
+    pub fn rows_rebuilt_last_frame(&self) -> usize {
+        self.imp().rows_rebuilt.get()
+    }
+
+    /// Drops the row cache, forcing a full rebuild on the next frame.
+    pub fn invalidate_render_cache(&self) {
+        self.imp().row_cache.borrow_mut().clear();
+        *self.imp().cache_key.borrow_mut() = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,6 +850,22 @@ fn decode_texture(image: &Image) -> Option<gdk::Texture> {
             )
         }
     }
+}
+
+/// Everything that invalidates every cached row. Scroll, resize, font, config,
+/// selection, preedit, and graphics changes all move or restyle content that
+/// alacritty's line damage does not track.
+#[derive(Clone, PartialEq)]
+pub(crate) struct RenderCacheKey {
+    cols: usize,
+    rows: usize,
+    cell_w: f32,
+    cell_h: f32,
+    display_offset: usize,
+    config: ResolvedConfig,
+    graphics_generation: u64,
+    preedit: String,
+    selection: Option<(i32, usize, i32, usize)>,
 }
 
 fn rgb_to_gdk(c: Rgb, alpha: f32) -> gdk::RGBA {
