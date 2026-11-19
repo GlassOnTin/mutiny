@@ -22,14 +22,17 @@ fn default_ipc_version() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConsentMode {
-    /// Local human CLI (`mutiny ctl`) — operator's own shell, audited as operator.
+    /// Operator carrier: a same-uid peer on the operator socket, audited as
+    /// the operator. The human running `mutiny ctl` is the consent.
     #[default]
     Operator,
-    /// Paired agent client — Tier-1 & Tier-2 allowed, visibly surfaced + audited.
+    /// Agent carrier pinned to paired: Tier-1 and Tier-2 allowed, surfaced
+    /// and audited. An operator-side grant, never a client request.
     Paired,
-    /// Interactive agent client — Tier-1 free, Tier-2 prompts in Mutiny window chrome.
+    /// Agent carrier pinned to ask: Tier-1 free, Tier-2 prompts in window
+    /// chrome unless this peer identity holds a session grant.
     Ask,
-    /// Strictly read-only agent client — Tier-2 verbs are rejected.
+    /// Agent carrier pinned to observe-only: Tier-2 verbs are rejected.
     ObserveOnly,
 }
 
@@ -287,6 +290,13 @@ pub struct AuditEntry {
     /// Mode the carrier assigned to this connection, recorded so the trail
     /// shows which trust path a call arrived on.
     pub carrier: ConsentMode,
+    /// Kernel-verified peer the call came from. `client` is the label that
+    /// peer chose; this is the process it actually was. Defaults to a zero
+    /// identity so entries written before this field existed still load
+    /// rather than being dropped from the trail. A zero pid is never a live
+    /// peer, so a legacy entry can never match a grant.
+    #[serde(default)]
+    pub peer: PeerIdentity,
     pub decision: AuditDecision,
     pub detail: String,
 }
@@ -512,6 +522,90 @@ pub fn carrier_permits_peer(cred: &libc::ucred, server_uid: u32) -> bool {
 
 pub fn server_uid() -> u32 {
     unsafe { libc::getuid() }
+}
+
+/// Kernel-verified identity of a socket peer. Session grants key on this, never
+/// on the `client` label, which is display text a caller chooses.
+///
+/// `start_time` is the process start time from `/proc/<pid>/stat`, included so a
+/// recycled pid does not inherit a dead process's grant. It reads as 0 when
+/// `/proc` is unavailable, which degrades pid-reuse protection but still keeps
+/// distinct live processes distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct PeerIdentity {
+    pub uid: u32,
+    pub pid: i32,
+    pub start_time: u64,
+}
+
+impl PeerIdentity {
+    pub fn from_credentials(cred: &libc::ucred) -> Self {
+        Self {
+            uid: cred.uid,
+            pid: cred.pid,
+            start_time: process_start_time(cred.pid),
+        }
+    }
+}
+
+/// Field 22 of `/proc/<pid>/stat`: clock ticks since boot at process start.
+/// The comm field can contain spaces and parentheses, so parse after the last
+/// ')' rather than splitting the whole line.
+pub fn process_start_time(pid: i32) -> u64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return 0;
+    };
+    // rest begins at field 3 (state), so field 22 is index 19.
+    rest.split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// What the carrier's trust rules decide for one call. Pure so the policy can
+/// be tested without a GUI, a socket, or a second user account.
+///
+/// The client label is deliberately not an input: a grant cannot follow a
+/// claimed name because the name never reaches this decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsentOutcome {
+    Allow(AuditDecision),
+    Deny(String),
+    /// Park the stream and raise the in-window consent bar.
+    Park,
+}
+
+pub fn consent_outcome(
+    tier: ConsentTier,
+    carrier: ConsentMode,
+    identity: PeerIdentity,
+    grants: &std::collections::HashSet<PeerIdentity>,
+    gui_present: bool,
+) -> ConsentOutcome {
+    match (tier, carrier) {
+        (ConsentTier::Observe, _) => ConsentOutcome::Allow(AuditDecision::Allowed),
+        (ConsentTier::Act, ConsentMode::Operator | ConsentMode::Paired) => {
+            ConsentOutcome::Allow(AuditDecision::Allowed)
+        }
+        (ConsentTier::Act, ConsentMode::ObserveOnly) => ConsentOutcome::Deny(String::from(
+            "observe-only session cannot execute Tier-2 Act verbs",
+        )),
+        (ConsentTier::Act, ConsentMode::Ask) => {
+            if grants.contains(&identity) {
+                ConsentOutcome::Allow(AuditDecision::ApprovedSession)
+            } else if !gui_present {
+                // Fail closed when no interactive window can present consent.
+                ConsentOutcome::Deny(String::from(
+                    "consent prompt requires an open Mutiny GUI window",
+                ))
+            } else {
+                ConsentOutcome::Park
+            }
+        }
+    }
 }
 
 pub fn write_response(stream: &mut UnixStream, resp: &IpcResponse) -> io::Result<()> {
@@ -820,5 +914,115 @@ mod tests {
             agent_socket_path(Path::new("/tmp/custom")),
             PathBuf::from("/tmp/custom-agent")
         );
+    }
+
+    fn peer(pid: i32, start_time: u64) -> PeerIdentity {
+        PeerIdentity {
+            uid: 1000,
+            pid,
+            start_time,
+        }
+    }
+
+    #[test]
+    fn session_grant_follows_the_peer_not_the_claimed_label() {
+        use crate::action::ConsentTier;
+        use std::collections::HashSet;
+
+        let granted = peer(111, 5_000);
+        // Same uid, different process. This is the attacker: it can claim any
+        // label it likes, including the granted client's name.
+        let attacker = peer(222, 9_000);
+        let mut grants = HashSet::new();
+        grants.insert(granted);
+
+        // The label is not an argument to the decision at all, so there is no
+        // value it could take that would change these outcomes.
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Ask, granted, &grants, true),
+            ConsentOutcome::Allow(AuditDecision::ApprovedSession)
+        );
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Ask, attacker, &grants, true),
+            ConsentOutcome::Park,
+            "a different process must not inherit the grant"
+        );
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Ask, attacker, &grants, false),
+            ConsentOutcome::Deny(String::from(
+                "consent prompt requires an open Mutiny GUI window"
+            )),
+            "headless, the ungranted peer fails closed"
+        );
+    }
+
+    #[test]
+    fn recycled_pid_does_not_inherit_a_dead_process_grant() {
+        use crate::action::ConsentTier;
+        use std::collections::HashSet;
+
+        let dead = peer(111, 5_000);
+        let recycled = peer(111, 60_000);
+        let mut grants = HashSet::new();
+        grants.insert(dead);
+        assert_ne!(dead, recycled);
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Ask, recycled, &grants, true),
+            ConsentOutcome::Park
+        );
+    }
+
+    #[test]
+    fn consent_matrix_unchanged_for_non_ask_carriers() {
+        use crate::action::ConsentTier;
+        use std::collections::HashSet;
+        let grants = HashSet::new();
+        let p = peer(111, 5_000);
+
+        for carrier in [
+            ConsentMode::Operator,
+            ConsentMode::Paired,
+            ConsentMode::Ask,
+            ConsentMode::ObserveOnly,
+        ] {
+            assert_eq!(
+                consent_outcome(ConsentTier::Observe, carrier, p, &grants, false),
+                ConsentOutcome::Allow(AuditDecision::Allowed),
+                "observe is free on {carrier:?}"
+            );
+        }
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Operator, p, &grants, false),
+            ConsentOutcome::Allow(AuditDecision::Allowed)
+        );
+        assert_eq!(
+            consent_outcome(ConsentTier::Act, ConsentMode::Paired, p, &grants, false),
+            ConsentOutcome::Allow(AuditDecision::Allowed)
+        );
+        assert!(matches!(
+            consent_outcome(ConsentTier::Act, ConsentMode::ObserveOnly, p, &grants, true),
+            ConsentOutcome::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn live_peer_identity_matches_this_process() {
+        let sock_path = env::temp_dir().join(format!("mutiny-ident-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = bind_socket(&sock_path).expect("bind");
+        let client = UnixStream::connect(&sock_path).expect("connect");
+        let (server_side, _) = listener.accept().expect("accept");
+        let cred = peer_credentials(&server_side).expect("SO_PEERCRED");
+        let identity = PeerIdentity::from_credentials(&cred);
+
+        assert_eq!(identity.uid, server_uid());
+        assert_eq!(identity.pid, std::process::id() as i32);
+        assert!(
+            identity.start_time > 0,
+            "starttime should be readable from /proc on Linux"
+        );
+        assert_eq!(identity.start_time, process_start_time(identity.pid));
+        drop(client);
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

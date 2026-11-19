@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v5, 2026-11-19. Owner: Ian. Public name remains open until first public release; internal identifiers are fixed now (see "Contracts that must not drift"). M0 and the trust/parity half of M0.5 are shipped; the growth diagnostic below says which is which.
+Status: draft v6, 2026-11-19. Owner: Ian. Public name remains open until first public release; internal identifiers are fixed now (see "Contracts that must not drift"). M0, the trust/parity half of M0.5, and the peer-identity grant binding are shipped; the growth diagnostic below says which is which. The next rung is chunked scrollback search (see M1).
 
 ## Thesis
 
@@ -80,7 +80,9 @@ Two carriers, because one socket cannot serve both trust paths:
 - **Agent socket** (`mutiny-agent.sock` beside it). Every connection is assigned the mode the operator pinned at GUI launch with `--agent-consent` (default `ask`). `mutiny mcp` arrives here by default. A bridge's own `--consent` flag is a local ceiling it enforces before forwarding; it can be more restrictive than the carrier, never less. A bridge asking for `paired` against an `observe-only` carrier is denied and audited.
 - **Network (M2, forward-looking).** `Paired` only after an explicit pairing token, bound to an explicitly configured interface. A network transport can never assign `Operator`.
 
-Two limits stay visible rather than implied. First, same-uid processes are mutually trusted under the Unix model: a malicious process running as the user can reach the operator socket and be the operator. The uid check closes the cross-user hole (notably the `/tmp` fallback path), not the same-user one. Second, the client *label* is still self-asserted, and session grants key on it, so a same-uid agent can claim another client's label to inherit its grant. Haven names the same spoofable-name debt; binding grants to a carrier-verified identity is the remaining work.
+Session grants key on a kernel-verified `PeerIdentity` (uid, pid, and `/proc` start time), never on the `client` label. The label is display and audit text; it is not an input to the consent decision at all, so there is no value it could take that would make a grant apply. Start time is included so a recycled pid does not inherit a dead process's grant. A grant therefore lives as long as the granted process: restarting an MCP bridge requires re-approval, which is the intended trade. The audit records the peer alongside the label, so the trail shows which process actually acted.
+
+One limit stays visible rather than implied: same-uid processes are mutually trusted under the Unix model. A malicious process running as the user can reach the operator socket and be the operator. The uid check closes the cross-user hole (notably the `/tmp` fallback path), not the same-user one. What the identity binding does close is grant inheritance between distinct same-uid processes, which is the hole a spoofed label opened.
 
 ### Audit is evidence, so it has to outlive the process
 
@@ -114,7 +116,7 @@ A plan needs a diagnosis. Against the M0 bootstrap commit:
 - **Commitment 1, engine: exercising well.** Chunked OSC 133 capture across read boundaries and scrollback rotation, OSC 7 cwd, OSC 9;4 progress, quiescence, and named-key encoding are implemented and tested. Two claims are ahead of the code. "Line-level damage tracking" exists as `has_damaged_lines`/`reset_damage` with no callers, so rendering is full-frame. The Kitty encoder honours disambiguation and report-all-keys, not all five flags.
 - **Commitment 2, off-widget state: shipped and load-bearing.** Detach and move preserve scrollback and the running child, verified by test. The seam is split geometry: `SplitNode.ratio` is carried through tree surgery but never applied to the `GtkPaned`, and user drags are not written back.
 - **Commitment 3, desktop citizenship: partly unverified.** SSD is left to KWin by construction and the chrome controls persist. The KDE global menu export has not been checked at runtime on a Plasma session; treat it as unproven until it is.
-- **Commitment 4, presence: shipped for Tiers 1 and 2, trust boundary in place.** Snapshots, search, exited ring, notices, and the audit viewer work. Consent mode is carrier-assigned, peer uid is checked, and the audit is durable. Remaining: grants still key on a self-asserted client label, and Tiers 3 and 4 are not implemented.
+- **Commitment 4, presence: shipped for Tiers 1 and 2, trust boundary in place.** Snapshots, search, exited ring, notices, and the audit viewer work. Consent mode is carrier-assigned, peer uid is checked, session grants bind to kernel-verified peer identity, and the audit is durable. Remaining: Tiers 3 and 4 are not implemented, and same-uid processes remain mutually trusted on the operator carrier.
 - **Commitment 5, one binary: shipped.** Three entry points, two carriers, MCP as adapter. The envelope carries a version and refuses a mismatch; MCP `initialize` negotiates against a supported revision set instead of echoing.
 - **Commitment 6, parity: test-locked, not generated.** 21 IPC verbs, 17 MCP tools, 4 static resources. `list_actions` and `ui://mutiny/actions` close the slug-discovery hole; `read_screen_text` and `wait_prompt` close the two verbs that previously had no MCP counterpart. Tests assert both directions of the mapping. The four lists are still hand-maintained.
 
@@ -148,23 +150,26 @@ The work that makes M0 safe to build on. Nothing here was a feature.
 - CI workflow (`.github/workflows/ci.yml`) and `scripts/ci.sh` running fmt, clippy with `-D warnings`, the displayless suite, and the same suite under Xvfb so the GTK accelerator assertions actually execute.
 - Latency and throughput baseline recorded in `benches/BASELINE.md`, reproduced by `cargo bench`.
 
-Evidence: 28 tests pass (22 unit, 6 integration), displayless and under a display. The spoof test refuses `operator`, `paired`, and `ask` claims on both carriers while the same verb without the claim succeeds. The carrier test shows a `paired` bridge denied against an `observe-only` carrier, audited with that carrier, then succeeding once the operator re-pins. The restart test shows two entries surviving a controller rebuild and the sequence continuing.
+Evidence: the suite passes displayless and under a display. The spoof test refuses `operator`, `paired`, and `ask` claims on both carriers while the same verb without the claim succeeds. The carrier test shows a `paired` bridge denied against an `observe-only` carrier, audited with that carrier, then succeeding once the operator re-pins. The restart test shows two entries surviving a controller rebuild and the sequence continuing.
 
-Two honest gaps. The CI workflow has not executed on GitHub because the repository has no remote; the commands it runs are verified green locally via `scripts/ci.sh`. And binding session grants to a carrier-verified identity rather than a self-asserted label is still open, carried into M1.
+Follow-on rung, shipped: session grants bind to `PeerIdentity` rather than the client label. The proof runs two real child processes under the same uid, both claiming `trusted-peer`; the granted one is allowed on a fresh connection and the other fails closed, with the audit showing two distinct pids behind one label. Mutating the decision back to "any grant applies" makes both the policy test and the cross-process test fail, so the tests detect the vulnerability rather than merely passing alongside the fix.
+
+One honest gap remains. The CI workflow has not executed on GitHub because the repository has no remote; the commands it runs are verified green locally via `scripts/ci.sh`.
 
 ### M1: the surface becomes configurable and complete
 
+**Next rung: chunk scrollback search across ticks.** The M0.5 baseline measured a full 10 000-line scan at about 3.2 ms median against a 4 ms GUI tick, so a non-matching needle run inline drops a frame. `search_scrollback` needs a resumable form that scans a bounded number of lines per tick and yields, and the viewport search bar must be built on that rather than on the whole-scan call. This comes first in M1 because it is a measured defect in the current shape, not a new feature.
+
+- Resumable `search_scrollback` with a per-tick line budget, plus the viewport search bar over it.
 - TOML config at `$XDG_CONFIG_HOME/mutiny/config.toml` with live reload, a documented key set, and defined precedence against CLI flags.
 - Bundled shell integration snippets (OSC 133 + OSC 7) for bash, zsh, fish, and nushell. PTYs already export `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID` for this.
 - Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
 - Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.
 - OSC 777 notifications through the desktop portal, with tab badges.
-- Viewport search bar over `search_scrollback`.
 - Text input correctness: `GtkIMContext` for IME and dead keys, and a font fallback chain for CJK, emoji, and box-drawing glyphs.
-- Bind session grants to a carrier-verified identity instead of the self-asserted client label.
-- Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document. The baseline shows a full scrollback scan costs about 3.2 ms against a 4 ms tick, so the search bar must chunk its scan rather than run it whole on the main loop.
+- Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: a fresh install reads config, a plain bash session emits OSC 133 without manual setup, an image renders inline, and a CJK or accented compose sequence types correctly.
+Done when: a search with no matches never stalls a tick, a fresh install reads config, a plain bash session emits OSC 133 without manual setup, an image renders inline, and a CJK or accented compose sequence types correctly.
 
 ### M2: persistence and reach *(forward-looking)*
 

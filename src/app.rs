@@ -9,12 +9,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gtk4::gdk;
 use gtk4::prelude::*;
 
-use crate::action::{ActionId, ConsentTier};
+use crate::action::ActionId;
 use crate::engine::{EngineNotification, GridSize, PaneEngine, parse_named_key};
 use crate::ipc::{
-    AuditDecision, AuditEntry, ConsentMode, IpcEnvelope, IpcRequest, IpcResponse, action_catalog,
-    bind_socket, carrier_permits_peer, default_audit_path, peer_credentials, read_envelope,
-    server_uid, write_response,
+    AuditDecision, AuditEntry, ConsentMode, ConsentOutcome, IpcEnvelope, IpcRequest, IpcResponse,
+    PeerIdentity, action_catalog, bind_socket, carrier_permits_peer, consent_outcome,
+    default_audit_path, peer_credentials, read_envelope, server_uid, write_response,
 };
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
 use crate::ui::window::MutinyWindow;
@@ -37,6 +37,9 @@ pub struct PendingConsent {
     pub client: String,
     pub request: IpcRequest,
     pub carrier: ConsentMode,
+    /// Kernel-verified peer, so an Allow Session grant binds to the process
+    /// that asked rather than to the name it typed.
+    pub peer: PeerIdentity,
     pub deadline: Instant,
     stream: UnixStream,
 }
@@ -62,7 +65,10 @@ pub struct AppController {
     audit_path: RefCell<Option<PathBuf>>,
     pending_waits: RefCell<Vec<PendingWait>>,
     pending_consents: RefCell<VecDeque<PendingConsent>>,
-    session_approved_clients: RefCell<HashSet<String>>,
+    session_approved_clients: RefCell<HashSet<PeerIdentity>>,
+    /// Display labels for the granted identities, so the audit dialog can show
+    /// a human name while the grant itself keys on the verified peer.
+    session_grant_labels: RefCell<HashMap<PeerIdentity, String>>,
     audit_log: RefCell<VecDeque<AuditEntry>>,
     next_audit_seq: Cell<u64>,
     next_consent_id: Cell<u64>,
@@ -97,6 +103,7 @@ impl AppController {
             pending_waits: RefCell::new(Vec::new()),
             pending_consents: RefCell::new(VecDeque::new()),
             session_approved_clients: RefCell::new(HashSet::new()),
+            session_grant_labels: RefCell::new(HashMap::new()),
             audit_log: RefCell::new(ring),
             next_audit_seq: Cell::new(next_seq),
             next_consent_id: Cell::new(1),
@@ -170,19 +177,39 @@ impl AppController {
         ))
     }
 
+    /// Labels of the granted peer identities, for the audit dialog. The grant
+    /// itself keys on `PeerIdentity`; this is display text only.
     pub fn session_grants(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .session_approved_clients
-            .borrow()
+        let grants = self.session_approved_clients.borrow();
+        let labels = self.session_grant_labels.borrow();
+        let mut out: Vec<String> = grants
             .iter()
-            .cloned()
+            .map(|id| {
+                let label = labels
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| String::from("unknown"));
+                format!("{label} (pid {})", id.pid)
+            })
             .collect();
         out.sort();
         out
     }
 
+    /// Grants a session to a kernel-verified peer. This is the operator-side
+    /// action the consent bar's Allow Session button performs; it is not
+    /// reachable from the IPC surface, so a client cannot grant itself.
+    pub fn grant_session(&self, peer: PeerIdentity, label: &str) {
+        self.session_approved_clients.borrow_mut().insert(peer);
+        self.session_grant_labels
+            .borrow_mut()
+            .insert(peer, label.to_owned());
+        self.refresh_all_window_chromes();
+    }
+
     pub fn revoke_session_grants(&self) {
         self.session_approved_clients.borrow_mut().clear();
+        self.session_grant_labels.borrow_mut().clear();
         self.refresh_all_window_chromes();
     }
 
@@ -202,6 +229,7 @@ impl AppController {
         req: &IpcRequest,
         decision: AuditDecision,
         carrier: ConsentMode,
+        peer: PeerIdentity,
     ) {
         let seq = self.next_audit_seq.get();
         self.next_audit_seq.set(seq + 1);
@@ -216,6 +244,7 @@ impl AppController {
             verb: req.verb_name().to_owned(),
             tier: req.consent_tier(),
             carrier,
+            peer,
             decision,
             detail: req.redacted_summary(),
         };
@@ -250,6 +279,7 @@ impl AppController {
                     &item.request,
                     AuditDecision::Denied,
                     item.carrier,
+                    item.peer,
                 );
                 let _ = write_response(
                     &mut item.stream,
@@ -262,20 +292,21 @@ impl AppController {
                     &item.request,
                     AuditDecision::ApprovedOnce,
                     item.carrier,
+                    item.peer,
                 );
                 if let Some(resp) = self.execute_ipc_request(item.request, &item.stream) {
                     let _ = write_response(&mut item.stream, &resp);
                 }
             }
             ConsentResolution::AllowSession => {
-                self.session_approved_clients
-                    .borrow_mut()
-                    .insert(item.client.clone());
+                // Bind to the verified peer, not to the label it sent.
+                self.grant_session(item.peer, &item.client);
                 self.record_audit(
                     &item.client,
                     &item.request,
                     AuditDecision::ApprovedSession,
                     item.carrier,
+                    item.peer,
                 );
                 if let Some(resp) = self.execute_ipc_request(item.request, &item.stream) {
                     let _ = write_response(&mut item.stream, &resp);
@@ -732,8 +763,8 @@ impl AppController {
     ) {
         // Identity comes from the kernel, before anything the client wrote is
         // trusted. A peer from another uid is refused outright.
-        match peer_credentials(&stream) {
-            Ok(cred) if carrier_permits_peer(&cred, server_uid()) => {}
+        let cred = match peer_credentials(&stream) {
+            Ok(cred) if carrier_permits_peer(&cred, server_uid()) => cred,
             Ok(cred) => {
                 let _ = write_response(
                     &mut stream,
@@ -752,7 +783,8 @@ impl AppController {
                 );
                 return;
             }
-        }
+        };
+        let peer = PeerIdentity::from_credentials(&cred);
 
         let env_req = match read_envelope(&mut stream) {
             Ok(env) => env,
@@ -763,7 +795,7 @@ impl AppController {
         };
 
         if let Some(resp) =
-            self.evaluate_consent_and_dispatch(env_req, &stream, carrier, default_label)
+            self.evaluate_consent_and_dispatch(env_req, &stream, carrier, default_label, peer)
         {
             let _ = write_response(&mut stream, &resp);
         }
@@ -775,7 +807,10 @@ impl AppController {
         raw_stream: &UnixStream,
         carrier: ConsentMode,
         default_label: &str,
+        peer: PeerIdentity,
     ) -> Option<IpcResponse> {
+        // The label is for display and audit only. It is not passed to the
+        // consent decision, so it cannot influence whether a grant applies.
         let client_label = env_req
             .meta
             .client
@@ -787,57 +822,31 @@ impl AppController {
             self.refresh_all_window_chromes();
         }
 
-        let tier = env_req.request.consent_tier();
-        match (tier, carrier) {
-            (ConsentTier::Observe, _)
-            | (ConsentTier::Act, ConsentMode::Operator | ConsentMode::Paired) => {
-                self.record_audit(
-                    &client_label,
-                    &env_req.request,
-                    AuditDecision::Allowed,
-                    carrier,
-                );
+        let gui_present = !self.ui_windows.borrow().is_empty();
+        let outcome = consent_outcome(
+            env_req.request.consent_tier(),
+            carrier,
+            peer,
+            &self.session_approved_clients.borrow(),
+            gui_present,
+        );
+
+        match outcome {
+            ConsentOutcome::Allow(decision) => {
+                self.record_audit(&client_label, &env_req.request, decision, carrier, peer);
                 self.execute_ipc_request(env_req.request, raw_stream)
             }
-            (ConsentTier::Act, ConsentMode::ObserveOnly) => {
+            ConsentOutcome::Deny(message) => {
                 self.record_audit(
                     &client_label,
                     &env_req.request,
                     AuditDecision::Denied,
                     carrier,
+                    peer,
                 );
-                Some(IpcResponse::err(
-                    "observe-only session cannot execute Tier-2 Act verbs",
-                ))
+                Some(IpcResponse::err(message))
             }
-            (ConsentTier::Act, ConsentMode::Ask) => {
-                if self
-                    .session_approved_clients
-                    .borrow()
-                    .contains(&client_label)
-                {
-                    self.record_audit(
-                        &client_label,
-                        &env_req.request,
-                        AuditDecision::ApprovedSession,
-                        carrier,
-                    );
-                    return self.execute_ipc_request(env_req.request, raw_stream);
-                }
-
-                // Fail closed when no interactive GUI window is attached to present consent.
-                if self.ui_windows.borrow().is_empty() {
-                    self.record_audit(
-                        &client_label,
-                        &env_req.request,
-                        AuditDecision::Denied,
-                        carrier,
-                    );
-                    return Some(IpcResponse::err(
-                        "consent prompt requires an open Mutiny GUI window",
-                    ));
-                }
-
+            ConsentOutcome::Park => {
                 let Ok(cloned) = raw_stream.try_clone() else {
                     return Some(IpcResponse::err("failed to clone IPC stream for consent"));
                 };
@@ -850,6 +859,7 @@ impl AppController {
                         client: client_label,
                         request: env_req.request,
                         carrier,
+                        peer,
                         deadline: Instant::now() + Duration::from_secs(25),
                         stream: cloned,
                     });

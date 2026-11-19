@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v5). M0 and the trust/parity half of M0.5 are shipped; M1 (config, shell integration, Kitty graphics, IME) is next. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v6). M0, the trust/parity half of M0.5, and peer-identity grant binding are shipped. The next rung is chunked scrollback search, then M1 (config, shell integration, Kitty graphics, IME). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 28 tests: 22 unit + 6 integration
+cargo test                               # 35 tests: 26 unit + 9 integration
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -103,12 +103,18 @@ Bounds worth knowing: 10 000 lines scrollback, 64 command records, 256 prompt ma
 `handle_accepted` checks `SO_PEERCRED` first and refuses a peer whose uid differs from `server_uid()`. Only then does it read the envelope. The matrix in `evaluate_consent_and_dispatch`:
 
 - Observe verbs always pass. Act passes for Operator and Paired.
-- Act + ObserveOnly is rejected. Act + Ask parks the stream and raises the in-window consent bar (25 s deadline), unless the client label already holds a session grant.
+- Act + ObserveOnly is rejected. Act + Ask parks the stream and raises the in-window consent bar (25 s deadline), unless the **peer identity** already holds a session grant.
 - Ask fails closed when no GUI window exists to present the prompt.
 
-Every decision appends to the durable trail at `default_audit_path()` (`$XDG_STATE_HOME/mutiny/audit.jsonl`), recording the carrier alongside the verb tier. `redacted_summary()` logs text payloads as byte counts, never content. The file rotates past 8 MiB keeping one generation; `load_audit_tail` reloads the last 256 entries on startup and continues the sequence. Tests use `AppController::with_audit_path` to avoid writing to the real state directory.
+The matrix itself is `ipc::consent_outcome`, a pure function of (verb tier, carrier mode, `PeerIdentity`, grant set, gui_present). It deliberately takes no client label, so a claimed name cannot influence the decision. Keep policy there rather than inline in the controller: it is what the headless tests exercise.
 
-Two limits to keep in mind when touching this code. Same-uid processes are mutually trusted under the Unix model, so the operator socket grants Operator to any process running as the user; the uid check closes the cross-user hole, not that one. And session grants still key on the self-asserted client label, so a same-uid agent can claim another client's label. Binding grants to a carrier-verified identity is open M1 work.
+**Session grants key on `PeerIdentity`, not on the label.** `PeerIdentity { uid, pid, start_time }` comes from `SO_PEERCRED` plus `/proc/<pid>/stat` field 22. Start time is included so a recycled pid does not inherit a dead process's grant; it reads 0 if `/proc` is unavailable, which degrades reuse protection but still separates live processes. A grant lives as long as the granted process, so restarting an MCP bridge requires re-approval. `AppController::grant_session(peer, label)` is the operator-side action the consent bar's Allow Session button calls; it is not reachable from IPC. `session_grants()` returns display labels with pids for the audit dialog. The `client` label is display and audit text only.
+
+Every decision appends to the durable trail at `default_audit_path()` (`$XDG_STATE_HOME/mutiny/audit.jsonl`), recording the carrier and the `peer` identity alongside the verb tier. `redacted_summary()` logs text payloads as byte counts, never content. The file rotates past 8 MiB keeping one generation; `load_audit_tail` reloads the last 256 entries on startup and continues the sequence. Tests use `AppController::with_audit_path` to avoid writing to the real state directory.
+
+One limit to keep in mind: same-uid processes are mutually trusted under the Unix model, so the operator socket grants Operator to any process running as the user. The uid check closes the cross-user hole, not that one.
+
+Testing grant behavior needs **two real processes**. Every thread in one process shares a pid, so in-process `McpBridge` instances all have the same peer identity. `tests/e2e_ipc_pty.rs` has a `PeerProcess` helper that re-invokes the test binary (`--exact raw_peer_helper`) as a stdin-driven raw socket client; `raw_peer_helper` is a no-op when its env var is unset, so the normal suite stays headless-green.
 
 ### Rendering
 
@@ -123,7 +129,7 @@ These look closer to done than they are:
 - **No config file.** VISION specifies TOML with live reload; there is no config module and no `toml` dependency. Font (`Monospace 11`), colours, and the 16-colour palette are constants in `src/ui/terminal_view.rs`.
 - **Split ratios are stored but not applied.** `SplitNode::Split { ratio }` is preserved through tree surgery, but `build_split_widget` never calls `set_position`, and user drags are not written back. Splits render at GTK's default.
 - **No shell integration snippets shipped.** OSC 133/7 tracking works only if the shell emits the markers; nothing in the repo installs them. PTYs do get `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID=<id>` for that purpose.
-- **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell. Related: a full scrollback scan costs about 3.2 ms against the 4 ms tick (see `benches/BASELINE.md`), so the M1 search bar must chunk its scan.
-- **Session grants key on a self-asserted label.** See the consent section above.
+- **Scrollback search blocks the tick (next rung).** A full 10 000-line scan with no match costs about 3.2 ms median against the 4 ms tick, so it drops a frame. `search_scrollback` needs a resumable form with a per-tick line budget, and the M1 search bar must use it. See `benches/BASELINE.md`.
+- **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell.
 - **CI has not run on GitHub.** The repo has no remote. `.github/workflows/ci.yml` is written and `./scripts/ci.sh` verifies the same commands locally, but the workflow itself is unexecuted.
 - Untested by the current suite: real GUI rendering, Kitty graphics, drag gestures, session restore, and the M2 HTTP MCP listener.

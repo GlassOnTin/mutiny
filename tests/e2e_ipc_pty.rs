@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use mutiny::action::ActionId;
 use mutiny::app::AppController;
-use mutiny::ipc::{ConsentMode, IpcRequest, IpcResponse, send_request};
+use mutiny::ipc::{ConsentMode, IpcRequest, IpcResponse, PeerIdentity, send_request, server_uid};
 use mutiny::mcp::{McpBridge, tool_definitions};
 use mutiny::topology::{PaneId, SplitAxis};
 use serde_json::{Value, json};
@@ -24,6 +24,7 @@ struct TestServer {
     dir: PathBuf,
     first_pane: PaneId,
     mode_tx: mpsc::Sender<ConsentMode>,
+    grant_tx: mpsc::Sender<(PeerIdentity, String)>,
     stop_tx: mpsc::Sender<()>,
     handle: Option<JoinHandle<()>>,
 }
@@ -40,6 +41,7 @@ impl TestServer {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (mode_tx, mode_rx) = mpsc::channel::<ConsentMode>();
+        let (grant_tx, grant_rx) = mpsc::channel::<(PeerIdentity, String)>();
 
         let op = operator_sock.clone();
         let ag = agent_sock.clone();
@@ -56,6 +58,9 @@ impl TestServer {
             while stop_rx.try_recv().is_err() {
                 if let Ok(mode) = mode_rx.try_recv() {
                     ctrl.set_agent_mode(mode);
+                }
+                if let Ok((peer, label)) = grant_rx.try_recv() {
+                    ctrl.grant_session(peer, &label);
                 }
                 ctrl.poll_once();
                 thread::sleep(Duration::from_millis(5));
@@ -74,6 +79,7 @@ impl TestServer {
             dir,
             first_pane,
             mode_tx,
+            grant_tx,
             stop_tx,
             handle: Some(handle),
         }
@@ -81,6 +87,14 @@ impl TestServer {
 
     fn set_agent_mode(&self, mode: ConsentMode) {
         self.mode_tx.send(mode).expect("mode channel");
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    /// Stands in for the operator tapping Allow Session on the consent bar.
+    fn grant_session(&self, peer: PeerIdentity, label: &str) {
+        self.grant_tx
+            .send((peer, label.to_owned()))
+            .expect("grant channel");
         thread::sleep(Duration::from_millis(30));
     }
 }
@@ -588,4 +602,202 @@ fn every_advertised_mcp_tool_dispatches() {
             "tool '{name}' returned no content: {reply}"
         );
     }
+}
+
+/// A separate process that speaks raw JSONL to a carrier on demand. Grants key
+/// on kernel-verified peer identity, and every thread in one process shares a
+/// pid, so proving label-spoof refusal requires genuinely distinct processes.
+struct PeerProcess {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    pid: u32,
+}
+
+impl PeerProcess {
+    fn spawn(sock: &PathBuf) -> Self {
+        let exe = env::current_exe().expect("current exe");
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("raw_peer_helper")
+            .arg("--nocapture")
+            .env("MUTINY_TEST_PEER_SOCKET", sock)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn peer process");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let pid = child.id();
+        Self {
+            child,
+            stdin,
+            stdout,
+            pid,
+        }
+    }
+
+    /// The identity the server will derive for this process, computed from the
+    /// same kernel and /proc sources the carrier uses.
+    fn identity(&self) -> PeerIdentity {
+        PeerIdentity {
+            uid: server_uid(),
+            pid: self.pid as i32,
+            start_time: mutiny::ipc::process_start_time(self.pid as i32),
+        }
+    }
+
+    fn call(&mut self, line: &str) -> Value {
+        writeln!(self.stdin, "{line}").expect("write request");
+        self.stdin.flush().expect("flush");
+        loop {
+            let mut buf = String::new();
+            let n = self.stdout.read_line(&mut buf).expect("read peer stdout");
+            assert!(n > 0, "peer process exited without replying");
+            if let Some(rest) = buf.strip_prefix("MUTINY_PEER_REPLY ") {
+                return serde_json::from_str(rest.trim()).expect("peer reply is JSON");
+            }
+        }
+    }
+}
+
+impl Drop for PeerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Driven by `PeerProcess` over stdin. Without the env var this is a no-op, so
+/// the ordinary suite stays green headless.
+#[test]
+fn raw_peer_helper() {
+    let Ok(sock) = env::var("MUTINY_TEST_PEER_SOCKET") else {
+        return;
+    };
+    let sock = PathBuf::from(sock);
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = raw_round_trip(&sock, &line);
+        println!("MUTINY_PEER_REPLY {reply}");
+        std::io::stdout().flush().expect("flush stdout");
+    }
+}
+
+#[test]
+fn same_uid_peer_claiming_another_label_cannot_inherit_its_grant() {
+    let server = TestServer::spawn("grantspoof", ConsentMode::Ask);
+    let p1 = server.first_pane;
+
+    // Both processes claim the identical label. Only one is granted.
+    let observe = r#"{"op":"list","client":"trusted-peer"}"#;
+    let act = format!(
+        r#"{{"op":"present-notice","client":"trusted-peer","pane":{},"message":"x"}}"#,
+        p1.0
+    );
+
+    let mut peer_a = PeerProcess::spawn(&server.agent_sock);
+    let identity_a = peer_a.identity();
+    assert!(identity_a.start_time > 0, "starttime must be readable");
+
+    // 1. Peer A is seen and audited under the identity the carrier derived.
+    assert_eq!(peer_a.call(observe)["status"], json!("ok"));
+    let audit = raw_round_trip(&server.operator_sock, r#"{"op":"audit-log","limit":50}"#);
+    let entry_a = audit["audit"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["client"] == json!("trusted-peer"))
+        .expect("peer A audited");
+    let seen_a: PeerIdentity =
+        serde_json::from_value(entry_a["peer"].clone()).expect("peer identity in audit");
+    assert_eq!(
+        seen_a, identity_a,
+        "carrier-derived identity must match the kernel facts about peer A"
+    );
+
+    // 2. Operator grants a session to that verified identity.
+    server.grant_session(identity_a, "trusted-peer");
+
+    // 3. Peer A reconnects (new socket, same process) and the grant holds.
+    let a_act = peer_a.call(&act);
+    assert_eq!(
+        a_act["status"],
+        json!("ok"),
+        "granted peer must be allowed on a fresh connection: {a_act}"
+    );
+
+    // 4. Peer B is a different process, same uid, claiming the SAME label.
+    let mut peer_b = PeerProcess::spawn(&server.agent_sock);
+    let identity_b = peer_b.identity();
+    assert_eq!(identity_b.uid, identity_a.uid, "both peers are same-uid");
+    assert_ne!(identity_b.pid, identity_a.pid);
+
+    let b_act = peer_b.call(&act);
+    assert_eq!(
+        b_act["status"],
+        json!("error"),
+        "claiming the granted label must not inherit the grant: {b_act}"
+    );
+    assert!(
+        b_act["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("consent prompt requires"),
+        "ungranted peer must fail closed headless: {b_act}"
+    );
+
+    // 5. The trail shows two distinct processes behind one label, and the
+    //    denial is recorded against B's identity rather than A's.
+    let audit = raw_round_trip(&server.operator_sock, r#"{"op":"audit-log","limit":50}"#);
+    let denied = audit["audit"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["client"] == json!("trusted-peer") && e["decision"] == json!("denied"))
+        .expect("denied entry for peer B");
+    let seen_b: PeerIdentity =
+        serde_json::from_value(denied["peer"].clone()).expect("peer identity");
+    assert_eq!(seen_b, identity_b);
+    assert_ne!(seen_b, identity_a);
+}
+
+#[test]
+fn audit_entries_written_before_peer_identity_still_load() {
+    let dir = env::temp_dir().join(format!("mutiny-legacy-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let audit_path = dir.join("audit.jsonl");
+
+    // Shaped exactly as the first M0.5 build wrote it: no `peer` field.
+    let legacy = json!({
+        "seq": 1, "unix_ms": 0, "client": "ctl", "verb": "list",
+        "tier": "observe", "carrier": "operator", "decision": "allowed", "detail": ""
+    });
+    let modern = json!({
+        "seq": 2, "unix_ms": 0, "client": "agent", "verb": "list",
+        "tier": "observe", "carrier": "ask", "decision": "allowed", "detail": "",
+        "peer": {"uid": server_uid(), "pid": 4242, "start_time": 99}
+    });
+    fs::write(&audit_path, format!("{legacy}\n{modern}\n")).expect("write trail");
+
+    let ctrl = AppController::with_audit_path(None, audit_path.clone());
+    let entries = ctrl.audit_entries(10);
+    assert_eq!(
+        entries.len(),
+        2,
+        "a pre-upgrade entry must load, not be silently dropped"
+    );
+    let old = entries.iter().find(|e| e.seq == 1).expect("legacy entry");
+    assert_eq!(old.peer, PeerIdentity::default());
+    let new = entries.iter().find(|e| e.seq == 2).expect("modern entry");
+    assert_eq!(new.peer.pid, 4242);
+    assert_eq!(new.peer.start_time, 99);
+
+    let _ = fs::remove_dir_all(&dir);
 }
