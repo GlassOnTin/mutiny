@@ -118,6 +118,8 @@ pub enum AttentionReason {
     Bell,
     CommandFailed(i32),
     AgentNotice,
+    /// An OSC 777 notification arrived. Lights the tab badge and urgent-next.
+    OscNotification,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,11 +245,22 @@ pub struct SearchProgress {
 #[derive(Debug, Clone)]
 pub enum EngineNotification {
     TitleChanged(String),
-    ClipboardStore { primary: bool, text: String },
+    ClipboardStore {
+        primary: bool,
+        text: String,
+    },
     Bell,
-    PromptReached { seq: u64 },
+    PromptReached {
+        seq: u64,
+    },
     CommandFinished(CommandRecord),
     ChildExited(Option<i32>),
+    /// OSC 777 notify. The engine parses and raises attention; forwarding to
+    /// the desktop is the controller's job, so the engine stays GTK-free.
+    DesktopNotification {
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -981,6 +994,19 @@ impl PaneEngine {
             "9" => {
                 if let Some(state) = parse_osc9_progress(rest) {
                     self.progress = state;
+                }
+            }
+            // OSC 777 notify: `777;notify;<title>[;<body>]`.
+            "777" => {
+                if let Some(rest) = rest.strip_prefix("notify;") {
+                    let (title, body) = match rest.split_once(';') {
+                        Some((t, b)) => (t.to_owned(), b.to_owned()),
+                        None => (rest.to_owned(), String::new()),
+                    };
+                    if !title.trim().is_empty() {
+                        self.attention = Some(AttentionReason::OscNotification);
+                        out.push(EngineNotification::DesktopNotification { title, body });
+                    }
                 }
             }
             // OSC 10/11 color queries. alacritty does not answer these, and

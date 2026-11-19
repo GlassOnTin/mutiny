@@ -20,6 +20,7 @@ use crate::ipc::{
     PeerIdentity, action_catalog, bind_socket, carrier_permits_peer, consent_outcome,
     default_audit_path, peer_credentials, read_envelope, server_uid, write_response,
 };
+use crate::notify::{DBusNotifier, DesktopNotifier};
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
 use crate::ui::window::MutinyWindow;
 
@@ -95,6 +96,7 @@ pub struct AppController {
     recent_agent: RefCell<Option<(String, Instant)>>,
     shell_override: RefCell<Option<(String, Vec<String>)>>,
     default_menubar: Cell<bool>,
+    notifier: RefCell<Rc<dyn DesktopNotifier>>,
 }
 
 impl AppController {
@@ -162,6 +164,7 @@ impl AppController {
             recent_agent: RefCell::new(None),
             shell_override: RefCell::new(shell_override),
             default_menubar: Cell::new(true),
+            notifier: RefCell::new(Rc::new(DBusNotifier)),
         })
     }
 
@@ -173,6 +176,12 @@ impl AppController {
 
     pub fn agent_mode(&self) -> ConsentMode {
         self.agent_mode.get()
+    }
+
+    /// Replaces the desktop notifier. Tests inject a recorder so forwarding
+    /// can be asserted without a session bus.
+    pub fn set_notifier(&self, notifier: Rc<dyn DesktopNotifier>) {
+        *self.notifier.borrow_mut() = notifier;
     }
 
     /// Zero-copy read of the effective config, for the renderer.
@@ -836,6 +845,14 @@ impl AppController {
 
             for note in notifications {
                 match note {
+                    EngineNotification::DesktopNotification { title, body } => {
+                        self.notifier.borrow().notify("mutiny", &title, &body);
+                        if let Some((wid, _)) = self.workspace.borrow().locate_pane(pid)
+                            && !windows_needing_chrome_refresh.contains(&wid)
+                        {
+                            windows_needing_chrome_refresh.push(wid);
+                        }
+                    }
                     EngineNotification::TitleChanged(_)
                     | EngineNotification::Bell
                     | EngineNotification::PromptReached { .. }

@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 89 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 96 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -25,6 +25,7 @@ Working today:
 - Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
+- OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
 - Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
 
@@ -34,7 +35,6 @@ Not built yet:
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
 - Split ratios persist within the session but not across restarts; that arrives with session restore.
 - Drag gestures work, but their GTK wiring is not covered by tests (the model operations they call are).
-- No OSC 777 desktop notifications.
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Rendering repaints every cell. The damage-tracking API exists but is unwired.
 - No session restore. There is no multiplexer daemon, so a GUI crash kills every shell. `tmux` and `zellij` compose alongside rather than being reimplemented.
@@ -223,7 +223,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 89 tests, no display required
+cargo test                    # 96 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

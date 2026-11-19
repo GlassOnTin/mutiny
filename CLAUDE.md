@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v13). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, and split ratios with drag gestures are shipped. The next rung is OSC 777 notifications, then damage tracking. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v14). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, and OSC 777 notifications are shipped. The next rung is damage tracking. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 89 tests: 55 unit + 7 config + 11 e2e + 1 ime + 5 graphics + 2 ratios + 1 shell + 7 queries
+cargo test                               # 96 tests: 57 unit + 7 config + 11 e2e + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -92,6 +92,14 @@ Two mechanisms, matching the two sequence families. OSC 10/11 ride the existing 
 OSC 10/11 report `reported_bg` / `reported_fg`, which the controller sets from config at spawn and on reload via `set_reported_colors`, so the answer matches what is rendered. Terminfo answers only `query-os-name` (linux, a fact) and declines everything else with `DCS 0 + r ST`. A decline is a valid answer that unblocks the caller; silence is what blocks it. Do not claim capabilities the engine has not been shown to implement.
 
 `query_replies_sent()` counts replies. The fish startup test asserts it is non-zero, which is what makes the test discriminate: some fish versions time out their queries and proceed anyway, so "fish ran a command" alone passes even with responses disabled.
+
+### OSC 777 notifications
+
+The engine parses `777;notify;<title>[;<body>]` and emits `EngineNotification::DesktopNotification`, keeping GTK out of the engine. `src/notify.rs` forwards to `org.freedesktop.Notifications.Notify` on the session bus; there is no separate notification portal method. Sending is best-effort and must never panic on a missing bus.
+
+`DesktopNotifier` is a trait so tests inject a recorder and assert forwarding without a session bus. The badge comes from `AttentionReason::OscNotification`, the same mechanism as bell and agent notices, so focusing the pane clears it.
+
+When testing the forwarding path, emit the sequence through the PTY (`write_to_pty` with a shell `printf`) so it arrives via `drain_pty`. Calling `advance_bytes` directly sets attention but bypasses the notification pipeline, which is why a test doing that sees an empty recorder. And in a Rust byte string, `\033` is a literal backslash for the shell's printf to interpret; `\0` alone is a NUL because Rust has no octal escapes.
 
 ### Split ratios and drag gestures
 
@@ -203,7 +211,8 @@ Selection follows the Linux model: drag sets primary selection, middle-click pas
 These look closer to done than they are:
 
 - **Kitty graphics is a slice.** No animation frames, file or shared-memory transmission, unicode placeholders, or cursor-movement policies. Placements drift once scrollback is capped, sharing the OSC 133 marker limitation.
-- **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell, and now draws textures too.
+- **Damage tracking is API-only (next rung).** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell, and now draws textures too.
+- **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
 - **No in-app settings UI.** The TOML file is the only config surface.
 - **No session restore.** A GUI crash kills every shell; there is no multiplexer daemon by design. Split ratios persist in the model across rebuilds but not across restarts.
 - **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.

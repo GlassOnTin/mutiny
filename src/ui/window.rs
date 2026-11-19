@@ -443,6 +443,17 @@ impl MutinyWindow {
         self.inner.gtk_window.close();
     }
 
+    /// Current tab button labels, including status badges. Exposed so tests
+    /// can assert a notification badges its tab.
+    pub fn tab_labels(&self) -> Vec<String> {
+        self.inner
+            .tab_buttons
+            .borrow()
+            .iter()
+            .map(|(_, btn)| btn.label().map(|s| s.to_string()).unwrap_or_default())
+            .collect()
+    }
+
     pub fn queue_draw_pane(&self, pane_id: PaneId) {
         if let Some(view) = self.inner.pane_views.borrow().get(&pane_id) {
             view.queue_draw();
@@ -667,6 +678,9 @@ impl MutinyWindow {
                             }
                             Some(AttentionReason::AgentNotice) => {
                                 status_badges.push(String::from("!agent"));
+                            }
+                            Some(AttentionReason::OscNotification) => {
+                                status_badges.push(String::from("!notify"));
                             }
                             None => {}
                         }

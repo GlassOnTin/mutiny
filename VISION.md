@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v13, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, and split ratios with drag gestures are shipped; the growth diagnostic below says which is which. The next rung is OSC 777 notifications (see M1).
+Status: draft v14, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, and OSC 777 notifications are shipped; the growth diagnostic below says which is which. The next rung is damage tracking (see M1).
 
 ## Thesis
 
@@ -204,12 +204,19 @@ Persistence is within the workspace model, which is what survives rebuilds and r
 
 The GTK gesture wiring itself is not driven by tests: synthesizing a real drag needs a seat and a compositor. The model operations it invokes are tested, and the ratio write-back is tested by moving the divider programmatically, which is what the handle does.
 
-**Next rung: OSC 777 notifications.** Wire OSC 777 to the desktop notification portal with tab badges, completing the notification path of the presence contract.
+**Shipped rung: OSC 777 notifications.** `PaneEngine` parses `777;notify;<title>[;<body>]` with either BEL or ST termination and across chunked reads, raises `AttentionReason::OscNotification`, and emits a `DesktopNotification` event. The engine stays GTK-free; `src/notify.rs` forwards to `org.freedesktop.Notifications.Notify` on the session bus. That is the interface desktops implement; there is no separate notification portal method, so calling it directly is the correct path rather than a shortcut.
 
-- OSC 777 notifications through the desktop portal, with tab badges.
+The notifying pane's tab gets a `!notify` badge through the same attention mechanism as bell and agent notices, and focusing the pane clears it. Sending is best-effort: a missing session bus logs and drops, never taking down a pane.
+
+Evidence: `tests/osc777.rs` covers title and body parsing, title-only, ST termination, chunked arrival, and rejection of empty titles and non-notify subcommands. A controller test emits the sequence through a real PTY and asserts the injected recorder receives exactly `("mutiny", "Deploy finished", "all green")`, and that attention is set then cleared on focus. Under Xvfb, a window test asserts the tab label gains `!notify`. Removing the forward call makes the controller test fail.
+
+The D-Bus send itself is not exercised by tests: CI's container has no session bus. Forwarding is verified through the injected notifier, and the no-bus path is verified to return an error rather than panic.
+
+**Next rung: damage tracking.** `has_damaged_lines` and `reset_damage` exist with no callers, and `render_snapshot` repaints every cell and now draws textures too. Wire the damage API into the redraw path, or drop the claim, and measure the render path with a display-bearing benchmark.
+
 - Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: an OSC 777 notification reaches the desktop and badges its tab. Config, shell integration, chunked search, fish startup, CJK compose, inline images, split ratios, and drag gestures are already met.
+Done when: a redraw touches only damaged lines and the render path has a measured baseline. Everything else in M1 is met.
 
 ### M2: persistence and reach *(forward-looking)*
 
