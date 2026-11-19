@@ -115,6 +115,50 @@ impl Drop for HttpHandle {
     }
 }
 
+/// Parses `LABEL=TOKEN[:MODE]`. Without a MODE the peer inherits
+/// `--agent-consent`, so existing invocations keep working.
+///
+/// The mode suffix is only stripped when it actually names a mode, so a token
+/// containing a colon still works. A token whose final segment happens to be
+/// `ask`, `paired`, or `observe-only` is ambiguous; use `--http-token` for that
+/// case. Generated tokens are hex and cannot collide.
+pub fn parse_http_peer(
+    raw: &str,
+    default_mode: ConsentMode,
+) -> Result<(String, String, ConsentMode), String> {
+    let (label, rest) = raw
+        .split_once('=')
+        .ok_or_else(|| String::from("expected LABEL=TOKEN[:MODE]"))?;
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(String::from("label must not be empty"));
+    }
+    let (token, mode) = match rest.rsplit_once(':') {
+        Some((head, suffix)) if !head.is_empty() => match ConsentMode::parse_peer_mode(suffix) {
+            Ok(mode) => (head, mode),
+            // Not a mode, so the colon belongs to the token. An explicit
+            // "operator" suffix is still refused rather than silently treated
+            // as part of a token, because it signals a mistaken expectation.
+            Err(err) if suffix.trim().eq_ignore_ascii_case("operator") => return Err(err),
+            Err(_) => (rest, default_mode),
+        },
+        _ => (rest, default_mode),
+    };
+    if token.is_empty() {
+        return Err(String::from("token must not be empty"));
+    }
+    Ok((label.to_owned(), token.to_owned(), mode))
+}
+
+pub fn mode_label(mode: ConsentMode) -> &'static str {
+    match mode {
+        ConsentMode::Operator => "operator",
+        ConsentMode::Paired => "paired",
+        ConsentMode::Ask => "ask",
+        ConsentMode::ObserveOnly => "observe-only",
+    }
+}
+
 /// Refuses an empty peer set, a blank token, or two peers sharing a label.
 /// Duplicate labels would make the trail ambiguous even though the identities
 /// differ, so they are rejected at launch rather than explained later.
@@ -353,6 +397,41 @@ mod tests {
             .expect_err("duplicate labels must be refused");
         assert!(err.contains("duplicate"), "{err}");
         assert!(validate_peers(&[peer("", "a")]).is_err());
+    }
+
+    #[test]
+    fn peer_mode_syntax_defaults_inherits_and_refuses_operator() {
+        use crate::ipc::ConsentMode;
+        // No suffix inherits the launch default, so old invocations still work.
+        let (label, token, mode) = parse_http_peer("phone=abc123", ConsentMode::Ask).unwrap();
+        assert_eq!((label.as_str(), token.as_str()), ("phone", "abc123"));
+        assert_eq!(mode, ConsentMode::Ask);
+
+        for (text, expected) in [
+            ("ask", ConsentMode::Ask),
+            ("paired", ConsentMode::Paired),
+            ("observe-only", ConsentMode::ObserveOnly),
+        ] {
+            let (_, _, mode) =
+                parse_http_peer(&format!("phone=abc123:{text}"), ConsentMode::Ask).unwrap();
+            assert_eq!(mode, expected, "{text}");
+        }
+
+        // Operator is not assignable, and is refused rather than absorbed into
+        // the token, because it signals a mistaken expectation.
+        let err = parse_http_peer("phone=abc123:operator", ConsentMode::Ask).unwrap_err();
+        assert!(err.contains("operator"), "{err}");
+        assert!(ConsentMode::parse_peer_mode("operator").is_err());
+        assert!(ConsentMode::parse_peer_mode("nonsense").is_err());
+
+        // A colon that is not a mode belongs to the token.
+        let (_, token, mode) = parse_http_peer("phone=abc:123", ConsentMode::ObserveOnly).unwrap();
+        assert_eq!(token, "abc:123");
+        assert_eq!(mode, ConsentMode::ObserveOnly);
+
+        assert!(parse_http_peer("no-equals", ConsentMode::Ask).is_err());
+        assert!(parse_http_peer("=abc", ConsentMode::Ask).is_err());
+        assert!(parse_http_peer("phone=", ConsentMode::Ask).is_err());
     }
 
     #[test]

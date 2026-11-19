@@ -76,10 +76,12 @@ struct Cli {
     #[arg(long)]
     http_token: Option<String>,
 
-    /// GUI only: a named peer for --http-bind, as `label=token`. Repeatable.
-    /// Each peer gets its own identity in the audit trail and its own session
-    /// grants, so two devices holding different tokens are distinguishable.
-    #[arg(long = "http-peer", value_name = "LABEL=TOKEN")]
+    /// GUI only: a named peer for --http-bind, as `LABEL=TOKEN[:MODE]`.
+    /// Repeatable. Each peer gets its own identity in the audit trail, its own
+    /// session grants, and its own consent mode (ask, paired, or observe-only).
+    /// Without MODE the peer inherits --agent-consent. Operator is not
+    /// assignable to a peer.
+    #[arg(long = "http-peer", value_name = "LABEL=TOKEN[:MODE]")]
     http_peers: Vec<String>,
 
     #[command(subcommand)]
@@ -620,17 +622,15 @@ fn run_gui_app(
     }
 
     // Authenticated HTTP MCP carrier. Off unless explicitly bound. Each peer
-    // token gets its own relay carrier and identity, and every relay carries the
-    // agent mode, so a network peer can never be assigned Operator.
+    // token gets its own relay carrier, identity, and consent mode, so a network
+    // peer can never be assigned Operator.
     let mut http_handle = None;
     if let Some(http) = http {
-        let mut specs: Vec<(String, String)> = Vec::new();
+        let mut specs: Vec<(String, String, ConsentMode)> = Vec::new();
         for raw in &http.peers {
-            match raw.split_once('=') {
-                Some((label, token)) if !label.trim().is_empty() && !token.is_empty() => {
-                    specs.push((label.trim().to_owned(), token.to_owned()));
-                }
-                _ => eprintln!("warning: ignoring --http-peer {raw:?}: expected LABEL=TOKEN"),
+            match http_mcp::parse_http_peer(raw, agent_consent) {
+                Ok(spec) => specs.push(spec),
+                Err(err) => eprintln!("warning: ignoring --http-peer {raw:?}: {err}"),
             }
         }
         if specs.is_empty() {
@@ -649,14 +649,14 @@ fn run_gui_app(
                     }
                 },
             };
-            specs.push((String::from("http-peer"), token));
+            specs.push((String::from("http-peer"), token, agent_consent));
         }
 
         let agent_base = agent_socket_path(&socket_path);
         let mut peers = Vec::new();
-        for (index, (label, token)) in specs.iter().enumerate() {
+        for (index, (label, token, mode)) in specs.iter().enumerate() {
             let path = http_peer_socket_path(&agent_base, index);
-            match controller.start_http_peer_listener(&path, token, label) {
+            match controller.start_http_peer_listener(&path, token, label, *mode) {
                 Ok(()) => peers.push(HttpPeer {
                     label: label.clone(),
                     token: token.clone(),
@@ -665,7 +665,10 @@ fn run_gui_app(
                 Err(err) => eprintln!("warning: HTTP peer {label:?} not started: {err}"),
             }
         }
-        let labels: Vec<String> = peers.iter().map(|p| p.label.clone()).collect();
+        let labels: Vec<String> = specs
+            .iter()
+            .map(|(label, _, mode)| format!("{label}({})", http_mcp::mode_label(*mode)))
+            .collect();
         match http_mcp::spawn(HttpMcpConfig {
             bind: http.bind,
             peers,

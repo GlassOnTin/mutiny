@@ -107,6 +107,10 @@ struct HttpPeerCarrier {
     path: PathBuf,
     identity: PeerIdentity,
     label: String,
+    /// Mode this peer's carrier assigns. Pinned per peer at launch, so one peer
+    /// can be paired while another is observe-only. Never `Operator`: the only
+    /// way in is `ConsentMode::parse_peer_mode`, which refuses it.
+    mode: ConsentMode,
 }
 
 pub struct AppController {
@@ -383,13 +387,23 @@ impl AppController {
         path: &Path,
         token: &str,
         label: &str,
+        mode: ConsentMode,
     ) -> io::Result<()> {
+        // Defensive: the parse boundary already refuses Operator, and a carrier
+        // that granted it over the network would break the whole model.
+        if mode == ConsentMode::Operator {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a network peer carrier can never assign Operator",
+            ));
+        }
         let listener = bind_socket(path)?;
         self.http_peers.borrow_mut().push(HttpPeerCarrier {
             listener,
             path: path.to_path_buf(),
             identity: PeerIdentity::for_token(token, server_uid()),
             label: label.to_owned(),
+            mode,
         });
         Ok(())
     }
@@ -1448,20 +1462,20 @@ impl AppController {
         self.accept_carrier(&self.ipc_listener, ConsentMode::Operator, "ctl", None);
         let agent_mode = self.agent_mode.get();
         self.accept_carrier(&self.agent_listener, agent_mode, "mcp-agent", None);
-        self.accept_http_peer_carriers(agent_mode);
+        self.accept_http_peer_carriers();
     }
 
     /// Services one carrier per HTTP peer token. Each assigns the identity its
     /// token was verified for, so two peers are distinct in the audit trail and
     /// in the grant set. The mode is the agent carrier's, never `Operator`.
-    fn accept_http_peer_carriers(self: &Rc<Self>, agent_mode: ConsentMode) {
+    fn accept_http_peer_carriers(self: &Rc<Self>) {
         let peers = self.http_peers.borrow();
         for peer in peers.iter() {
             loop {
                 let accepted = peer.listener.accept();
                 match accepted {
                     Ok((stream, _)) => {
-                        self.handle_accepted(stream, agent_mode, &peer.label, Some(peer.identity))
+                        self.handle_accepted(stream, peer.mode, &peer.label, Some(peer.identity))
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => break,

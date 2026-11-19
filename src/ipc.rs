@@ -36,6 +36,28 @@ pub enum ConsentMode {
     ObserveOnly,
 }
 
+impl ConsentMode {
+    /// Parses a mode an operator may assign to an agent or network peer.
+    ///
+    /// `Operator` is deliberately unparseable here. It belongs to the operator
+    /// socket, where a same-uid human is the consent; no configuration string
+    /// and no client can reach it. Keeping the refusal at the type's own parse
+    /// boundary means a new caller cannot forget the check.
+    pub fn parse_peer_mode(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "paired" => Ok(Self::Paired),
+            "observe-only" => Ok(Self::ObserveOnly),
+            "operator" => Err(String::from(
+                "operator is not assignable to a peer; it belongs to the operator socket",
+            )),
+            other => Err(format!(
+                "unknown consent mode {other:?}: expected ask, paired, or observe-only"
+            )),
+        }
+    }
+}
+
 /// Caller-supplied label only. The consent mode is deliberately absent: it is
 /// assigned by the carrier that accepted the connection, never by the client.
 /// See `parse_envelope`, which refuses any envelope that tries to send one.

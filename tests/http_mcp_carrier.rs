@@ -56,6 +56,17 @@ fn harness(tag: &str, agent_mode: ConsentMode) -> Harness {
 
 /// One relay carrier per peer, so each token maps to its own identity.
 fn harness_peers(tag: &str, agent_mode: ConsentMode, spec: &[(&str, &str)]) -> Harness {
+    let with_modes: Vec<(&str, &str, ConsentMode)> =
+        spec.iter().map(|(l, t)| (*l, *t, agent_mode)).collect();
+    harness_peers_with_modes(tag, agent_mode, &with_modes)
+}
+
+/// Each peer gets its own consent mode, independent of the agent carrier's.
+fn harness_peers_with_modes(
+    tag: &str,
+    agent_mode: ConsentMode,
+    spec: &[(&str, &str, ConsentMode)],
+) -> Harness {
     let dir = std::env::temp_dir().join(format!("mutiny-http-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -65,12 +76,13 @@ fn harness_peers(tag: &str, agent_mode: ConsentMode, spec: &[(&str, &str)]) -> H
     let peers: Vec<HttpPeer> = spec
         .iter()
         .enumerate()
-        .map(|(i, (label, token))| HttpPeer {
+        .map(|(i, (label, token, _mode))| HttpPeer {
             label: (*label).to_owned(),
             token: (*token).to_owned(),
             socket: dir.join(format!("mutiny-agent-peer-{i}.sock")),
         })
         .collect();
+    let modes: Vec<ConsentMode> = spec.iter().map(|(_, _, m)| *m).collect();
 
     let handle = spawn(HttpMcpConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -94,8 +106,8 @@ fn harness_peers(tag: &str, agent_mode: ConsentMode, spec: &[(&str, &str)]) -> H
         ctrl.start_ipc_listener(&op).expect("operator listener");
         ctrl.start_agent_listener(&ag, agent_mode)
             .expect("agent listener");
-        for peer in &peers {
-            ctrl.start_http_peer_listener(&peer.socket, &peer.token, &peer.label)
+        for (peer, mode) in peers.iter().zip(modes.iter()) {
+            ctrl.start_http_peer_listener(&peer.socket, &peer.token, &peer.label, *mode)
                 .expect("peer relay listener");
         }
         ctrl.create_window(None).expect("pane");
@@ -378,4 +390,154 @@ fn two_peer_tokens_produce_two_distinct_audit_identities() {
         "refused token reached a verb"
     );
     assert!(after.len() >= before);
+}
+
+/// Per-peer consent MODE. The agent carrier here is pinned to observe-only, so
+/// an implementation that still read the shared `agent_mode` would deny the
+/// paired peer too. That is what makes this test discriminate.
+#[test]
+fn each_peer_carries_its_own_consent_mode_not_the_shared_agent_mode() {
+    let h = harness_peers_with_modes(
+        "peer-modes",
+        ConsentMode::ObserveOnly,
+        &[
+            ("trusted", TOKEN_A, ConsentMode::Paired),
+            ("readonly", TOKEN_B, ConsentMode::ObserveOnly),
+        ],
+    );
+    let read = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}).to_string();
+    let act = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"spawn_pane","arguments":{"mode":"split-right"}}}).to_string();
+
+    // Observe passes for both peers.
+    for token in [TOKEN_A, TOKEN_B] {
+        let (status, body) = post(h.http_addr, Some(token), &read);
+        assert_eq!(status, 200);
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["result"]["isError"], json!(false), "{body}");
+    }
+
+    // The paired peer may Act even though the agent carrier is observe-only.
+    let (_, body) = post(h.http_addr, Some(TOKEN_A), &act);
+    let reply: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        reply["result"]["isError"],
+        json!(false),
+        "the paired peer's own mode must govern, not the agent carrier's: {body}"
+    );
+
+    // The observe-only peer may not.
+    let (_, body) = post(h.http_addr, Some(TOKEN_B), &act);
+    let reply: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["result"]["isError"], json!(true), "{body}");
+    assert!(body.contains("observe-only"), "{body}");
+
+    thread::sleep(Duration::from_millis(200));
+    let entries = audit_entries(&h);
+    let for_label = |label: &str| -> Vec<Value> {
+        entries
+            .iter()
+            .filter(|e| e["client"] == json!(label))
+            .cloned()
+            .collect()
+    };
+    let trusted = for_label("trusted");
+    let readonly = for_label("readonly");
+    assert!(!trusted.is_empty() && !readonly.is_empty(), "{entries:?}");
+    for entry in &trusted {
+        assert_eq!(entry["carrier"], json!("paired"), "{entry}");
+    }
+    for entry in &readonly {
+        assert_eq!(entry["carrier"], json!("observe-only"), "{entry}");
+    }
+    assert!(
+        readonly.iter().any(|e| e["decision"] == json!("denied")),
+        "the denial must be audited: {readonly:?}"
+    );
+    for entry in trusted.iter().chain(readonly.iter()) {
+        assert_ne!(
+            entry["carrier"],
+            json!("operator"),
+            "never Operator: {entry}"
+        );
+    }
+
+    // Unpaired refusal is unchanged by per-peer modes.
+    assert_eq!(post(h.http_addr, None, &read).0, 401);
+    assert_eq!(post(h.http_addr, Some("not-a-peer-token"), &read).0, 401);
+}
+
+/// A peer pinned to ask still prompts, and a grant for one peer does not cover
+/// another. Identity was already per peer; this checks mode and grants compose.
+#[test]
+fn an_ask_peer_is_not_escalated_by_a_paired_sibling() {
+    let h = harness_peers_with_modes(
+        "ask-sibling",
+        ConsentMode::Paired,
+        &[
+            ("open", TOKEN_A, ConsentMode::Paired),
+            ("guarded", TOKEN_B, ConsentMode::Ask),
+        ],
+    );
+    let act = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn_pane","arguments":{"mode":"split-right"}}}).to_string();
+
+    let (_, body) = post(h.http_addr, Some(TOKEN_A), &act);
+    let reply: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["result"]["isError"], json!(false), "{body}");
+
+    // The ask peer has no GUI window in this harness, so it fails closed rather
+    // than inheriting its sibling's paired trust.
+    let (_, body) = post(h.http_addr, Some(TOKEN_B), &act);
+    let reply: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["result"]["isError"], json!(true), "{body}");
+    assert!(
+        body.contains("consent"),
+        "expected a consent failure, not a paired allow: {body}"
+    );
+
+    thread::sleep(Duration::from_millis(200));
+    let entries = audit_entries(&h);
+    for entry in entries.iter().filter(|e| e["client"] == json!("guarded")) {
+        assert_eq!(entry["carrier"], json!("ask"), "{entry}");
+        assert_ne!(entry["decision"], json!("allowed"), "{entry}");
+    }
+}
+
+/// The carrier itself refuses Operator, independently of the parse boundary.
+#[test]
+fn a_peer_carrier_refuses_operator_even_if_asked_directly() {
+    let dir = std::env::temp_dir().join(format!("mutiny-op-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ctrl = AppController::with_config(
+        Some((String::from("/bin/sh"), Vec::new())),
+        dir.join("audit.jsonl"),
+        dir.join("config.toml"),
+        Overrides::default(),
+    );
+    let err = ctrl
+        .start_http_peer_listener(
+            &dir.join("peer.sock"),
+            "token",
+            "sneaky",
+            ConsentMode::Operator,
+        )
+        .expect_err("a network carrier must never assign Operator");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("Operator"), "{err}");
+    // The accepted modes still bind.
+    for mode in [
+        ConsentMode::Ask,
+        ConsentMode::Paired,
+        ConsentMode::ObserveOnly,
+    ] {
+        ctrl.start_http_peer_listener(
+            &dir.join(format!("peer-{mode:?}.sock")),
+            "token",
+            "ok",
+            mode,
+        )
+        .expect("a non-operator mode must bind");
+    }
+    ctrl.shutdown_ipc();
+    let _ = std::fs::remove_dir_all(&dir);
 }

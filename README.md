@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 147 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 151 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -45,7 +45,7 @@ Not built yet:
 - Session restore does not re-attach multiplexer clients: a restored pane that was running tmux comes back as a plain shell.
 - A pane attached to tmux or zellij gets no shell integration, so prompt jumping and command capture do not work inside it.
 - The session picker scans local tmux and zellij plus configured SSH hosts. screen, abduco, and dtach are not discovered.
-- The HTTP MCP carrier is a slice: no SSE and no session management. Peer identity and session grants are per token; the consent mode is still one setting for the whole listener. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
+- The HTTP MCP carrier is a slice: no SSE and no session management. Peer identity, session grants, and consent mode are all per token. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
 
@@ -169,7 +169,16 @@ mutiny --http-bind 10.1.0.4:18740 \
 
 Each peer gets its own relay carrier and its own identity, derived from its token. The audit trail records that identity rather than mutiny's pid, so two devices are distinguishable, and session grants key on it: an Allow Session tap for one peer does not cover another. A peer cannot choose its identity, only present a token; the mapping is fixed by your configuration at launch. `--http-token` still works for a single unnamed peer.
 
-One gap remains. The consent *mode* is one setting for the whole listener, so you cannot yet make one peer `paired` and another `observe-only`. Per-peer mode needs a mode per relay carrier; the identity and grant half is done.
+Each peer also carries its own consent mode, so one device can be trusted while another is read-only:
+
+```sh
+mutiny --http-bind 10.1.0.4:18740 \
+  --http-peer laptop=4b71...:paired \
+  --http-peer tablet=8c02...:observe-only \
+  --http-peer guest=1f9a...:ask
+```
+
+Without a `:MODE` suffix a peer inherits `--agent-consent`, so existing invocations keep working. `operator` is not assignable to a peer and is refused at the flag, because it belongs to the operator socket where a same-uid human is the consent. The startup line reports each peer's mode, for example `for peers: laptop(paired), tablet(observe-only)`.
 
 #### Driving it from Haven
 
@@ -337,7 +346,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 147 tests, no display required
+cargo test                    # 151 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
