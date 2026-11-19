@@ -41,7 +41,7 @@ Not built yet:
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
 - Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
-- The HTTP MCP carrier is a slice: no SSE, no session management, and no per-peer identity, so all HTTP clients share one grant identity. It has not been tested against a real Haven client over a tunnel.
+- The HTTP MCP carrier is a slice: no SSE, no session management, and no per-peer identity, so all HTTP clients share one grant identity. Driven end to end from Haven on a phone over an SSH forward; WireGuard is untested.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
 
@@ -132,16 +132,18 @@ Identifiers are stable regardless of the public product name, which is still ope
 Nothing listens on the network unless you ask for it. `--http-bind` names an explicit interface address, normally a WireGuard or SSH-tunneled IP:
 
 ```sh
-mutiny --http-bind 100.64.0.5:8730 --agent-consent paired
+mutiny --http-bind 100.64.0.5:18740 --agent-consent paired
 # mutiny: HTTP MCP pairing token: 9f2c...   (generated once, printed to stderr)
 ```
 
 A wildcard bind (`0.0.0.0` or `[::]`) is refused, because the listener is meant to sit on a named interface rather than every interface. Pass `--http-token` to supply your own token; otherwise one is generated from the kernel CSPRNG and printed once.
 
+Pick a port that is not already taken. Haven's own MCP reverse tunnel binds `127.0.0.1:8730` on the workstation, so that port is a poor choice for the peer it is meant to serve. If the bind fails the listener stays down and the GUI keeps running, with a warning naming the reason.
+
 Clients POST JSON-RPC to `/mcp` with `Authorization: Bearer <token>`:
 
 ```sh
-curl -s http://100.64.0.5:8730/mcp \
+curl -s http://100.64.0.5:18740/mcp \
   -H 'Authorization: Bearer 9f2c...' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
@@ -153,6 +155,26 @@ An unpaired client gets `401` before its body is read, so it cannot make the lis
 This is a bounded slice. Each request is stateless: there is no MCP session id, so the name sent in `initialize` does not persist and every call is audited as `http-peer`. SSE streaming, session management, and `DELETE` are not implemented.
 
 One trust gap is worth stating plainly. The agent socket sees the mutiny process as the peer, so every HTTP client shares one peer identity. Session grants key on that identity, which means an Allow Session tap under `--agent-consent ask` would grant every HTTP client rather than the one that prompted. Prefer `paired` (one token, one trust level) or `observe-only` for a network listener until per-peer identity exists for this carrier.
+
+#### Driving it from Haven
+
+Verified end to end with Haven on a phone, over an SSH local forward rather than a directly exposed port. Bind loopback only on the workstation:
+
+```sh
+mutiny --http-bind 127.0.0.1:18740 --agent-consent paired
+```
+
+Then forward the phone's loopback to it through the SSH profile for that host (`add_port_forward`, type `LOCAL`, bind port 18740 to `127.0.0.1:18740`). Haven's Linux guest shares its network namespace, so from the guest:
+
+```sh
+curl -s http://127.0.0.1:18740/mcp \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}'
+```
+
+What that run showed: no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
+
+Every one of those calls audited against the mutiny process's own pid, which is the shared-identity gap above observed from a real remote client rather than inferred.
 
 ## Configuration
 
