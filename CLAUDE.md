@@ -25,6 +25,8 @@ cargo bench                              # headless engine baseline, see benches
 
 Edition 2024, declared `rust-version = 1.92`. Clippy (with `-D warnings`) and fmt are clean.
 
+**Check against the CI toolchain, not just your local one.** CI runs Arch's current stable, which is newer than most local installs and carries clippy lints yours lacks. A rung once passed locally and failed CI on `chunks_exact_to_as_chunks`. Install the CI version (`rustup toolchain install <ver> --profile minimal --component clippy rustfmt`) and run `cargo +<ver> clippy --locked --all-targets -- -D warnings` before pushing.
+
 **Tests need no display.** `env -u WAYLAND_DISPLAY -u DISPLAY cargo test` passes. The integration tests drive real `/bin/sh` PTYs through `AppController` with no GTK application attached: `ensure_ui_window` returns early when `gtk_app` is `None`, so no widgets are created. Engine, topology, IPC, and MCP work is therefore testable headlessly; only `src/ui/` needs a display.
 
 One caveat: `action::tests::every_action_id_is_registered_uniquely` calls `gtk4::init()` and validates accelerator syntax only if that succeeds. Headless runs silently skip the accelerator check.

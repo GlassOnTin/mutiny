@@ -743,7 +743,8 @@ fn decode_texture(image: &Image) -> Option<gdk::Texture> {
                 image.data.clone()
             } else {
                 let mut out = Vec::with_capacity(image.data.len() / 3 * 4);
-                for px in image.data.chunks_exact(3) {
+                let (pixels, _remainder) = image.data.as_chunks::<3>();
+                for px in pixels {
                     out.extend_from_slice(&[px[0], px[1], px[2], 255]);
                 }
                 out
