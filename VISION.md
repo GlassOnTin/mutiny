@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v8, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, and bundled shell integration are shipped; the growth diagnostic below says which is which. The next rung is TOML config (see M1).
+Status: draft v9, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, and TOML config are shipped; the growth diagnostic below says which is which. The next rung is answering terminal capability queries (see M1).
 
 ## Thesis
 
@@ -41,7 +41,7 @@ A Linux desktop power user on Wayland or X11, KDE Plasma or a GTK desktop, runni
 3. **No silent automation, no divergent state.** Agent reads and writes operate on the exact `Workspace` rendered on screen, leave an audit trail, and surface visibly in window chrome.
 4. **Corporate and vendor neutrality.** Any CLI or MCP client speaking standard PTY and JSON-RPC conventions is a first-class peer. Vendor names never appear in product chrome or user-facing documentation. Haven is named in this document as the reference peer, not as a vendor or an endorsement; the rule binds the shipped app and its public docs, not internal design notes.
 5. **Pure Rust, human-understandable code.** Dependencies come from crates.io and standard Linux system libraries (`gtk4`, `pango`, `harfbuzz`, `fontconfig`). Every merged change must be explainable unaided by a human maintainer, which means a change too large to explain is a change to split.
-6. **Local-first.** Plain TOML config with live reload, zero telemetry, zero outbound network calls. The config file is M1 work; until it lands, font and palette are constants and this principle is partly aspirational.
+6. **Local-first.** Plain TOML config with live reload, zero telemetry, zero outbound network calls. Shipped: `$XDG_CONFIG_HOME/mutiny/config.toml`, with CLI flags taking precedence over the file over built-in defaults.
 
 ## Presence: the Haven peer contract
 
@@ -126,7 +126,7 @@ Haven's audit found places where the surface looked unified while the implementa
 
 - **The verb surface (largest instance, now locked rather than unified).** `IpcRequest`, `CtlVerb`, the MCP dispatch match, and `tool_definitions()` are still four hand-maintained lists describing one vocabulary, and a new verb still takes four edits. What changed in M0.5 is that drift now fails a test instead of shipping: `variant_ordinal` is an exhaustive match that will not compile without a decision for a new verb, `verb_samples` must cover it, and the parity tests assert reachability and dispatch in both directions. Generating the lists from one source remains the real fix.
 - **The response shape.** `IpcResponse::Ok` is one struct of optional fields filled by destructuring, with constructors in two modules. A new field is a three-site edit. Worth collapsing before the verb count grows.
-- **Configuration.** Principle 6 promises one TOML store; font, palette, and geometry are constants in the renderer. Until the store exists there is nothing to drift, but every new constant widens the eventual migration.
+- **Configuration (resolved).** Principle 6's single TOML store now exists and the renderer reads font, palette, geometry, and padding from it. The remaining discipline is to keep new tunables going into the store rather than becoming fresh constants beside it.
 
 ## Milestones
 
@@ -168,9 +168,12 @@ Evidence: `tests/shell_integration.rs` spawns a fresh bash with an empty HOME an
 
 Discovered defect, not yet fixed: fish 4 blocks at startup until the terminal answers its capability queries (primary DA, cursor position report, XTVERSION, OSC 11 background, DCS terminfo). A bare PTY that stays silent leaves fish alive but unresponsive. Whether mutiny answers all of these is unverified and needs checking before fish can be called supported.
 
-**Next rung: TOML config.** Font, colours, and palette are still compile-time constants, so a fresh install cannot be customized at all. Ship `$XDG_CONFIG_HOME/mutiny/config.toml` with live reload, a documented key set, and defined precedence against CLI flags.
+**Shipped rung: TOML config.** `$XDG_CONFIG_HOME/mutiny/config.toml` with a documented key set covering font, colors and the 16-entry palette, geometry, and scrollback depth. Precedence is CLI flag, then file, then built-in default, and overrides are re-applied on every reload so editing the file cannot discard a launch flag. The file is stat'd every 250 ms; font, colors, palette, and padding apply immediately to open panes (cell metrics are recomputed, which resizes the grid and PTY), while geometry and scrollback apply to new panes and windows because alacritty fixes scrollback at construction. Unknown keys are rejected, a malformed file keeps the previous config, bad colors fall back per key, and out-of-range numbers clamp. Nothing here can take the terminal down.
 
-- TOML config at `$XDG_CONFIG_HOME/mutiny/config.toml` with live reload, a documented key set, and defined precedence against CLI flags.
+Evidence: `tests/config_reload.rs` covers fresh-install defaults, picking up a newly created file, live font and palette edits, flags surviving a reload while unflagged keys follow the file, malformed-edit recovery, deletion reverting to defaults, and configured geometry and scrollback reaching new panes. `src/config.rs` unit tests cover parsing, precedence, clamping, path resolution, and mtime detection.
+
+**Next rung: answer terminal capability queries.** The shell-integration rung found that fish 4 blocks at startup until the terminal answers primary DA, cursor position report, XTVERSION, OSC 11 background, and DCS terminfo queries. That is a protocol correctness gap in the engine, not a shell problem, and it makes a shell we ship integration for unusable. Answer the queries mutiny can answer honestly and decline the rest, then verify fish starts responsively.
+
 - Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
 - Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.
 - OSC 777 notifications through the desktop portal, with tab badges.

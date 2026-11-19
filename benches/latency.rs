@@ -137,6 +137,7 @@ fn pty_echo_latency() {
             None,
             Some((String::from("/bin/sh"), Vec::new())),
             9000,
+            10_000,
         ) else {
             println!("PTY echo             skipped (cannot spawn /bin/sh)");
             return;

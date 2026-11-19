@@ -10,8 +10,10 @@ use gtk4::prelude::*;
 
 use mutiny::action::{ACTIONS, build_menubar_model, by_slug};
 use mutiny::app::AppController;
+use mutiny::config::{self, Overrides};
 use mutiny::ipc::{
-    ConsentMode, IpcRequest, IpcResponse, agent_socket_path, default_socket_path, send_request,
+    ConsentMode, IpcRequest, IpcResponse, agent_socket_path, default_audit_path,
+    default_socket_path, send_request,
 };
 use mutiny::mcp::McpBridge;
 use mutiny::topology::{PaneId, SplitAxis, TabId, WindowId};
@@ -40,6 +42,22 @@ struct Cli {
     /// allows Tier-2 acts without a prompt, so opt in deliberately.
     #[arg(long, value_enum, default_value_t = McpConsentArg::Ask)]
     agent_consent: McpConsentArg,
+
+    /// GUI only: font family, overriding config.toml [font] family.
+    #[arg(long)]
+    font: Option<String>,
+
+    /// GUI only: font size in points, overriding config.toml [font] size.
+    #[arg(long)]
+    font_size: Option<u32>,
+
+    /// GUI only: initial pane columns, overriding config.toml [geometry].
+    #[arg(long)]
+    cols: Option<usize>,
+
+    /// GUI only: initial pane rows, overriding config.toml [geometry].
+    #[arg(long)]
+    rows: Option<usize>,
 
     #[command(subcommand)]
     command: Option<TopCommand>,
@@ -247,6 +265,12 @@ fn main() -> ExitCode {
             cli.working_directory,
             cli.shell,
             cli.agent_consent.into(),
+            Overrides {
+                font_family: cli.font,
+                font_size: cli.font_size,
+                initial_cols: cli.cols,
+                initial_rows: cli.rows,
+            },
         ),
     }
 }
@@ -407,6 +431,7 @@ fn run_gui_app(
     initial_cwd: Option<PathBuf>,
     shell_prog: Option<String>,
     agent_consent: ConsentMode,
+    overrides: Overrides,
 ) -> ExitCode {
     if socket_path.exists()
         && let Ok(IpcResponse::Ok { .. }) = send_request(
@@ -426,7 +451,15 @@ fn run_gui_app(
         .build();
 
     let shell_override = shell_prog.map(|p| (p, Vec::new()));
-    let controller = AppController::new(shell_override);
+    // Precedence: CLI flag, then config.toml, then built-in default. Overrides
+    // are re-applied on every live reload, so editing the file cannot discard
+    // a flag the operator launched with.
+    let controller = AppController::with_config(
+        shell_override,
+        default_audit_path(),
+        config::config_path(),
+        overrides,
+    );
 
     if let Err(err) = controller.start_ipc_listener(&socket_path) {
         eprintln!(

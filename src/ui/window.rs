@@ -46,11 +46,15 @@ impl MutinyWindow {
         controller: Rc<AppController>,
     ) -> Self {
         // Leave titlebar unset so Wayland xdg-decoration uses KWin native Breeze SSD on KDE.
+        let (win_w, win_h) = {
+            let cfg = controller.config_ref();
+            (cfg.window_width, cfg.window_height)
+        };
         let gtk_window = gtk4::ApplicationWindow::builder()
             .application(app)
             .title("Mutiny")
-            .default_width(980)
-            .default_height(640)
+            .default_width(win_w)
+            .default_height(win_h)
             .show_menubar(false)
             .handle_menubar_accel(false)
             .build();
@@ -415,6 +419,16 @@ impl MutinyWindow {
     pub fn queue_draw_pane(&self, pane_id: PaneId) {
         if let Some(view) = self.inner.pane_views.borrow().get(&pane_id) {
             view.queue_draw();
+        }
+    }
+
+    /// Applies a live config reload: rebuild each view's font and cell metrics
+    /// (which resizes its grid and PTY), then repaint. Window geometry is not
+    /// resized here; it applies to newly opened windows.
+    pub fn refresh_from_config(&self) {
+        let views: Vec<TerminalView> = self.inner.pane_views.borrow().values().cloned().collect();
+        for view in views {
+            view.refresh_font();
         }
     }
 

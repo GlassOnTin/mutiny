@@ -15,22 +15,12 @@ use gtk4::subclass::prelude::*;
 
 use crate::action::build_context_menu_model;
 use crate::app::AppController;
+use crate::config::ResolvedConfig;
 use crate::engine::{GridSize, KeyInput, KeyKind};
 use crate::topology::PaneId;
 
-const PADDING_PX: f32 = 6.0;
-const DEFAULT_FONT: &str = "Monospace 11";
-
-const DEFAULT_BG: Rgb = Rgb {
-    r: 0x16,
-    g: 0x18,
-    b: 0x1d,
-};
-const DEFAULT_FG: Rgb = Rgb {
-    r: 0xe6,
-    g: 0xe9,
-    b: 0xef,
-};
+// Font, palette, and padding come from the config store, not constants here.
+// See src/config.rs for the key set and defaults.
 
 mod imp {
     use super::*;
@@ -61,19 +51,6 @@ mod imp {
             obj.set_can_focus(true);
             obj.set_hexpand(true);
             obj.set_vexpand(true);
-
-            let desc = pango::FontDescription::from_string(DEFAULT_FONT);
-            let ctx = obj.pango_context();
-            let metrics = ctx.metrics(Some(&desc), None);
-            let cw = ((metrics.approximate_char_width() as f32) / (pango::SCALE as f32))
-                .ceil()
-                .max(7.0);
-            let ch = (((metrics.ascent() + metrics.descent()) as f32) / (pango::SCALE as f32))
-                .ceil()
-                .max(14.0);
-            self.cell_w.set(cw);
-            self.cell_h.set(ch);
-            *self.font_desc.borrow_mut() = Some(desc);
 
             let popover = gtk4::PopoverMenu::from_model(Some(&build_context_menu_model()));
             popover.set_parent(&*obj);
@@ -112,8 +89,33 @@ impl TerminalView {
         let imp = view.imp();
         imp.pane_id.set(Some(pane_id));
         *imp.controller.borrow_mut() = Rc::downgrade(controller);
+        view.refresh_font();
         view.install_controllers();
         view
+    }
+
+    /// Rebuilds the Pango font and cell metrics from the config store. Called
+    /// at construction and again on live reload, so a font change takes effect
+    /// without recreating the pane.
+    pub fn refresh_font(&self) {
+        let Some(ctrl) = self.upgrade_controller() else {
+            return;
+        };
+        let desc = pango::FontDescription::from_string(&ctrl.config_ref().font_description);
+        let ctx = self.pango_context();
+        let metrics = ctx.metrics(Some(&desc), None);
+        let cw = ((metrics.approximate_char_width() as f32) / (pango::SCALE as f32))
+            .ceil()
+            .max(7.0);
+        let ch = (((metrics.ascent() + metrics.descent()) as f32) / (pango::SCALE as f32))
+            .ceil()
+            .max(14.0);
+        self.imp().cell_w.set(cw);
+        self.imp().cell_h.set(ch);
+        *self.imp().font_desc.borrow_mut() = Some(desc);
+        // Cell size changed, so the grid must be recomputed and the PTY resized.
+        self.recompute_grid_dimensions(self.width(), self.height());
+        self.queue_draw();
     }
 
     pub fn pane_id(&self) -> Option<PaneId> {
@@ -124,11 +126,18 @@ impl TerminalView {
         self.imp().controller.borrow().upgrade()
     }
 
+    fn padding_px(&self) -> f32 {
+        self.upgrade_controller()
+            .map(|c| c.config_ref().padding_px)
+            .unwrap_or_else(|| crate::config::ResolvedConfig::default().padding_px)
+    }
+
     fn px_to_cell(&self, x: f64, y: f64) -> (usize, usize) {
         let cw = self.imp().cell_w.get().max(1.0) as f64;
         let ch = self.imp().cell_h.get().max(1.0) as f64;
-        let col = ((x - PADDING_PX as f64).max(0.0) / cw).floor() as usize;
-        let row = ((y - PADDING_PX as f64).max(0.0) / ch).floor() as usize;
+        let padding = self.padding_px() as f64;
+        let col = ((x - padding).max(0.0) / cw).floor() as usize;
+        let row = ((y - padding).max(0.0) / ch).floor() as usize;
         (col, row)
     }
 
@@ -141,8 +150,9 @@ impl TerminalView {
         };
         let cw = self.imp().cell_w.get().max(1.0);
         let ch = self.imp().cell_h.get().max(1.0);
-        let usable_w = (width_px as f32 - 2.0 * PADDING_PX).max(cw * 4.0);
-        let usable_h = (height_px as f32 - 2.0 * PADDING_PX).max(ch * 2.0);
+        let padding = ctrl.config_ref().padding_px;
+        let usable_w = (width_px as f32 - 2.0 * padding).max(cw * 4.0);
+        let usable_h = (height_px as f32 - 2.0 * padding).max(ch * 2.0);
         let cols = (usable_w / cw).floor() as usize;
         let rows = (usable_h / ch).floor() as usize;
         let grid_size = GridSize::new(cols, rows, cw as u16, ch as u16);
@@ -336,14 +346,17 @@ impl TerminalView {
             return;
         }
 
-        snapshot.append_color(
-            &rgb_to_gdk(DEFAULT_BG, 1.0),
-            &graphene::Rect::new(0.0, 0.0, w, h),
-        );
-
         let (Some(pid), Some(ctrl)) = (self.pane_id(), self.upgrade_controller()) else {
             return;
         };
+        // One config read per frame; nothing here parses or allocates per cell.
+        let cfg = ctrl.config_ref();
+        let padding = cfg.padding_px;
+        let bg = cfg.background;
+        let fg = cfg.foreground;
+
+        snapshot.append_color(&rgb_to_gdk(bg, 1.0), &graphene::Rect::new(0.0, 0.0, w, h));
+
         let cw = self.imp().cell_w.get();
         let ch = self.imp().cell_h.get();
         let base_font = self
@@ -351,7 +364,7 @@ impl TerminalView {
             .font_desc
             .borrow()
             .clone()
-            .unwrap_or_else(|| pango::FontDescription::from_string(DEFAULT_FONT));
+            .unwrap_or_else(|| pango::FontDescription::from_string(&cfg.font_description));
 
         let ws = ctrl.workspace.borrow();
         let is_active_pane = ws.active_pane_id() == Some(pid);
@@ -372,7 +385,7 @@ impl TerminalView {
         for row_idx in 0..rows {
             let line = Line(row_idx as i32 - display_offset);
             let grid_row = &grid[line];
-            let y = PADDING_PX + (row_idx as f32) * ch;
+            let y = padding + (row_idx as f32) * ch;
 
             // Pass 1: contiguous non-default background runs + selection highlight
             let mut col = 0usize;
@@ -382,18 +395,14 @@ impl TerminalView {
                 let selected = sel_range.is_some_and(|r| r.contains(pt));
                 let inverse = cell.flags.contains(CellFlags::INVERSE);
                 let bg_rgb = if selected {
-                    Rgb {
-                        r: 0x3b,
-                        g: 0x52,
-                        b: 0x78,
-                    }
+                    cfg.selection
                 } else if inverse {
-                    resolve_color(cell.fg, DEFAULT_FG)
+                    resolve_color(cell.fg, fg, &cfg)
                 } else {
-                    resolve_color(cell.bg, DEFAULT_BG)
+                    resolve_color(cell.bg, bg, &cfg)
                 };
 
-                if bg_rgb != DEFAULT_BG {
+                if bg_rgb != bg {
                     let start_col = col;
                     col += 1;
                     while col < cols {
@@ -401,15 +410,11 @@ impl TerminalView {
                         let next_sel =
                             sel_range.is_some_and(|r| r.contains(Point::new(line, Column(col))));
                         let next_bg = if next_sel {
-                            Rgb {
-                                r: 0x3b,
-                                g: 0x52,
-                                b: 0x78,
-                            }
+                            cfg.selection
                         } else if next_cell.flags.contains(CellFlags::INVERSE) {
-                            resolve_color(next_cell.fg, DEFAULT_FG)
+                            resolve_color(next_cell.fg, fg, &cfg)
                         } else {
-                            resolve_color(next_cell.bg, DEFAULT_BG)
+                            resolve_color(next_cell.bg, bg, &cfg)
                         };
                         if next_bg != bg_rgb {
                             break;
@@ -419,7 +424,7 @@ impl TerminalView {
                     let span_w = ((col - start_col) as f32) * cw;
                     snapshot.append_color(
                         &rgb_to_gdk(bg_rgb, 1.0),
-                        &graphene::Rect::new(PADDING_PX + (start_col as f32) * cw, y, span_w, ch),
+                        &graphene::Rect::new(padding + (start_col as f32) * cw, y, span_w, ch),
                     );
                 } else {
                     col += 1;
@@ -441,7 +446,7 @@ impl TerminalView {
                 }
 
                 let start_col = col;
-                let style = RunStyle::from_cell(cell);
+                let style = RunStyle::from_cell(cell, &cfg);
                 run_text.clear();
                 run_text.push(cell.c);
                 let underline = cell.flags.contains(CellFlags::UNDERLINE);
@@ -453,7 +458,7 @@ impl TerminalView {
                         col += 1;
                         continue;
                     }
-                    if RunStyle::from_cell(next) != style
+                    if RunStyle::from_cell(next, &cfg) != style
                         || next.flags.contains(CellFlags::UNDERLINE) != underline
                     {
                         break;
@@ -472,7 +477,7 @@ impl TerminalView {
                 layout.set_font_description(Some(&desc));
                 layout.set_text(&run_text);
 
-                let x = PADDING_PX + (start_col as f32) * cw;
+                let x = padding + (start_col as f32) * cw;
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new(x, y));
                 snapshot.append_layout(&layout, &rgb_to_gdk(style.fg, 1.0));
@@ -491,10 +496,9 @@ impl TerminalView {
         // Pass 3: Cursor (visible when at bottom of scrollback)
         if display_offset == 0 {
             let cursor_pt = grid.cursor.point;
-            let cx = PADDING_PX + (cursor_pt.column.0 as f32) * cw;
-            let cy = PADDING_PX + (cursor_pt.line.0 as f32) * ch;
-            let cursor_rgba =
-                gdk::RGBA::new(0.54, 0.71, 0.98, if is_active_pane { 0.78 } else { 0.35 });
+            let cx = padding + (cursor_pt.column.0 as f32) * cw;
+            let cy = padding + (cursor_pt.line.0 as f32) * ch;
+            let cursor_rgba = rgb_to_gdk(cfg.cursor, if is_active_pane { 0.78 } else { 0.35 });
             if is_active_pane {
                 snapshot.append_color(&cursor_rgba, &graphene::Rect::new(cx, cy, cw, ch));
             } else {
@@ -514,7 +518,7 @@ impl TerminalView {
         // Pass 4: Subtle top accent bar on active split pane for instant visual orientation
         if is_active_pane {
             snapshot.append_color(
-                &gdk::RGBA::new(0.36, 0.62, 0.96, 0.85),
+                &rgb_to_gdk(cfg.accent, 0.85),
                 &graphene::Rect::new(0.0, 0.0, w, 2.0),
             );
         }
@@ -529,11 +533,11 @@ struct RunStyle {
 }
 
 impl RunStyle {
-    fn from_cell(cell: &alacritty_terminal::term::cell::Cell) -> Self {
+    fn from_cell(cell: &alacritty_terminal::term::cell::Cell, cfg: &ResolvedConfig) -> Self {
         let fg = if cell.flags.contains(CellFlags::INVERSE) {
-            resolve_color(cell.bg, DEFAULT_BG)
+            resolve_color(cell.bg, cfg.background, cfg)
         } else {
-            resolve_color(cell.fg, DEFAULT_FG)
+            resolve_color(cell.fg, cfg.foreground, cfg)
         };
         Self {
             fg,
@@ -552,124 +556,40 @@ fn rgb_to_gdk(c: Rgb, alpha: f32) -> gdk::RGBA {
     )
 }
 
-fn resolve_color(color: AnsiColor, fallback: Rgb) -> Rgb {
+fn resolve_color(color: AnsiColor, fallback: Rgb, cfg: &ResolvedConfig) -> Rgb {
     match color {
         AnsiColor::Spec(rgb) => rgb,
-        AnsiColor::Indexed(idx) => indexed_color(idx),
+        AnsiColor::Indexed(idx) => indexed_color(idx, cfg),
         AnsiColor::Named(named) => match named {
-            NamedColor::Foreground | NamedColor::BrightForeground => DEFAULT_FG,
-            NamedColor::Background => DEFAULT_BG,
-            NamedColor::Cursor => Rgb {
-                r: 0x89,
-                g: 0xb4,
-                b: 0xfa,
-            },
-            NamedColor::Black | NamedColor::DimBlack => indexed_color(0),
-            NamedColor::Red | NamedColor::DimRed => indexed_color(1),
-            NamedColor::Green | NamedColor::DimGreen => indexed_color(2),
-            NamedColor::Yellow | NamedColor::DimYellow => indexed_color(3),
-            NamedColor::Blue | NamedColor::DimBlue => indexed_color(4),
-            NamedColor::Magenta | NamedColor::DimMagenta => indexed_color(5),
-            NamedColor::Cyan | NamedColor::DimCyan => indexed_color(6),
-            NamedColor::White | NamedColor::DimWhite => indexed_color(7),
-            NamedColor::BrightBlack => indexed_color(8),
-            NamedColor::BrightRed => indexed_color(9),
-            NamedColor::BrightGreen => indexed_color(10),
-            NamedColor::BrightYellow => indexed_color(11),
-            NamedColor::BrightBlue => indexed_color(12),
-            NamedColor::BrightMagenta => indexed_color(13),
-            NamedColor::BrightCyan => indexed_color(14),
-            NamedColor::BrightWhite => indexed_color(15),
+            NamedColor::Foreground | NamedColor::BrightForeground => cfg.foreground,
+            NamedColor::Background => cfg.background,
+            NamedColor::Cursor => cfg.cursor,
+            NamedColor::Black | NamedColor::DimBlack => indexed_color(0, cfg),
+            NamedColor::Red | NamedColor::DimRed => indexed_color(1, cfg),
+            NamedColor::Green | NamedColor::DimGreen => indexed_color(2, cfg),
+            NamedColor::Yellow | NamedColor::DimYellow => indexed_color(3, cfg),
+            NamedColor::Blue | NamedColor::DimBlue => indexed_color(4, cfg),
+            NamedColor::Magenta | NamedColor::DimMagenta => indexed_color(5, cfg),
+            NamedColor::Cyan | NamedColor::DimCyan => indexed_color(6, cfg),
+            NamedColor::White | NamedColor::DimWhite => indexed_color(7, cfg),
+            NamedColor::BrightBlack => indexed_color(8, cfg),
+            NamedColor::BrightRed => indexed_color(9, cfg),
+            NamedColor::BrightGreen => indexed_color(10, cfg),
+            NamedColor::BrightYellow => indexed_color(11, cfg),
+            NamedColor::BrightBlue => indexed_color(12, cfg),
+            NamedColor::BrightMagenta => indexed_color(13, cfg),
+            NamedColor::BrightCyan => indexed_color(14, cfg),
+            NamedColor::BrightWhite => indexed_color(15, cfg),
             _ => fallback,
         },
     }
 }
 
-fn indexed_color(idx: u8) -> Rgb {
-    const PALETTE_16: [Rgb; 16] = [
-        Rgb {
-            r: 0x1e,
-            g: 0x22,
-            b: 0x2a,
-        },
-        Rgb {
-            r: 0xe0,
-            g: 0x6c,
-            b: 0x75,
-        },
-        Rgb {
-            r: 0x98,
-            g: 0xc3,
-            b: 0x79,
-        },
-        Rgb {
-            r: 0xe5,
-            g: 0xc0,
-            b: 0x7b,
-        },
-        Rgb {
-            r: 0x61,
-            g: 0xaf,
-            b: 0xef,
-        },
-        Rgb {
-            r: 0xc6,
-            g: 0x78,
-            b: 0xdd,
-        },
-        Rgb {
-            r: 0x56,
-            g: 0xb6,
-            b: 0xc2,
-        },
-        Rgb {
-            r: 0xab,
-            g: 0xb2,
-            b: 0xbf,
-        },
-        Rgb {
-            r: 0x5c,
-            g: 0x63,
-            b: 0x70,
-        },
-        Rgb {
-            r: 0xf3,
-            g: 0x8b,
-            b: 0xa8,
-        },
-        Rgb {
-            r: 0xa6,
-            g: 0xe3,
-            b: 0xa1,
-        },
-        Rgb {
-            r: 0xf9,
-            g: 0xe2,
-            b: 0xaf,
-        },
-        Rgb {
-            r: 0x89,
-            g: 0xb4,
-            b: 0xfa,
-        },
-        Rgb {
-            r: 0xcb,
-            g: 0xa6,
-            b: 0xf7,
-        },
-        Rgb {
-            r: 0x94,
-            g: 0xe2,
-            b: 0xd5,
-        },
-        Rgb {
-            r: 0xff,
-            g: 0xff,
-            b: 0xff,
-        },
-    ];
+/// ANSI 0-15 come from the configured palette; the 6x6x6 cube and grayscale
+/// ramp are computed, as they are not part of the configurable 16.
+fn indexed_color(idx: u8, cfg: &ResolvedConfig) -> Rgb {
     match idx {
-        0..=15 => PALETTE_16[idx as usize],
+        0..=15 => cfg.palette[idx as usize],
         16..=231 => {
             let v = idx - 16;
             let r = v / 36;

@@ -277,10 +277,16 @@ pub struct PaneEngine {
 
 impl PaneEngine {
     pub fn new_headless(cols: usize, rows: usize) -> Self {
+        Self::new_headless_with_scrollback(cols, rows, 10_000)
+    }
+
+    /// Scrollback depth is fixed at construction because alacritty's TermConfig
+    /// is, so a config change applies to new panes rather than existing ones.
+    pub fn new_headless_with_scrollback(cols: usize, rows: usize, scrollback_lines: usize) -> Self {
         let size = GridSize::new(cols, rows, 9, 18);
         let events = EventCollector::default();
         let config = TermConfig {
-            scrolling_history: 10_000,
+            scrolling_history: scrollback_lines,
             kitty_keyboard: true,
             ..TermConfig::default()
         };
@@ -316,6 +322,7 @@ impl PaneEngine {
         working_directory: Option<PathBuf>,
         shell_override: Option<(String, Vec<String>)>,
         pane_id_num: u64,
+        scrollback_lines: usize,
     ) -> io::Result<Self> {
         tty::setup_env();
         let mut env = HashMap::new();
@@ -369,7 +376,7 @@ impl PaneEngine {
             env,
         };
         let pty = tty::new(&opts, size.to_window_size(), pane_id_num)?;
-        let mut engine = Self::new_headless(size.cols, size.rows);
+        let mut engine = Self::new_headless_with_scrollback(size.cols, size.rows, scrollback_lines);
         engine.size = size;
         engine.cwd = working_directory;
         engine.pty = Some(pty);

@@ -45,8 +45,8 @@ fn fresh_plain_bash_emits_osc133_and_osc7_without_manual_setup() {
     assert!(!home.join(".bashrc").exists(), "home must start empty");
 
     // No shell override: the engine must resolve $SHELL and inject on its own.
-    let mut engine =
-        PaneEngine::spawn_pty(GridSize::new(100, 30, 9, 18), None, None, 77).expect("spawn bash");
+    let mut engine = PaneEngine::spawn_pty(GridSize::new(100, 30, 9, 18), None, None, 77, 10_000)
+        .expect("spawn bash");
 
     pump(&mut engine, 1200);
     let startup_prompt = engine.prompt_seq();

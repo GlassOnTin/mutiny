@@ -10,6 +10,7 @@ use gtk4::gdk;
 use gtk4::prelude::*;
 
 use crate::action::ActionId;
+use crate::config::{self, Overrides, RELOAD_CHECK_INTERVAL, ResolvedConfig};
 use crate::engine::{
     EngineNotification, GridSize, PaneEngine, SEARCH_LINES_PER_TICK, ScrollbackSearch,
     parse_named_key,
@@ -76,6 +77,11 @@ pub struct AppController {
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
     audit_path: RefCell<Option<PathBuf>>,
+    config: RefCell<ResolvedConfig>,
+    config_path: PathBuf,
+    config_overrides: Overrides,
+    config_mtime: Cell<Option<SystemTime>>,
+    last_config_check: Cell<Instant>,
     pending_waits: RefCell<Vec<PendingWait>>,
     pending_searches: RefCell<Vec<PendingSearch>>,
     pending_consents: RefCell<VecDeque<PendingConsent>>,
@@ -102,8 +108,34 @@ impl AppController {
         shell_override: Option<(String, Vec<String>)>,
         audit_path: PathBuf,
     ) -> Rc<Self> {
+        Self::with_config(
+            shell_override,
+            audit_path,
+            config::config_path(),
+            Overrides::default(),
+        )
+    }
+
+    /// Builds a controller with an explicit config path and CLI overrides.
+    /// Precedence is flag, then file, then default; overrides are re-applied on
+    /// every live reload so editing the file cannot discard a launch flag.
+    pub fn with_config(
+        shell_override: Option<(String, Vec<String>)>,
+        audit_path: PathBuf,
+        config_path: PathBuf,
+        overrides: Overrides,
+    ) -> Rc<Self> {
         let mut ring = VecDeque::with_capacity(MAX_AUDIT_ENTRIES);
         let next_seq = load_audit_tail(&audit_path, &mut ring);
+        let loaded = match config::load_file(&config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("warning: config not loaded, using defaults: {err}");
+                config::Config::default()
+            }
+        };
+        let resolved = config::resolve(&loaded, &overrides);
+        let mtime = config::file_mtime(&config_path);
         Rc::new(Self {
             workspace: RefCell::new(Workspace::new()),
             gtk_app: RefCell::new(None),
@@ -114,6 +146,11 @@ impl AppController {
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
+            config: RefCell::new(resolved),
+            config_path,
+            config_overrides: overrides,
+            config_mtime: Cell::new(mtime),
+            last_config_check: Cell::new(Instant::now()),
             pending_waits: RefCell::new(Vec::new()),
             pending_searches: RefCell::new(Vec::new()),
             pending_consents: RefCell::new(VecDeque::new()),
@@ -136,6 +173,58 @@ impl AppController {
 
     pub fn agent_mode(&self) -> ConsentMode {
         self.agent_mode.get()
+    }
+
+    /// Zero-copy read of the effective config, for the renderer.
+    pub fn config_ref(&self) -> std::cell::Ref<'_, ResolvedConfig> {
+        self.config.borrow()
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// Stats the config file on a coarse interval and reloads when it changed.
+    /// Returns true when a new config was applied. A parse failure keeps the
+    /// previous config and does not retry until the file changes again, so a
+    /// half-written file cannot spam warnings every tick.
+    pub fn reload_config_if_changed(self: &Rc<Self>) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.last_config_check.get()) < RELOAD_CHECK_INTERVAL {
+            return false;
+        }
+        self.last_config_check.set(now);
+
+        let mtime = config::file_mtime(&self.config_path);
+        if mtime == self.config_mtime.get() {
+            return false;
+        }
+        self.config_mtime.set(mtime);
+
+        let loaded = match config::load_file(&self.config_path) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("warning: config reload failed, keeping previous: {err}");
+                return false;
+            }
+        };
+        let resolved = config::resolve(&loaded, &self.config_overrides);
+        if *self.config.borrow() == resolved {
+            return false;
+        }
+        *self.config.borrow_mut() = resolved;
+        self.apply_config_to_views();
+        true
+    }
+
+    fn apply_config_to_views(self: &Rc<Self>) {
+        let wins: Vec<MutinyWindow> = self.ui_windows.borrow().values().cloned().collect();
+        for w in wins {
+            w.refresh_from_config();
+        }
+        for pid in self.workspace.borrow().pane_ids() {
+            self.queue_redraw_pane(pid);
+        }
     }
 
     pub fn attach_gtk_app(&self, app: &gtk4::Application) {
@@ -332,9 +421,13 @@ impl AppController {
     }
 
     fn spawn_engine(&self, pane_id: PaneId, cwd: Option<PathBuf>) -> io::Result<PaneEngine> {
-        let size = GridSize::new(100, 30, 9, 18);
+        let (cols, rows, scrollback) = {
+            let cfg = self.config.borrow();
+            (cfg.initial_cols, cfg.initial_rows, cfg.scrollback_lines)
+        };
+        let size = GridSize::new(cols, rows, 9, 18);
         let shell = self.shell_override.borrow().clone();
-        PaneEngine::spawn_pty(size, cwd, shell, pane_id.0)
+        PaneEngine::spawn_pty(size, cwd, shell, pane_id.0, scrollback)
     }
 
     fn active_cwd(&self, win_hint: Option<WindowId>, pane_hint: Option<PaneId>) -> Option<PathBuf> {
@@ -683,6 +776,7 @@ impl AppController {
 
     /// Single non-blocking tick: drains PTYs, updates UI badges/draws, and services IPC/MCP sockets.
     pub fn poll_once(self: &Rc<Self>) {
+        self.reload_config_if_changed();
         let pane_ids = self.workspace.borrow().pane_ids();
         let mut panes_exited = Vec::new();
         let mut windows_needing_chrome_refresh = Vec::new();

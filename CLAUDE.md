@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v8). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, and bundled shell integration are shipped. The next rung is TOML config, then the rest of M1 (Kitty graphics, IME, drag gestures). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v9). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, and TOML config are shipped. The next rung is answering terminal capability queries (fish 4 blocks on them), then the rest of M1 (Kitty graphics, IME, drag gestures). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 46 tests: 34 unit + 11 e2e + 1 shell integration
+cargo test                               # 63 tests: 44 unit + 7 config + 11 e2e + 1 shell
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -80,6 +80,18 @@ Deferred work is modelled as queues holding a cloned `UnixStream`, not futures: 
 `PaneEngine::advance_bytes` runs its own byte-wise OSC scanner and **slices the byte stream at each OSC terminator**, feeding the preceding slice to alacritty's `Processor` before handling the payload itself. This is deliberate: OSC 133 markers must observe the exact grid cursor position at the instant they arrive, which a post-hoc event callback cannot give. New protocol extensions (OSC 133/7/9;4 today, Kitty graphics later) go in `handle_osc_payload`, not in a widget.
 
 Alacritty's own events (title, bell, OSC 52 clipboard, `PtyWrite` replies) arrive separately via `EventCollector` and are drained in `collect_term_events`. Two paths, both surfaced as `EngineNotification` to `poll_once`.
+
+### Config store and live reload
+
+`src/config.rs` owns the key set, defaults, parsing, and clamping. `Config` is the raw serde shape; `ResolvedConfig` is what the renderer and spawner read, with colors parsed to `Rgb` and numbers clamped, so no per-frame parsing happens. `Overrides` carries the CLI flags.
+
+Precedence is flag, then file, then default, implemented in `config::resolve`. `AppController` holds the resolved config plus the path, the overrides, and the last seen mtime. `reload_config_if_changed` runs from `poll_once`, throttled to `RELOAD_CHECK_INTERVAL` (250 ms), and re-applies the same overrides on every reload so a file edit cannot discard a launch flag.
+
+What applies when: font, colors, palette, and padding apply immediately (`apply_config_to_views` calls `TerminalView::refresh_font`, which recomputes Pango metrics and resizes the grid and PTY). Geometry and `scrollback_lines` apply to new panes and windows only, because alacritty fixes `scrolling_history` at `Term` construction. `PaneEngine::spawn_pty` takes `scrollback_lines` for that reason; `new_headless` keeps the 10 000 default for tests.
+
+Failure behavior is deliberate: unknown keys are rejected (`deny_unknown_fields`) so typos surface; a malformed file keeps the previous config and does not retry until mtime changes again, so a half-written file cannot spam warnings; a bad color falls back per key; a palette that is not 16 entries falls back whole. Add new tunables to the store rather than as constants beside it.
+
+`tests/config_reload.rs` uses explicit paths via `AppController::with_config`, so it needs no env mutation and runs in parallel. Reload tests must `settle()` past the 250 ms throttle and force a distinct mtime rather than relying on filesystem granularity.
 
 ### Shell integration is bundled and injected at spawn
 
@@ -149,8 +161,8 @@ These look closer to done than they are:
 - **No config file.** VISION specifies TOML with live reload; there is no config module and no `toml` dependency. Font (`Monospace 11`), colours, and the 16-colour palette are constants in `src/ui/terminal_view.rs`.
 - **Split ratios are stored but not applied.** `SplitNode::Split { ratio }` is preserved through tree surgery, but `build_split_widget` never calls `set_position`, and user drags are not written back. Splits render at GTK's default.
 - **No shell integration snippets shipped.** OSC 133/7 tracking works only if the shell emits the markers; nothing in the repo installs them. PTYs do get `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID=<id>` for that purpose.
-- **No config file is the next rung.** Font, colours, and palette are compile-time constants.
-- **fish 4 blocks on unanswered terminal queries.** It waits for primary DA, cursor position report, XTVERSION, OSC 11 background, and DCS terminfo responses before becoming responsive. Whether mutiny answers all of them is unverified. Found while verifying the fish snippet in a container; a bare PTY that stays silent leaves fish alive but stuck.
+- **fish 4 blocks on unanswered terminal queries (next rung).** It waits for primary DA, cursor position report, XTVERSION, OSC 11 background, and DCS terminfo responses before becoming responsive. Whether mutiny answers all of them is unverified. Found while verifying the fish snippet in a container; a bare PTY that stays silent leaves fish alive but stuck.
+- **No in-app settings UI.** The TOML file is the only config surface.
 - **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell.
 - **CI runs on GitHub and is green.** `origin` is `https://github.com/GlassOnTin/mutiny` (public, AGPL-3.0-or-later). `.github/workflows/ci.yml` runs fmt, clippy, the displayless suite, the suite under Xvfb, and a release build in an Arch container, with cargo caching keyed on rustc and GTK versions. `./scripts/ci.sh` runs the same checks locally. `.github/workflows/release.yml` is tag-triggered and gated on CI, but has not been exercised: no tag has been pushed.
 - Untested by the current suite: real GUI rendering, Kitty graphics, drag gestures, session restore, and the M2 HTTP MCP listener.

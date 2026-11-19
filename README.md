@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 46 tests that run without a display. The GUI itself is not exercised by the automated suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 63 tests that run without a display. The GUI itself is not exercised by the automated suite.
 
 Working today:
 
@@ -23,10 +23,11 @@ Working today:
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
 - One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 21 IPC verbs, 17 MCP tools, 4 MCP resources, held at parity by tests.
 - Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
+- TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 
 Not built yet:
 
-- No config file. Font, colours, and palette are compile-time constants. TOML with live reload is M1.
+- No config editor or in-app settings UI; the TOML file is the only surface.
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
 - fish 4 waits for terminal capability queries to be answered before it becomes responsive; whether mutiny answers all of them is not yet verified.
 - Split ratios are stored but not applied; splits render at the GTK default and drags are not persisted.
@@ -118,6 +119,49 @@ The GUI flag `--agent-consent ask|paired|observe-only` (default `ask`) pins the 
 
 Identifiers are stable regardless of the public product name, which is still open: application id `dev.mutiny.Terminal`, environment `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID`, MCP resources under `ui://mutiny/*`.
 
+## Configuration
+
+Config lives at `$XDG_CONFIG_HOME/mutiny/config.toml`, falling back to `~/.config/mutiny/config.toml`. The file is optional: a fresh install runs on the defaults below and never writes a config file itself.
+
+Precedence is **CLI flag, then config file, then built-in default**. The flags `--font`, `--font-size`, `--cols`, and `--rows` shadow the matching keys, and they are re-applied on every live reload, so editing the file cannot discard a flag you launched with.
+
+Every key, with its default:
+
+```toml
+[font]
+family = "Monospace"
+size = 11                      # points, clamped 6..72
+
+[colors]
+background = "#16181d"
+foreground = "#e6e9ef"
+cursor = "#89b4fa"
+selection = "#3b5278"
+accent = "#5c9ef5"             # active-pane top bar
+palette = [                    # exactly 16 entries, ANSI 0-15
+  "#1e222a", "#e06c75", "#98c379", "#e5c07b",
+  "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+  "#5c6370", "#f38ba8", "#a6e3a1", "#f9e2af",
+  "#89b4fa", "#cba6f7", "#94e2d5", "#ffffff",
+]
+
+[geometry]
+initial_cols = 100             # grid a new pane spawns at, clamped 20..500
+initial_rows = 30              # clamped 5..200
+window_width = 980             # new windows, clamped 320..7680
+window_height = 640            # clamped 200..4320
+padding_px = 6.0               # clamped 0..64
+
+[terminal]
+scrollback_lines = 10000       # capped at 1000000
+```
+
+Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are computed, not configurable.
+
+**Live reload.** The file is stat'd every 250 ms and reloaded when it changes. Font, colors, palette, and padding apply immediately to every open pane: cell metrics are recomputed, which resizes the grid and the PTY. Geometry and scrollback depth apply to *newly created* panes and windows, because alacritty fixes scrollback at construction and resizing existing windows under you would be rude. Deleting the file reverts to defaults.
+
+**Errors are survivable.** Unknown keys are rejected so a typo is reported rather than silently ignored. A malformed file leaves the previous config in place and warns, and does not retry until the file changes again. An invalid color falls back to that key's default; a palette that is not exactly 16 entries falls back to the whole default palette. Out-of-range numbers are clamped. None of these stop the terminal.
+
 ### Keybinds
 
 | Action | Chord |
@@ -161,7 +205,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 46 tests, no display required
+cargo test                    # 63 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
