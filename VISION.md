@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v15, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. **M1 is complete.** The next milestone is M2, starting with session restore.
+Status: draft v16, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. **M1 is complete.** M2 is open: session restore is shipped; quick terminal and the authenticated HTTP MCP listener remain.
 
 ## Thesis
 
@@ -225,13 +225,18 @@ Render measurement covers node construction and Pango shaping under Xvfb, not GP
 
 M1 is complete. Every item above is shipped and tested; the render path has a measured baseline in `benches/BASELINE.md`.
 
-### M2: persistence and reach *(forward-looking)*
+### M2: persistence and reach
 
-- Session restore and named workspace bundles matching Haven's `save_workspace`/`compose_workspace`: window, tab, and split geometry, working directories, serialized scrollback, with no background multiplexer daemon.
-- Quick terminal: Yakuake-style drop-down via `gtk4-layer-shell`, toggled over IPC/MCP or a global shortcut.
+**Shipped rung: session restore.** `src/session.rs` captures the workspace to `$XDG_STATE_HOME/mutiny/session.json`: window/tab/split trees with their ratios (reusing the live `WindowModel`/`SplitNode` types so geometry is carried verbatim), each pane's title, working directory, grid size, and scrollback as text. It writes atomically, rejects an unknown version rather than guessing, and restores on launch unless `--no-restore` is passed. Saving happens on clean exit.
+
+Processes are not restored, and that is the contract rather than a gap: there is no multiplexer daemon, so a crash kills every shell. A restore spawns a fresh shell in each saved directory and replays the saved scrollback into it, so the layout, history, and split ratios come back while the processes do not. Restored scrollback is plain text, not styled cells, because alacritty's grid is not a stable serialization format. A crash loses changes since the last clean save.
+
+Evidence: `tests/session_restore.rs` builds a three-pane session with distinct cwds and history, saves it, restores into a fresh controller, and asserts window/tab/pane identity, tree shape and both split ratios, per-pane grid size, cwd, and scrollback content. It then writes a command to a restored pane and asserts a fresh shell executes it, making the no-daemon contract visible. A second test asserts a missing file restores nothing and a corrupt file is reported without half-restoring. Disabling scrollback replay makes the first test fail.
+
+**Next rung: quick terminal.** A Yakuake-style drop-down via `gtk4-layer-shell`, toggled over IPC/MCP or a global shortcut.
 - Authenticated streamable-HTTP MCP listener, off by default, bound to an explicitly configured WireGuard or SSH-tunneled interface, with pairing tokens and rate-capped Tier 3 standing policies.
 
-Done when: a restored bundle reproduces geometry and scrollback, and the HTTP listener refuses an unpaired client and can never assign `Operator`.
+Done when: the quick terminal toggles from a global shortcut, and the HTTP listener refuses an unpaired client and can never assign `Operator`. Session restore is already met.
 
 ## Contracts that must not drift
 

@@ -6,6 +6,7 @@ pub mod graphics;
 pub mod ipc;
 pub mod mcp;
 pub mod notify;
+pub mod session;
 pub mod shell_integration;
 pub mod topology;
 pub mod ui;

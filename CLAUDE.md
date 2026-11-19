@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v15). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete; the next milestone is M2, starting with session restore. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v16). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore is shipped; the next rung is the quick terminal, then the authenticated HTTP MCP listener. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 97 tests: 57 unit + 7 config + 11 e2e + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 1 shell + 7 queries
+cargo test                               # 103 tests: 61 unit + 7 config + 11 e2e + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -92,6 +92,16 @@ Two mechanisms, matching the two sequence families. OSC 10/11 ride the existing 
 OSC 10/11 report `reported_bg` / `reported_fg`, which the controller sets from config at spawn and on reload via `set_reported_colors`, so the answer matches what is rendered. Terminfo answers only `query-os-name` (linux, a fact) and declines everything else with `DCS 0 + r ST`. A decline is a valid answer that unblocks the caller; silence is what blocks it. Do not claim capabilities the engine has not been shown to implement.
 
 `query_replies_sent()` counts replies. The fish startup test asserts it is non-zero, which is what makes the test discriminate: some fish versions time out their queries and proceed anyway, so "fish ran a command" alone passes even with responses disabled.
+
+### Session restore
+
+`src/session.rs` captures geometry by reusing the live `WindowModel`/`SplitNode` types, so ratios and tree shape serialize verbatim rather than being re-derived. Pane content is title, cwd, grid size, and scrollback as plain text. `Workspace::restore_from_session` replaces the model with saved ids and counters; `AppController::restore_session` spawns the engines first, then installs the tree that references them.
+
+Processes are never restored. That is the no-daemon contract, not a missing feature: a restore spawns fresh shells in saved cwds and replays scrollback. Do not add process resurrection without revisiting the crash-semantics contract in VISION.
+
+Save is atomic (temp file plus rename) and happens on clean exit in `main.rs`, not in `shutdown_ipc`, so tests do not write to the user's real state directory. Tests must call `set_session_path` with a temp path. Load rejects an unknown version and reports corrupt files rather than half-restoring.
+
+`replay_scrollback` feeds plain text through `advance_bytes`, so it fabricates no command records or prompt markers. Text containing a literal ESC could be reinterpreted on replay; that is a known edge of text-only restore.
 
 ### Damage-driven redraw
 
@@ -223,7 +233,8 @@ These look closer to done than they are:
 - **Kitty graphics is a slice.** No animation frames, file or shared-memory transmission, unicode placeholders, or cursor-movement policies. Placements drift once scrollback is capped, sharing the OSC 133 marker limitation.
 - **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
 - **No in-app settings UI.** The TOML file is the only config surface.
-- **No session restore (M2, next).** A GUI crash kills every shell; there is no multiplexer daemon by design. Split ratios persist in the model across rebuilds but not across restarts.
+- **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Processes are never restored, by contract.
+- **No quick terminal or HTTP MCP listener yet (M2).**
 - **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.
 - **Tests skip when prerequisites are absent.** CI installs fish and asserts `fish --version`, and runs under Xvfb with CJK/emoji fonts, so the fish, IME, and graphics render tests execute there. Locally the fish test needs `MUTINY_TEST_FISH` or fish on PATH, and the GTK tests need a display.
 - **The release workflow is unexercised.** `.github/workflows/release.yml` is tag-triggered and gated on CI, but no tag has been pushed.

@@ -59,6 +59,10 @@ struct Cli {
     #[arg(long)]
     rows: Option<usize>,
 
+    /// GUI only: start empty instead of restoring the saved session.
+    #[arg(long)]
+    no_restore: bool,
+
     #[command(subcommand)]
     command: Option<TopCommand>,
 }
@@ -275,6 +279,7 @@ fn main() -> ExitCode {
             cli.working_directory,
             cli.shell,
             cli.agent_consent.into(),
+            cli.no_restore,
             Overrides {
                 font_family: cli.font,
                 font_size: cli.font_size,
@@ -452,6 +457,7 @@ fn run_gui_app(
     initial_cwd: Option<PathBuf>,
     shell_prog: Option<String>,
     agent_consent: ConsentMode,
+    no_restore: bool,
     overrides: Overrides,
 ) -> ExitCode {
     if socket_path.exists()
@@ -497,6 +503,17 @@ fn run_gui_app(
         );
     }
 
+    // Restore the saved session before the first window is created, so
+    // connect_activate only spawns a fresh pane when there is nothing to
+    // restore. Processes are not restored; shells start fresh in saved cwds.
+    if !no_restore {
+        match controller.restore_session_from_file() {
+            Ok(Some(n)) => eprintln!("mutiny: restored {n} panes from the saved session"),
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: session not restored: {err}"),
+        }
+    }
+
     let ctrl_startup = Rc::clone(&controller);
     app.connect_startup(move |gtk_app| {
         ctrl_startup.attach_gtk_app(gtk_app);
@@ -525,6 +542,11 @@ fn run_gui_app(
     });
 
     let code = app.run_with_args::<&str>(&[]);
+    // Save on clean exit. A crash loses changes since the last save, which is
+    // the accepted consequence of having no multiplexer daemon.
+    if let Err(err) = controller.save_session() {
+        eprintln!("warning: session not saved: {err}");
+    }
     controller.shutdown_ipc();
     ExitCode::from(code.get())
 }

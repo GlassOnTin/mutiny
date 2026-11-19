@@ -21,6 +21,7 @@ use crate::ipc::{
     default_audit_path, peer_credentials, read_envelope, server_uid, write_response,
 };
 use crate::notify::{DBusNotifier, DesktopNotifier};
+use crate::session::{self, SessionState};
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
 use crate::ui::window::MutinyWindow;
 
@@ -97,6 +98,7 @@ pub struct AppController {
     shell_override: RefCell<Option<(String, Vec<String>)>>,
     default_menubar: Cell<bool>,
     notifier: RefCell<Rc<dyn DesktopNotifier>>,
+    session_path: RefCell<PathBuf>,
 }
 
 impl AppController {
@@ -165,6 +167,7 @@ impl AppController {
             shell_override: RefCell::new(shell_override),
             default_menubar: Cell::new(true),
             notifier: RefCell::new(Rc::new(DBusNotifier)),
+            session_path: RefCell::new(session::session_path()),
         })
     }
 
@@ -176,6 +179,57 @@ impl AppController {
 
     pub fn agent_mode(&self) -> ConsentMode {
         self.agent_mode.get()
+    }
+
+    /// Overrides the session state path. Tests point this at a temp file so
+    /// they never touch the user's real state directory.
+    pub fn set_session_path(&self, path: PathBuf) {
+        *self.session_path.borrow_mut() = path;
+    }
+
+    /// Writes the current workspace to the session state file.
+    pub fn save_session(&self) -> io::Result<()> {
+        let state = session::capture(&self.workspace.borrow());
+        session::save(&self.session_path.borrow(), &state)
+    }
+
+    /// Loads and restores the session file, if present. Returns the pane count
+    /// restored, or None when there was no state file.
+    pub fn restore_session_from_file(self: &Rc<Self>) -> Result<Option<usize>, String> {
+        match session::load(&self.session_path.borrow())? {
+            Some(state) => Ok(Some(self.restore_session(state)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Restores a saved bundle: fresh shells in the saved directories, with the
+    /// saved geometry, ratios, and scrollback. Processes are not restored; the
+    /// no-daemon crash contract stands.
+    pub fn restore_session(self: &Rc<Self>, state: SessionState) -> Result<usize, String> {
+        let mut engines = Vec::new();
+        for sp in &state.panes {
+            let mut eng = self
+                .spawn_engine(sp.id, sp.cwd.clone())
+                .map_err(|e| format!("pane {}: {e}", sp.id))?;
+            eng.resize(GridSize::new(sp.cols, sp.rows, 9, 18));
+            eng.set_title(sp.title.clone());
+            eng.replay_scrollback(&sp.scrollback);
+            engines.push((sp.id, eng));
+        }
+        let count = engines.len();
+        session::install(&mut self.workspace.borrow_mut(), state, engines);
+        let ids: Vec<WindowId> = self
+            .workspace
+            .borrow()
+            .windows()
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        for id in ids {
+            self.ensure_ui_window(id);
+            self.sync_ui_window(id);
+        }
+        Ok(count)
     }
 
     /// Replaces the desktop notifier. Tests inject a recorder so forwarding

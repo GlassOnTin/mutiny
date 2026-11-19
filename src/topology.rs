@@ -331,6 +331,31 @@ impl Workspace {
         id
     }
 
+    /// Replaces the workspace with a restored session. Ids and counters come
+    /// from the state file so a restored bundle keeps its identity; engines are
+    /// supplied by the caller because spawning a PTY is not the model's job.
+    pub fn restore_from_session(
+        &mut self,
+        windows: Vec<WindowModel>,
+        active_window: Option<WindowId>,
+        panes: BTreeMap<PaneId, PaneEngine>,
+        next_pane_id: u64,
+        next_tab_id: u64,
+        next_window_id: u64,
+    ) {
+        self.panes = panes;
+        self.windows = windows;
+        self.active_window = active_window.filter(|id| self.windows.iter().any(|w| w.id == *id));
+        self.exited_panes.clear();
+        self.next_pane_id = next_pane_id;
+        self.next_tab_id = next_tab_id;
+        self.next_window_id = next_window_id;
+    }
+
+    pub fn id_counters(&self) -> (u64, u64, u64) {
+        (self.next_pane_id, self.next_tab_id, self.next_window_id)
+    }
+
     pub fn windows(&self) -> &[WindowModel] {
         &self.windows
     }

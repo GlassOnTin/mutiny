@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 (session restore, quick terminal, authenticated HTTP MCP) is next. The engine, pane mobility, and agent surface are covered by 97 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore is shipped; quick terminal and authenticated HTTP MCP remain. The engine, pane mobility, and agent surface are covered by 103 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -27,6 +27,7 @@ Working today:
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
 - Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 131x cheaper than a full repaint, measured under Xvfb.
+- Session restore: layout, split ratios, working directories, and scrollback survive a restart. See [Session restore](#session-restore).
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
 - Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
 
@@ -167,6 +168,12 @@ Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are c
 
 **Errors are survivable.** Unknown keys are rejected so a typo is reported rather than silently ignored. A malformed file leaves the previous config in place and warns, and does not retry until the file changes again. An invalid color falls back to that key's default; a palette that is not exactly 16 entries falls back to the whole default palette. Out-of-range numbers are clamped. None of these stop the terminal.
 
+### Session restore
+
+On clean exit mutiny writes `$XDG_STATE_HOME/mutiny/session.json`, and on launch it restores that bundle unless you pass `--no-restore`. A restored session reproduces the window/tab/split layout with its divider ratios, each pane's working directory and grid size, and its scrollback.
+
+**Processes are not restored.** There is no multiplexer daemon, so a crash kills every shell; that is a deliberate contract. A restore starts a fresh shell in each saved directory and replays the saved history into it. Restored scrollback is plain text, so colors and attributes are not preserved, and a crash loses changes since the last clean save.
+
 ### Inline images
 
 mutiny implements a vertical slice of the Kitty graphics protocol: transmit (including chunked), place, delete, and query, for PNG and raw RGB/RGBA. Images are anchored to cells and scroll with their content.
@@ -224,7 +231,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 97 tests, no display required
+cargo test                    # 103 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

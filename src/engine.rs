@@ -547,6 +547,12 @@ impl PaneEngine {
         self.reported_fg = foreground;
     }
 
+    /// Sets the title directly, used by session restore. Live titles still
+    /// come from OSC 0/2 once the shell emits them.
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
     pub fn title(&self) -> &str {
         &self.title
     }
@@ -1316,6 +1322,43 @@ impl PaneEngine {
             Column(self.size.cols.saturating_sub(1)),
         );
         self.term.bounds_to_string(start, end)
+    }
+
+    /// Every retained line, history then visible screen, as plain text. Used by
+    /// session restore. Attributes are not preserved: alacritty's cell grid is
+    /// not a stable serialization format, so restored scrollback is text.
+    pub fn scrollback_text(&self) -> Vec<String> {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let last_line = self.size.rows.saturating_sub(1) as i32;
+        let last_col = Column(self.size.cols.saturating_sub(1));
+        let mut out = Vec::new();
+        for line in (-history..=last_line).rev() {
+            let text = self.term.bounds_to_string(
+                Point::new(Line(line), Column(0)),
+                Point::new(Line(line), last_col),
+            );
+            out.push(text.trim_end().to_owned());
+        }
+        // Drop trailing blank lines so a restored pane is not padded.
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+        out
+    }
+
+    /// Replays saved scrollback into a fresh engine. Plain text only, so no
+    /// command records or prompt markers are fabricated from history.
+    pub fn replay_scrollback(&mut self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut buf = String::new();
+        for line in lines {
+            buf.push_str(line);
+            buf.push_str("\r\n");
+        }
+        self.advance_bytes(buf.as_bytes());
     }
 
     pub fn trimmed_screen_lines(&self) -> Vec<String> {
