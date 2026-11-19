@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags as CellFlags;
@@ -17,6 +17,7 @@ use crate::action::build_context_menu_model;
 use crate::app::AppController;
 use crate::config::ResolvedConfig;
 use crate::engine::{GridSize, KeyInput, KeyKind};
+use crate::graphics::{Image, ImageFormat};
 use crate::topology::PaneId;
 
 // Font, palette, and padding come from the config store, not constants here.
@@ -37,6 +38,10 @@ mod imp {
         pub im_context: RefCell<Option<gtk4::IMMulticontext>>,
         /// In-progress composition text, drawn at the cursor until committed.
         pub preedit: RefCell<String>,
+        /// Decoded textures keyed by image id, invalidated when the graphics
+        /// store's generation changes so images are not decoded every frame.
+        pub texture_cache: RefCell<std::collections::HashMap<u32, gdk::Texture>>,
+        pub graphics_generation: Cell<u64>,
     }
 
     #[glib::object_subclass]
@@ -185,6 +190,19 @@ impl TerminalView {
             cw as i32,
             ch as i32,
         ));
+    }
+
+    fn texture_for(&self, eng: &crate::engine::PaneEngine, image_id: u32) -> Option<gdk::Texture> {
+        if let Some(found) = self.imp().texture_cache.borrow().get(&image_id) {
+            return Some(found.clone());
+        }
+        let image = eng.graphics().image(image_id)?;
+        let texture = decode_texture(image)?;
+        self.imp()
+            .texture_cache
+            .borrow_mut()
+            .insert(image_id, texture.clone());
+        Some(texture)
     }
 
     fn padding_px(&self) -> f32 {
@@ -442,7 +460,9 @@ impl TerminalView {
         glib::Propagation::Proceed
     }
 
-    fn render_snapshot(&self, snapshot: &gtk4::Snapshot) {
+    /// Renders the pane into a GtkSnapshot. Public so tests can inspect the
+    /// resulting render-node tree for texture placements.
+    pub fn render_snapshot(&self, snapshot: &gtk4::Snapshot) {
         let w = self.width() as f32;
         let h = self.height() as f32;
         if w <= 0.0 || h <= 0.0 {
@@ -618,6 +638,42 @@ impl TerminalView {
             }
         }
 
+        // Kitty graphics placements, drawn over the cell grid and scrolled with
+        // the content they are anchored to. Sorted by z-index so ordering is
+        // deterministic.
+        let history = grid.history_size() as i32;
+        let generation = eng.graphics().generation();
+        if self.imp().graphics_generation.get() != generation {
+            self.imp().texture_cache.borrow_mut().clear();
+            self.imp().graphics_generation.set(generation);
+        }
+        let mut placements: Vec<_> = eng.graphics().placements().iter().collect();
+        placements.sort_by_key(|p| p.z_index);
+        for placement in placements {
+            let grid_line = placement.line - history;
+            let viewport_row = grid_line + display_offset;
+            if viewport_row < 0 || viewport_row >= rows as i32 {
+                continue;
+            }
+            let Some(texture) = self.texture_for(eng, placement.image_id) else {
+                continue;
+            };
+            let (w_cells, h_cells) = if placement.cols > 0 && placement.rows > 0 {
+                (f32::from(placement.cols), f32::from(placement.rows))
+            } else {
+                (
+                    (texture.width() as f32 / cw).ceil(),
+                    (texture.height() as f32 / ch).ceil(),
+                )
+            };
+            let x = padding + placement.column as f32 * cw;
+            let y = padding + viewport_row as f32 * ch;
+            snapshot.append_texture(
+                &texture,
+                &graphene::Rect::new(x, y, w_cells * cw, h_cells * ch),
+            );
+        }
+
         // Preedit: in-progress composition drawn at the cursor, underlined, so
         // CJK and dead-key input is visible before it commits.
         let preedit = self.imp().preedit.borrow().clone();
@@ -667,6 +723,42 @@ impl RunStyle {
             fg,
             bold: cell.flags.contains(CellFlags::BOLD),
             italic: cell.flags.contains(CellFlags::ITALIC),
+        }
+    }
+}
+
+/// Decodes stored image bytes into a GDK texture. PNG (and JPEG) go through
+/// GDK's own decoder; raw formats become memory textures.
+fn decode_texture(image: &Image) -> Option<gdk::Texture> {
+    match image.format {
+        ImageFormat::Png => {
+            let bytes = glib::Bytes::from(&image.data);
+            gdk::Texture::from_bytes(&bytes).ok()
+        }
+        ImageFormat::Rgba | ImageFormat::Rgb => {
+            if image.width == 0 || image.height == 0 {
+                return None;
+            }
+            let rgba = if image.format == ImageFormat::Rgba {
+                image.data.clone()
+            } else {
+                let mut out = Vec::with_capacity(image.data.len() / 3 * 4);
+                for px in image.data.chunks_exact(3) {
+                    out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+                out
+            };
+            let bytes = glib::Bytes::from(&rgba);
+            Some(
+                gdk::MemoryTexture::new(
+                    image.width as i32,
+                    image.height as i32,
+                    gdk::MemoryFormat::R8g8b8a8,
+                    &bytes,
+                    (image.width * 4) as usize,
+                )
+                .upcast(),
+            )
         }
     }
 }

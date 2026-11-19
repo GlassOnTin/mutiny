@@ -1102,6 +1102,49 @@ impl AppController {
                 });
                 None
             }
+            IpcRequest::PresentMedia {
+                pane,
+                path,
+                cols,
+                rows,
+            } => {
+                let pid = pane.or_else(|| self.workspace.borrow().active_pane_id());
+                let Some(pid) = pid else {
+                    return Some(IpcResponse::err("no active pane"));
+                };
+                let data = match std::fs::read(&path) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        return Some(IpcResponse::err(format!(
+                            "cannot read {}: {err}",
+                            path.display()
+                        )));
+                    }
+                };
+                let result = self
+                    .workspace
+                    .borrow_mut()
+                    .pane_mut(pid)
+                    .ok_or_else(|| format!("pane {pid} not found"))
+                    .and_then(|eng| eng.present_image(data, cols.unwrap_or(0), rows.unwrap_or(0)));
+                match result {
+                    Ok((image_id, placement_id)) => {
+                        self.queue_redraw_pane(pid);
+                        let mut resp = ids_ok(None, None, Some(pid));
+                        if let IpcResponse::Ok {
+                            image_id: img,
+                            placement_id: plc,
+                            ..
+                        } = &mut resp
+                        {
+                            *img = Some(image_id);
+                            *plc = Some(placement_id);
+                        }
+                        Some(resp)
+                    }
+                    Err(err) => Some(IpcResponse::err(err)),
+                }
+            }
             IpcRequest::RunAction { action, window } => {
                 self.execute_action(action, window);
                 Some(IpcResponse::empty_ok())
@@ -1668,5 +1711,7 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         text: None,
         prompt_seq: None,
         output_seq: None,
+        image_id: None,
+        placement_id: None,
     }
 }

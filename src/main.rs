@@ -204,6 +204,16 @@ enum CtlVerb {
         pane: Option<u64>,
         message: Option<String>,
     },
+    /// Place an image file inline in a pane via Kitty graphics
+    PresentMedia {
+        path: PathBuf,
+        #[arg(long)]
+        pane: Option<u64>,
+        #[arg(long)]
+        cols: Option<u16>,
+        #[arg(long)]
+        rows: Option<u16>,
+    },
     /// Read the captured output and exit code of the last OSC 133 command
     LastOutput {
         #[arg(long)]
@@ -376,6 +386,17 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::PresentNotice { pane, message } => IpcRequest::PresentNotice {
             pane: pane.map(PaneId),
             message,
+        },
+        CtlVerb::PresentMedia {
+            path,
+            pane,
+            cols,
+            rows,
+        } => IpcRequest::PresentMedia {
+            pane: pane.map(PaneId),
+            path,
+            cols,
+            rows,
         },
         CtlVerb::LastOutput { pane } => IpcRequest::LastOutput {
             pane: pane.map(PaneId),

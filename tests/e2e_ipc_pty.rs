@@ -565,6 +565,7 @@ fn every_advertised_mcp_tool_dispatches() {
             "focus_pane" => json!({"pane": p1.0}),
             "run_action" => json!({"slug": "new-tab"}),
             "present_notice" => json!({"pane": p1.0, "message": "x"}),
+            "present_media" => json!({"pane": p1.0, "path": "/nonexistent-probe.png"}),
             _ => return None,
         })
     };

@@ -17,6 +17,7 @@ use alacritty_terminal::tty::{
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use serde::{Deserialize, Serialize};
 
+use crate::graphics::{self, GraphicsStore};
 use crate::shell_integration;
 
 const MAX_COMMAND_RECORDS: usize = 64;
@@ -39,11 +40,17 @@ enum QueryScanState {
         buf: Vec<u8>,
         saw_esc: bool,
     },
+    /// APC (`ESC _ ... ST`), which carries Kitty graphics.
+    Apc {
+        buf: Vec<u8>,
+        saw_esc: bool,
+    },
 }
 
 enum QueryKind {
     XtVersion,
     Terminfo(Vec<u8>),
+    Graphics(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +294,7 @@ pub struct PaneEngine {
     command_running: bool,
     osc_state: OscScanState,
     query_state: QueryScanState,
+    graphics: GraphicsStore,
     /// Colors reported for OSC 10/11 queries. The controller sets these from
     /// config so a query answers with what is actually on screen.
     reported_bg: Rgb,
@@ -336,6 +344,7 @@ impl PaneEngine {
             command_running: false,
             osc_state: OscScanState::Ground,
             query_state: QueryScanState::Ground,
+            graphics: GraphicsStore::default(),
             reported_bg: Rgb {
                 r: 0x16,
                 g: 0x18,
@@ -441,6 +450,73 @@ impl PaneEngine {
     /// Number of capability-query replies emitted since construction.
     pub fn query_replies_sent(&self) -> usize {
         self.query_replies_sent
+    }
+
+    pub fn graphics(&self) -> &GraphicsStore {
+        &self.graphics
+    }
+
+    pub fn graphics_mut(&mut self) -> &mut GraphicsStore {
+        &mut self.graphics
+    }
+
+    /// Cursor position in the absolute coordinate placements are anchored to.
+    fn cursor_absolute(&self) -> (i32, usize) {
+        let grid = self.term.grid();
+        let point = grid.cursor.point;
+        (grid.history_size() as i32 + point.line.0, point.column.0)
+    }
+
+    /// Stores an encoded image and places it at the cursor. Backs the
+    /// present-media verb.
+    pub fn present_image(
+        &mut self,
+        data: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(u32, u32), String> {
+        let (line, column) = self.cursor_absolute();
+        self.graphics.present(data, cols, rows, line, column)
+    }
+
+    fn handle_graphics(&mut self, payload: &[u8]) {
+        let cmd = match graphics::parse(payload) {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                self.graphics_reply(None, Some(err), 0);
+                return;
+            }
+        };
+        let quiet = cmd.quiet;
+        let (line, column) = self.cursor_absolute();
+        match self.graphics.apply(cmd, line, column) {
+            Ok(id) => self.graphics_reply(id, None, quiet),
+            Err(err) => self.graphics_reply(None, Some(err), quiet),
+        }
+    }
+
+    fn graphics_reply(&mut self, id: Option<u32>, err: Option<String>, quiet: u8) {
+        if err.is_none() && quiet >= 1 {
+            return;
+        }
+        if err.is_some() && quiet >= 2 {
+            return;
+        }
+        let body = match err {
+            // Sanitize so a malformed payload cannot inject escape sequences
+            // back into the program that sent it.
+            Some(msg) => format!(
+                "i={};{}",
+                id.unwrap_or(0),
+                msg.replace([';', '\x1b', '\x07'], " ")
+            ),
+            None => match id {
+                Some(id) => format!("i={id};OK"),
+                None => String::from("OK"),
+            },
+        };
+        let reply = format!("\x1b_G{body}\x1b\\");
+        self.pending_pty_writes.extend_from_slice(reply.as_bytes());
     }
 
     pub fn set_reported_colors(&mut self, background: Rgb, foreground: Rgb) {
@@ -810,6 +886,12 @@ impl PaneEngine {
                             saw_esc: false,
                         }
                     }
+                    b'_' => {
+                        self.query_state = QueryScanState::Apc {
+                            buf: Vec::with_capacity(64),
+                            saw_esc: false,
+                        }
+                    }
                     _ => self.query_state = QueryScanState::Ground,
                 },
                 QueryScanState::Csi { buf } => {
@@ -841,6 +923,24 @@ impl PaneEngine {
                         }
                     }
                 }
+                QueryScanState::Apc { buf, saw_esc } => {
+                    if *saw_esc && b == b'\\' {
+                        buf.pop();
+                        let payload = std::mem::take(buf);
+                        self.query_state = QueryScanState::Ground;
+                        if let Some(rest) = payload.strip_prefix(b"G") {
+                            completed = Some(QueryKind::Graphics(rest.to_vec()));
+                        }
+                    } else if b == 0x18 || b == 0x1a {
+                        self.query_state = QueryScanState::Ground;
+                    } else {
+                        *saw_esc = b == 0x1b;
+                        // Graphics payloads are base64 images and can be large.
+                        if buf.len() < graphics::MAX_IMAGE_BYTES {
+                            buf.push(b);
+                        }
+                    }
+                }
             }
             if let Some(kind) = completed {
                 self.reply_to_query(kind);
@@ -854,6 +954,10 @@ impl PaneEngine {
                 format!("\x1bP>|mutiny {}\x1b\\", env!("CARGO_PKG_VERSION"))
             }
             QueryKind::Terminfo(names) => terminfo_reply(&names),
+            QueryKind::Graphics(payload) => {
+                self.handle_graphics(&payload);
+                return;
+            }
         };
         self.pending_pty_writes.extend_from_slice(reply.as_bytes());
         self.query_replies_sent += 1;

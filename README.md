@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 71 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 84 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -26,13 +26,16 @@ Working today:
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
+- Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
 
 Not built yet:
 
 - No config editor or in-app settings UI; the TOML file is the only surface.
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
 - Split ratios are stored but not applied; splits render at the GTK default and drags are not persisted.
-- No Kitty graphics, no drag-to-detach gestures, no OSC 777 notifications, no IME or font fallback chain.
+- No drag-to-reorder or drag-to-detach gestures, and split ratios are not applied yet.
+- No OSC 777 desktop notifications.
+- Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Rendering repaints every cell. The damage-tracking API exists but is unwired.
 - No session restore. There is no multiplexer daemon, so a GUI crash kills every shell. `tmux` and `zellij` compose alongside rather than being reimplemented.
 
@@ -163,6 +166,20 @@ Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are c
 
 **Errors are survivable.** Unknown keys are rejected so a typo is reported rather than silently ignored. A malformed file leaves the previous config in place and warns, and does not retry until the file changes again. An invalid color falls back to that key's default; a palette that is not exactly 16 entries falls back to the whole default palette. Out-of-range numbers are clamped. None of these stop the terminal.
 
+### Inline images
+
+mutiny implements a vertical slice of the Kitty graphics protocol: transmit (including chunked), place, delete, and query, for PNG and raw RGB/RGBA. Images are anchored to cells and scroll with their content.
+
+An agent can place an image through any of the three surfaces:
+
+```sh
+mutiny ctl present-media /path/to/chart.png --cols 40 --rows 12
+```
+
+or the `present_media` MCP tool with `{ "path": "...", "cols": 40, "rows": 12 }`, or the `present-media` IPC verb. It is an Act-tier verb, so it is consent-gated and audited like any other write. The reply carries `image_id` and `placement_id`.
+
+Not implemented: animation frames, file and shared-memory transmission, unicode placeholders, and cursor-movement policies.
+
 ### Keybinds
 
 | Action | Chord |
@@ -206,7 +223,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 71 tests, no display required
+cargo test                    # 84 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

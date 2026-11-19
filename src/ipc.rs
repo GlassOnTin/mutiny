@@ -130,6 +130,14 @@ pub enum IpcRequest {
         pane: Option<PaneId>,
         message: Option<String>,
     },
+    /// Reads an image file and places it inline in a pane via Kitty graphics.
+    /// Additive verb; existing request and response shapes are unchanged.
+    PresentMedia {
+        pane: Option<PaneId>,
+        path: PathBuf,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
     LastOutput {
         pane: Option<PaneId>,
     },
@@ -193,7 +201,8 @@ impl IpcRequest {
             | IpcRequest::SendText { .. }
             | IpcRequest::SendInput { .. }
             | IpcRequest::SendToAgent { .. }
-            | IpcRequest::PresentNotice { .. } => ConsentTier::Act,
+            | IpcRequest::PresentNotice { .. }
+            | IpcRequest::PresentMedia { .. } => ConsentTier::Act,
         }
     }
 
@@ -216,6 +225,7 @@ impl IpcRequest {
             IpcRequest::SendInput { .. } => "send-input",
             IpcRequest::SendToAgent { .. } => "send-to-agent",
             IpcRequest::PresentNotice { .. } => "present-notice",
+            IpcRequest::PresentMedia { .. } => "present-media",
             IpcRequest::LastOutput { .. } => "last-output",
             IpcRequest::ScreenText { .. } => "screen-text",
             IpcRequest::WaitPrompt { .. } => "wait-prompt",
@@ -248,6 +258,15 @@ impl IpcRequest {
                     .unwrap_or_else(|| String::from("<cleared>"));
                 format!("pane={pane:?} notice={preview:?}")
             }
+            IpcRequest::PresentMedia {
+                pane,
+                path,
+                cols,
+                rows,
+            } => format!(
+                "pane={pane:?} path={:?} cols={cols:?} rows={rows:?}",
+                path.display()
+            ),
             IpcRequest::RunAction { action, window } => {
                 format!("action={} window={window:?}", spec(*action).slug)
             }
@@ -345,6 +364,10 @@ pub enum IpcResponse {
         prompt_seq: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_seq: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_id: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        placement_id: Option<u32>,
     },
     Error {
         message: String,
@@ -369,6 +392,8 @@ impl IpcResponse {
             text: None,
             prompt_seq: None,
             output_seq: None,
+            image_id: None,
+            placement_id: None,
         }
     }
 
@@ -744,6 +769,12 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             settle_ms: 250,
             timeout_ms: 1_000,
         },
+        IpcRequest::PresentMedia {
+            pane: None,
+            path: PathBuf::from("/nonexistent.png"),
+            cols: None,
+            rows: None,
+        },
     ]
 }
 
@@ -774,6 +805,7 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::ScreenText { .. } => 18,
         IpcRequest::WaitPrompt { .. } => 19,
         IpcRequest::AwaitTurn { .. } => 20,
+        IpcRequest::PresentMedia { .. } => 21,
     }
 }
 

@@ -2,6 +2,7 @@ pub mod action;
 pub mod app;
 pub mod config;
 pub mod engine;
+pub mod graphics;
 pub mod ipc;
 pub mod mcp;
 pub mod shell_integration;

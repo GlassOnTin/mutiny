@@ -59,6 +59,7 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::ScreenText { .. } => Some(McpSurface::Tool("read_screen_text")),
         IpcRequest::WaitPrompt { .. } => Some(McpSurface::Tool("wait_prompt")),
         IpcRequest::AwaitTurn { .. } => Some(McpSurface::Tool("await_turn")),
+        IpcRequest::PresentMedia { .. } => Some(McpSurface::Tool("present_media")),
     }
 }
 
@@ -561,6 +562,22 @@ impl McpBridge {
                     Duration::from_secs(30),
                 )
             }
+            "present_media" => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`path` is required")))?;
+                let opt_u16 = |key: &str| args.get(key).and_then(Value::as_u64).map(|n| n as u16);
+                (
+                    IpcRequest::PresentMedia {
+                        pane: opt_pane("pane"),
+                        path: PathBuf::from(path),
+                        cols: opt_u16("cols"),
+                        rows: opt_u16("rows"),
+                    },
+                    Duration::from_secs(30),
+                )
+            }
             "present_notice" => {
                 let message = args
                     .get("message")
@@ -784,6 +801,20 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "slug": { "type": "string" },
                     "window": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "present_media",
+            "description": "Tier-2 Act: read an image file and place it inline in a pane via Kitty graphics. Returns image_id and placement_id. cols/rows size it in cells; omit for natural size.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "pane": { "type": "integer" },
+                    "path": { "type": "string", "description": "Absolute path to a PNG or JPEG on the mutiny host" },
+                    "cols": { "type": "integer" },
+                    "rows": { "type": "integer" }
                 }
             }
         },

@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v11, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, and IME with font fallback are shipped; the growth diagnostic below says which is which. The next rung is Kitty graphics (see M1).
+Status: draft v12, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, and the Kitty graphics slice are shipped; the growth diagnostic below says which is which. The next rung is split ratios and drag gestures (see M1).
 
 ## Thesis
 
@@ -18,7 +18,7 @@ That combination is the position. A terminal that renders beautifully but expose
 
 ## The six commitments
 
-1. **One committed VT engine, no facade.** `alacritty_terminal` is the only backend. No dual-backend trait abstraction and no foreign C library. Protocol extensions it does not carry (OSC 133 command zones, OSC 7 working directory, OSC 9;4 progress, output-quiescence turn tracking, and later Kitty graphics) live in a stream-level Rust `PaneEngine` wrapper. The wrapper slices the byte stream at OSC terminators so a marker observes the exact grid cursor position at the instant it arrives; a post-hoc event callback cannot give that. Sixel is out of scope.
+1. **One committed VT engine, no facade.** `alacritty_terminal` is the only backend. No dual-backend trait abstraction and no foreign C library. Protocol extensions it does not carry (OSC 133 command zones, OSC 7 working directory, OSC 9;4 progress, output-quiescence turn tracking, and Kitty graphics) live in a stream-level Rust `PaneEngine` wrapper. The wrapper slices the byte stream at OSC terminators so a marker observes the exact grid cursor position at the instant it arrives; a post-hoc event callback cannot give that. Sixel is out of scope.
 
 2. **State outside widgets, reparent-safe rendering.** Terminal state, PTYs, and scrollback live in an application-owned `Workspace` keyed by `PaneId`, never inside GTK widgets. Widgets are disposable viewports over `GtkSnapshot` render nodes rather than per-pane `GLArea` contexts, so detaching or moving a split across windows never tears down rendering state or stalls a PTY. Anything that must survive a reparent belongs in the engine or the workspace.
 
@@ -184,17 +184,23 @@ Evidence: `tests/ime_and_fallback.rs` drives the real commit signal with CJK, ac
 
 The rung also found and fixed a real bug: an unrealized view has a 0x0 allocation, and `recompute_grid_dimensions` was resizing its pane to the minimum 4x2 grid, which wrapped every wide glyph and ate characters. It now waits for a real allocation, with a regression assertion.
 
-**Carried follow-up:** the fish startup test skips when fish is absent, so a CI run where the fish package fails to install would report green without exercising it. Add a CI step asserting `fish --version` so the skip cannot pass silently.
+**Shipped rung: Kitty graphics vertical slice.** `src/graphics.rs` holds images and cell-anchored placements as pure data with no GTK dependency, so `PaneEngine` owns the store and the UI decodes bytes into textures. The APC scanner recognizes `ESC _ G ... ST` and supports transmit (chunked), transmit-and-place, place, delete, and query, in PNG or raw RGB/RGBA, with z-index ordering and sanitized OK/error replies that honor `q`. The renderer draws placements as `GtkSnapshot` texture nodes, scrolled with the content they are anchored to, with a texture cache invalidated by a store generation counter.
 
-**Next rung: Kitty graphics.** Image placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays. This is the largest remaining M1 feature and the one that completes the reach-back direction of the presence contract on the desktop.
+`present-media` is the desktop peer of Haven's `present_media`: an Act-tier verb that reads an image file and places it inline in a pane, reachable from `mutiny ctl present-media`, the `present_media` MCP tool, and IPC. It is additive: existing request and response shapes are unchanged, the envelope stays version 1, and two optional response fields (`image_id`, `placement_id`) were added. The surface is now 22 verbs, 18 tools, 4 resources, still held at parity by test.
 
-- Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
+Evidence: `tests/kitty_graphics.rs` asserts protocol placement and the OK reply, chunked reassembly with `q=1` suppression, sanitized error replies, the present-media verb end to end including a clean missing-file error, and that a presented image produces a texture node in the widget's render-node tree while an empty pane produces none. Both PNG and raw RGBA render. Removing the `append_texture` call makes the render test fail, so it discriminates.
+
+Scope deliberately excluded: animation frames, file and shared-memory transmission, unicode placeholders, and cursor-movement policies. Placements use the same absolute line coordinate as OSC 133 markers, which is stable while history grows but drifts once scrollback is capped; that limitation is shared with prompt markers and documented rather than hidden.
+
+**Carried follow-up, now done:** CI asserts `fish --version` so the fish startup test cannot silently skip if the package install fails.
+
+**Next rung: split ratios and drag gestures.** `SplitNode.ratio` is stored but never applied to the `GtkPaned`, and user drags are not written back, so splits always render at GTK's default. Drag-to-reorder and drag-to-detach complete the pane mobility story that is mutiny's headline feature.
+
 - Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.
 - OSC 777 notifications through the desktop portal, with tab badges.
-- Text input correctness: `GtkIMContext` for IME and dead keys, and a font fallback chain for CJK, emoji, and box-drawing glyphs.
 - Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: an image renders inline, a CJK or accented compose sequence types correctly, and drag-to-detach works. Config, shell integration, chunked search, and fish startup are already met.
+Done when: drag-to-detach works and split ratios persist. Config, shell integration, chunked search, fish startup, CJK compose, and inline images are already met.
 
 ### M2: persistence and reach *(forward-looking)*
 
