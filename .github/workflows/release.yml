@@ -27,10 +27,29 @@ jobs:
         run: |
           set -eu
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed git gtk4 rustup github-cli
+          pacman -Syu --noconfirm --needed git gtk4 rustup github-cli zstd
           rustup default stable
 
       - uses: actions/checkout@v7
+
+      - name: Record toolchain and GTK versions
+        id: versions
+        run: |
+          set -eu
+          echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+          echo "gtk4=$(pkg-config --modversion gtk4)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ steps.versions.outputs.rustc }}-gtk${{ steps.versions.outputs.gtk4 }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ steps.versions.outputs.rustc }}-gtk${{ steps.versions.outputs.gtk4 }}-
 
       - name: Tag must match the crate version
         run: |

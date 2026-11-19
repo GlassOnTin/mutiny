@@ -154,7 +154,7 @@ Evidence: the suite passes displayless and under a display. The spoof test refus
 
 Follow-on rung, shipped: session grants bind to `PeerIdentity` rather than the client label. The proof runs two real child processes under the same uid, both claiming `trusted-peer`; the granted one is allowed on a fresh connection and the other fails closed, with the audit showing two distinct pids behind one label. Mutating the decision back to "any grant applies" makes both the policy test and the cross-process test fail, so the tests detect the vulnerability rather than merely passing alongside the fix.
 
-One honest gap remains. The CI workflow has not executed on GitHub because the repository has no remote; the commands it runs are verified green locally via `scripts/ci.sh`.
+One honest gap remains. The release workflow is tag-triggered and gated on CI, but no tag has been pushed, so the artifact packaging and publication path is unexercised. CI itself runs green on GitHub at `GlassOnTin/mutiny`.
 
 ### M1: the surface becomes configurable and complete
 

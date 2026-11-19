@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     # The crate needs GTK 4.22+. Ubuntu runners ship an older GTK, so build in
     # Arch, which carries gtk4 4.24. base-devel does NOT include git, so it is
-    # installed explicitly before checkout.
+    # installed explicitly before checkout. zstd is needed by actions/cache.
     container:
       image: archlinux:base-devel
     steps:
@@ -27,7 +27,7 @@ jobs:
         run: |
           set -eu
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb
+          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb zstd
           rustup default stable
           rustup component add clippy rustfmt
 
@@ -42,6 +42,28 @@ jobs:
           fi
 
       - uses: actions/checkout@v7
+
+      # The cache key carries the toolchain and GTK versions because the Arch
+      # image floats: a new rustc or GTK invalidates compiled -sys crates even
+      # when Cargo.lock is unchanged.
+      - name: Record toolchain and GTK versions
+        id: versions
+        run: |
+          set -eu
+          echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+          echo "gtk4=$(pkg-config --modversion gtk4)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ github.job }}-${{ steps.versions.outputs.rustc }}-gtk${{ steps.versions.outputs.gtk4 }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ github.job }}-${{ steps.versions.outputs.rustc }}-gtk${{ steps.versions.outputs.gtk4 }}-
 
       - name: Format
         run: cargo fmt --check
@@ -75,10 +97,31 @@ jobs:
         run: |
           set -eu
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed git gtk4 rustup
+          pacman -Syu --noconfirm --needed git gtk4 rustup zstd
           rustup default stable
 
       - uses: actions/checkout@v7
+
+      - name: Record toolchain and GTK versions
+        id: versions
+        run: |
+          set -eu
+          echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+          echo "gtk4=$(pkg-config --modversion gtk4)" >> "$GITHUB_OUTPUT"
+
+      # Separate key from the check job: this one builds the release profile,
+      # so sharing a target directory would make the two jobs evict each other.
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ github.job }}-${{ steps.versions.outputs.rustc }}-gtk${{ steps.versions.outputs.gtk4 }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ github.job }}-${{ steps.versions.outputs.rustc }}-gtk${{ steps.versions.outputs.gtk4 }}-
 
       - name: Build release binary
         run: cargo build --locked --release
