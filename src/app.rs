@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -13,12 +13,15 @@ use crate::action::{ActionId, ConsentTier};
 use crate::engine::{EngineNotification, GridSize, PaneEngine, parse_named_key};
 use crate::ipc::{
     AuditDecision, AuditEntry, ConsentMode, IpcEnvelope, IpcRequest, IpcResponse, action_catalog,
-    bind_socket, read_envelope, write_response,
+    bind_socket, carrier_permits_peer, default_audit_path, peer_credentials, read_envelope,
+    server_uid, write_response,
 };
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
 use crate::ui::window::MutinyWindow;
 
 const MAX_AUDIT_ENTRIES: usize = 256;
+/// Rotate the durable trail past this size, keeping one previous generation.
+const AUDIT_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 
 struct PendingWait {
     pane: PaneId,
@@ -33,6 +36,7 @@ pub struct PendingConsent {
     pub id: u64,
     pub client: String,
     pub request: IpcRequest,
+    pub carrier: ConsentMode,
     pub deadline: Instant,
     stream: UnixStream,
 }
@@ -50,6 +54,12 @@ pub struct AppController {
     ui_windows: RefCell<HashMap<WindowId, MutinyWindow>>,
     ipc_listener: RefCell<Option<UnixListener>>,
     socket_path: RefCell<Option<PathBuf>>,
+    agent_listener: RefCell<Option<UnixListener>>,
+    agent_socket_path: RefCell<Option<PathBuf>>,
+    /// Mode the agent carrier assigns to every connection it accepts. Pinned
+    /// by the operator at GUI launch; no client can raise it.
+    agent_mode: Cell<ConsentMode>,
+    audit_path: RefCell<Option<PathBuf>>,
     pending_waits: RefCell<Vec<PendingWait>>,
     pending_consents: RefCell<VecDeque<PendingConsent>>,
     session_approved_clients: RefCell<HashSet<String>>,
@@ -63,22 +73,47 @@ pub struct AppController {
 
 impl AppController {
     pub fn new(shell_override: Option<(String, Vec<String>)>) -> Rc<Self> {
+        Self::with_audit_path(shell_override, default_audit_path())
+    }
+
+    /// Builds a controller whose durable audit trail lives at `audit_path`.
+    /// Existing entries are loaded so the trail survives a restart.
+    pub fn with_audit_path(
+        shell_override: Option<(String, Vec<String>)>,
+        audit_path: PathBuf,
+    ) -> Rc<Self> {
+        let mut ring = VecDeque::with_capacity(MAX_AUDIT_ENTRIES);
+        let next_seq = load_audit_tail(&audit_path, &mut ring);
         Rc::new(Self {
             workspace: RefCell::new(Workspace::new()),
             gtk_app: RefCell::new(None),
             ui_windows: RefCell::new(HashMap::new()),
             ipc_listener: RefCell::new(None),
             socket_path: RefCell::new(None),
+            agent_listener: RefCell::new(None),
+            agent_socket_path: RefCell::new(None),
+            agent_mode: Cell::new(ConsentMode::Ask),
+            audit_path: RefCell::new(Some(audit_path)),
             pending_waits: RefCell::new(Vec::new()),
             pending_consents: RefCell::new(VecDeque::new()),
             session_approved_clients: RefCell::new(HashSet::new()),
-            audit_log: RefCell::new(VecDeque::with_capacity(MAX_AUDIT_ENTRIES)),
-            next_audit_seq: Cell::new(1),
+            audit_log: RefCell::new(ring),
+            next_audit_seq: Cell::new(next_seq),
             next_consent_id: Cell::new(1),
             recent_agent: RefCell::new(None),
             shell_override: RefCell::new(shell_override),
             default_menubar: Cell::new(true),
         })
+    }
+
+    /// Pins the mode the agent carrier will assign. Call before accepting
+    /// connections; this is the operator-side grant, not a client request.
+    pub fn set_agent_mode(&self, mode: ConsentMode) {
+        self.agent_mode.set(mode);
+    }
+
+    pub fn agent_mode(&self) -> ConsentMode {
+        self.agent_mode.get()
     }
 
     pub fn attach_gtk_app(&self, app: &gtk4::Application) {
@@ -92,9 +127,24 @@ impl AppController {
         Ok(())
     }
 
+    /// Binds the agent carrier and pins the mode it assigns. Separate from the
+    /// operator socket so an agent transport can never arrive on the carrier
+    /// that grants `Operator`.
+    pub fn start_agent_listener(&self, path: &Path, mode: ConsentMode) -> io::Result<()> {
+        let listener = bind_socket(path)?;
+        *self.agent_listener.borrow_mut() = Some(listener);
+        *self.agent_socket_path.borrow_mut() = Some(path.to_path_buf());
+        self.agent_mode.set(mode);
+        Ok(())
+    }
+
     pub fn shutdown_ipc(&self) {
         *self.ipc_listener.borrow_mut() = None;
         if let Some(path) = self.socket_path.borrow_mut().take() {
+            let _ = std::fs::remove_file(path);
+        }
+        *self.agent_listener.borrow_mut() = None;
+        if let Some(path) = self.agent_socket_path.borrow_mut().take() {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -146,26 +196,39 @@ impl AppController {
             .collect()
     }
 
-    fn record_audit(&self, client: &str, req: &IpcRequest, decision: AuditDecision) {
+    fn record_audit(
+        &self,
+        client: &str,
+        req: &IpcRequest,
+        decision: AuditDecision,
+        carrier: ConsentMode,
+    ) {
         let seq = self.next_audit_seq.get();
         self.next_audit_seq.set(seq + 1);
         let unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let mut log = self.audit_log.borrow_mut();
-        if log.len() >= MAX_AUDIT_ENTRIES {
-            log.pop_front();
-        }
-        log.push_back(AuditEntry {
+        let entry = AuditEntry {
             seq,
             unix_ms,
             client: client.to_owned(),
             verb: req.verb_name().to_owned(),
             tier: req.consent_tier(),
+            carrier,
             decision,
             detail: req.redacted_summary(),
-        });
+        };
+        {
+            let mut log = self.audit_log.borrow_mut();
+            if log.len() >= MAX_AUDIT_ENTRIES {
+                log.pop_front();
+            }
+            log.push_back(entry.clone());
+        }
+        if let Some(path) = self.audit_path.borrow().as_ref() {
+            append_audit_entry(path, &entry);
+        }
     }
 
     pub fn resolve_consent(self: &Rc<Self>, id: u64, resolution: ConsentResolution) {
@@ -182,14 +245,24 @@ impl AppController {
 
         match resolution {
             ConsentResolution::Deny => {
-                self.record_audit(&item.client, &item.request, AuditDecision::Denied);
+                self.record_audit(
+                    &item.client,
+                    &item.request,
+                    AuditDecision::Denied,
+                    item.carrier,
+                );
                 let _ = write_response(
                     &mut item.stream,
                     &IpcResponse::err("operator denied agent action"),
                 );
             }
             ConsentResolution::AllowOnce => {
-                self.record_audit(&item.client, &item.request, AuditDecision::ApprovedOnce);
+                self.record_audit(
+                    &item.client,
+                    &item.request,
+                    AuditDecision::ApprovedOnce,
+                    item.carrier,
+                );
                 if let Some(resp) = self.execute_ipc_request(item.request, &item.stream) {
                     let _ = write_response(&mut item.stream, &resp);
                 }
@@ -198,7 +271,12 @@ impl AppController {
                 self.session_approved_clients
                     .borrow_mut()
                     .insert(item.client.clone());
-                self.record_audit(&item.client, &item.request, AuditDecision::ApprovedSession);
+                self.record_audit(
+                    &item.client,
+                    &item.request,
+                    AuditDecision::ApprovedSession,
+                    item.carrier,
+                );
                 if let Some(resp) = self.execute_ipc_request(item.request, &item.stream) {
                     let _ = write_response(&mut item.stream, &resp);
                 }
@@ -614,10 +692,24 @@ impl AppController {
         self.accept_ipc_clients();
     }
 
+    /// Services both carriers. The operator socket assigns `Operator` to a
+    /// same-uid peer; the agent socket assigns the mode the operator pinned at
+    /// launch. Neither reads a mode from the request.
     fn accept_ipc_clients(self: &Rc<Self>) {
+        self.accept_carrier(&self.ipc_listener, ConsentMode::Operator, "ctl");
+        let agent_mode = self.agent_mode.get();
+        self.accept_carrier(&self.agent_listener, agent_mode, "mcp-agent");
+    }
+
+    fn accept_carrier(
+        self: &Rc<Self>,
+        cell: &RefCell<Option<UnixListener>>,
+        carrier: ConsentMode,
+        default_label: &str,
+    ) {
         loop {
             let accepted = {
-                let guard = self.ipc_listener.borrow();
+                let guard = cell.borrow();
                 let Some(listener) = guard.as_ref() else {
                     break;
                 };
@@ -625,16 +717,55 @@ impl AppController {
             };
 
             match accepted {
-                Ok((mut stream, _)) => {
-                    if let Ok(env_req) = read_envelope(&mut stream)
-                        && let Some(resp) = self.evaluate_consent_and_dispatch(env_req, &stream)
-                    {
-                        let _ = write_response(&mut stream, &resp);
-                    }
-                }
+                Ok((stream, _)) => self.handle_accepted(stream, carrier, default_label),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
+        }
+    }
+
+    fn handle_accepted(
+        self: &Rc<Self>,
+        mut stream: UnixStream,
+        carrier: ConsentMode,
+        default_label: &str,
+    ) {
+        // Identity comes from the kernel, before anything the client wrote is
+        // trusted. A peer from another uid is refused outright.
+        match peer_credentials(&stream) {
+            Ok(cred) if carrier_permits_peer(&cred, server_uid()) => {}
+            Ok(cred) => {
+                let _ = write_response(
+                    &mut stream,
+                    &IpcResponse::err(format!(
+                        "peer uid {} does not match server uid {}; connection refused",
+                        cred.uid,
+                        server_uid()
+                    )),
+                );
+                return;
+            }
+            Err(err) => {
+                let _ = write_response(
+                    &mut stream,
+                    &IpcResponse::err(format!("peer credential check failed: {err}")),
+                );
+                return;
+            }
+        }
+
+        let env_req = match read_envelope(&mut stream) {
+            Ok(env) => env,
+            Err(err) => {
+                let _ = write_response(&mut stream, &IpcResponse::err(err.to_string()));
+                return;
+            }
+        };
+
+        if let Some(resp) =
+            self.evaluate_consent_and_dispatch(env_req, &stream, carrier, default_label)
+        {
+            let _ = write_response(&mut stream, &resp);
         }
     }
 
@@ -642,31 +773,39 @@ impl AppController {
         self: &Rc<Self>,
         env_req: IpcEnvelope,
         raw_stream: &UnixStream,
+        carrier: ConsentMode,
+        default_label: &str,
     ) -> Option<IpcResponse> {
-        let client_label =
-            env_req
-                .meta
-                .client
-                .clone()
-                .unwrap_or_else(|| match env_req.meta.consent_mode {
-                    ConsentMode::Operator => String::from("ctl"),
-                    _ => String::from("mcp-agent"),
-                });
+        let client_label = env_req
+            .meta
+            .client
+            .clone()
+            .unwrap_or_else(|| default_label.to_owned());
 
-        if env_req.meta.client.is_some() || env_req.meta.consent_mode != ConsentMode::Operator {
+        if carrier != ConsentMode::Operator {
             *self.recent_agent.borrow_mut() = Some((client_label.clone(), Instant::now()));
             self.refresh_all_window_chromes();
         }
 
         let tier = env_req.request.consent_tier();
-        match (tier, env_req.meta.consent_mode) {
+        match (tier, carrier) {
             (ConsentTier::Observe, _)
             | (ConsentTier::Act, ConsentMode::Operator | ConsentMode::Paired) => {
-                self.record_audit(&client_label, &env_req.request, AuditDecision::Allowed);
+                self.record_audit(
+                    &client_label,
+                    &env_req.request,
+                    AuditDecision::Allowed,
+                    carrier,
+                );
                 self.execute_ipc_request(env_req.request, raw_stream)
             }
             (ConsentTier::Act, ConsentMode::ObserveOnly) => {
-                self.record_audit(&client_label, &env_req.request, AuditDecision::Denied);
+                self.record_audit(
+                    &client_label,
+                    &env_req.request,
+                    AuditDecision::Denied,
+                    carrier,
+                );
                 Some(IpcResponse::err(
                     "observe-only session cannot execute Tier-2 Act verbs",
                 ))
@@ -681,13 +820,19 @@ impl AppController {
                         &client_label,
                         &env_req.request,
                         AuditDecision::ApprovedSession,
+                        carrier,
                     );
                     return self.execute_ipc_request(env_req.request, raw_stream);
                 }
 
                 // Fail closed when no interactive GUI window is attached to present consent.
                 if self.ui_windows.borrow().is_empty() {
-                    self.record_audit(&client_label, &env_req.request, AuditDecision::Denied);
+                    self.record_audit(
+                        &client_label,
+                        &env_req.request,
+                        AuditDecision::Denied,
+                        carrier,
+                    );
                     return Some(IpcResponse::err(
                         "consent prompt requires an open Mutiny GUI window",
                     ));
@@ -704,6 +849,7 @@ impl AppController {
                         id: cid,
                         client: client_label,
                         request: env_req.request,
+                        carrier,
                         deadline: Instant::now() + Duration::from_secs(25),
                         stream: cloned,
                     });
@@ -1184,6 +1330,55 @@ impl AppController {
             self.refresh_all_window_chromes();
         }
     }
+}
+
+/// Appends one redacted entry to the durable trail. Best-effort: a failing
+/// audit write must not take down the terminal, but it is reported on stderr
+/// so the operator can see the trail is incomplete.
+fn append_audit_entry(path: &Path, entry: &AuditEntry) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > AUDIT_ROTATE_BYTES
+    {
+        let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
+    }
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path);
+    match opened {
+        Ok(mut file) => {
+            if let Ok(line) = serde_json::to_string(entry)
+                && let Err(err) = writeln!(file, "{line}")
+            {
+                eprintln!("warning: audit append failed: {err}");
+            }
+        }
+        Err(err) => eprintln!("warning: cannot open audit log {}: {err}", path.display()),
+    }
+}
+
+/// Loads the tail of the durable trail into the viewer ring and returns the
+/// next sequence number. Corrupt lines are skipped rather than fatal.
+fn load_audit_tail(path: &Path, ring: &mut VecDeque<AuditEntry>) -> u64 {
+    let Ok(file) = std::fs::File::open(path) else {
+        return 1;
+    };
+    let mut max_seq = 0u64;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let Ok(entry) = serde_json::from_str::<AuditEntry>(&line) else {
+            continue;
+        };
+        max_seq = max_seq.max(entry.seq);
+        if ring.len() >= MAX_AUDIT_ENTRIES {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+    }
+    max_seq + 1
 }
 
 fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) -> IpcResponse {

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    # GTK 4.22 is required by the crate's v4_22 feature. Arch carries it;
+    # the Ubuntu runner's own GTK is too old.
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark checkout safe for git in the container
+        run: git config --global --add safe.directory '*'
+
+      - name: Install GTK4, Rust, and a virtual X server
+        run: pacman -Syu --noconfirm --needed gtk4 rustup xorg-server-xvfb
+
+      - name: Select stable toolchain
+        run: rustup default stable
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The suite must pass with no display at all: this is the property that
+      # lets engine, topology, IPC, and MCP work be tested without a desktop.
+      - name: Tests (no display)
+        run: cargo test
+        env:
+          WAYLAND_DISPLAY: ""
+          DISPLAY: ""
+
+      # Under Xvfb the GTK-dependent assertions actually run, including the
+      # accelerator-syntax check that a displayless run silently skips.
+      - name: Tests (virtual display, exercises GTK assertions)
+        run: xvfb-run -a cargo test
+
+      - name: Baseline benchmark builds
+        run: cargo bench --no-run

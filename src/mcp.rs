@@ -6,10 +6,61 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::action::by_slug;
-use crate::ipc::{CallerMeta, ConsentMode, IpcEnvelope, IpcRequest, IpcResponse, send_envelope};
+use crate::ipc::{
+    CallerMeta, ConsentMode, IPC_PROTOCOL_VERSION, IpcEnvelope, IpcRequest, IpcResponse,
+    send_envelope,
+};
 use crate::topology::{PaneId, SplitAxis, TabId, WindowId};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP revisions this bridge implements. `initialize` negotiates against this
+/// set instead of echoing whatever the client asked for.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// Resource URIs that exist regardless of workspace contents. Single source
+/// for `resources/list`, `resources/read`, and the parity test.
+pub const STATIC_RESOURCES: &[&str] = &[
+    "ui://mutiny/workspace",
+    "ui://mutiny/actions",
+    "ui://mutiny/exited",
+    "ui://mutiny/audit",
+];
+
+/// How an IPC verb is reachable from MCP. The match in `mcp_surface_for` is
+/// exhaustive, so a new verb cannot compile until its reachability is decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpSurface {
+    Tool(&'static str),
+    Resource(&'static str),
+}
+
+/// Maps every IPC verb to the MCP tool or resource that reaches it. `None`
+/// means the verb is CLI-only, which the parity test treats as a failure.
+pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
+    match req {
+        IpcRequest::List => Some(McpSurface::Tool("list_workspace")),
+        IpcRequest::Actions => Some(McpSurface::Tool("list_actions")),
+        IpcRequest::AuditLog { .. } => Some(McpSurface::Resource("ui://mutiny/audit")),
+        IpcRequest::Snapshot { .. } => Some(McpSurface::Tool("read_pane_snapshot")),
+        IpcRequest::ReadExited { .. } => Some(McpSurface::Tool("read_exited_pane")),
+        IpcRequest::Search { .. } => Some(McpSurface::Tool("search_scrollback")),
+        IpcRequest::RunAction { .. } => Some(McpSurface::Tool("run_action")),
+        IpcRequest::SpawnWindow { .. } => Some(McpSurface::Tool("spawn_pane")),
+        IpcRequest::SpawnTab { .. } => Some(McpSurface::Tool("spawn_pane")),
+        IpcRequest::Split { .. } => Some(McpSurface::Tool("spawn_pane")),
+        IpcRequest::Focus { .. } => Some(McpSurface::Tool("focus_pane")),
+        IpcRequest::DetachSplit { .. } => Some(McpSurface::Tool("detach_split")),
+        IpcRequest::MovePane { .. } => Some(McpSurface::Tool("move_pane")),
+        IpcRequest::SendText { .. } => Some(McpSurface::Tool("send_terminal_input")),
+        IpcRequest::SendInput { .. } => Some(McpSurface::Tool("send_terminal_input")),
+        IpcRequest::SendToAgent { .. } => Some(McpSurface::Tool("send_to_agent")),
+        IpcRequest::PresentNotice { .. } => Some(McpSurface::Tool("present_notice")),
+        IpcRequest::LastOutput { .. } => Some(McpSurface::Tool("read_last_command_output")),
+        IpcRequest::ScreenText { .. } => Some(McpSurface::Tool("read_screen_text")),
+        IpcRequest::WaitPrompt { .. } => Some(McpSurface::Tool("wait_prompt")),
+        IpcRequest::AwaitTurn { .. } => Some(McpSurface::Tool("await_turn")),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -133,10 +184,21 @@ impl McpBridge {
         request: IpcRequest,
         timeout: Duration,
     ) -> Result<IpcResponse, (i32, String)> {
+        // The launch flag is a local ceiling, enforced here before anything
+        // reaches the socket. The carrier assigns the effective mode; this
+        // bridge can only ever be more restrictive than the carrier, never less.
+        if self.consent_mode == ConsentMode::ObserveOnly
+            && request.consent_tier() == crate::action::ConsentTier::Act
+        {
+            return Ok(IpcResponse::err(
+                "observe-only session cannot execute Tier-2 Act verbs",
+            ));
+        }
+
         let env_req = IpcEnvelope {
+            version: IPC_PROTOCOL_VERSION,
             meta: CallerMeta {
                 client: Some(self.client_name.clone()),
-                consent_mode: self.consent_mode,
             },
             request,
         };
@@ -162,12 +224,19 @@ impl McpBridge {
                 {
                     self.client_name = name.trim().to_owned();
                 }
+                // Negotiate: honour a revision we implement, otherwise answer
+                // with our own latest. Never echo an unsupported version back.
                 let requested_version = params
                     .get("protocolVersion")
                     .and_then(Value::as_str)
                     .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+                let negotiated = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested_version) {
+                    requested_version
+                } else {
+                    DEFAULT_PROTOCOL_VERSION
+                };
                 Ok(json!({
-                    "protocolVersion": requested_version,
+                    "protocolVersion": negotiated,
                     "capabilities": {
                         "tools": {},
                         "resources": {}
@@ -188,26 +257,18 @@ impl McpBridge {
     }
 
     fn list_resources(&self) -> Result<Value, (i32, String)> {
-        let mut resources = vec![
-            json!({
-                "uri": "ui://mutiny/workspace",
-                "name": "Mutiny Workspace Topology",
-                "description": "Live windows, tabs, binary split trees, working directories, and pane attention flags",
-                "mimeType": "application/json"
-            }),
-            json!({
-                "uri": "ui://mutiny/exited",
-                "name": "Recently Exited Panes",
-                "description": "Final screens and exit codes of the last 8 closed or failed panes",
-                "mimeType": "application/json"
-            }),
-            json!({
-                "uri": "ui://mutiny/audit",
-                "name": "Agent Audit Trail",
-                "description": "Redacted log of IPC and MCP calls with consent decisions",
-                "mimeType": "application/json"
-            }),
-        ];
+        let mut resources: Vec<Value> = STATIC_RESOURCES
+            .iter()
+            .map(|uri| {
+                let (name, description) = resource_metadata(uri);
+                json!({
+                    "uri": uri,
+                    "name": name,
+                    "description": description,
+                    "mimeType": "application/json"
+                })
+            })
+            .collect();
 
         if let Ok(IpcResponse::Ok {
             workspace: Some(ws),
@@ -239,6 +300,8 @@ impl McpBridge {
 
         let ipc_req = if uri == "ui://mutiny/workspace" {
             IpcRequest::List
+        } else if uri == "ui://mutiny/actions" {
+            IpcRequest::Actions
         } else if uri == "ui://mutiny/exited" {
             IpcRequest::ReadExited { pane: None }
         } else if uri == "ui://mutiny/audit" {
@@ -292,6 +355,27 @@ impl McpBridge {
 
         let (ipc_req, timeout) = match name {
             "list_workspace" => (IpcRequest::List, Duration::from_secs(5)),
+            "list_actions" => (IpcRequest::Actions, Duration::from_secs(5)),
+            "read_screen_text" => (
+                IpcRequest::ScreenText {
+                    pane: opt_pane("pane"),
+                },
+                Duration::from_secs(5),
+            ),
+            "wait_prompt" => {
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(15_000);
+                (
+                    IpcRequest::WaitPrompt {
+                        pane: opt_pane("pane"),
+                        since_seq: args.get("since_seq").and_then(Value::as_u64),
+                        timeout_ms,
+                    },
+                    Duration::from_millis(timeout_ms.saturating_add(2_000)),
+                )
+            }
             "read_pane_snapshot" => (
                 IpcRequest::Snapshot {
                     pane: opt_pane("pane"),
@@ -508,12 +592,59 @@ impl McpBridge {
     }
 }
 
-fn tool_definitions() -> Value {
+fn resource_metadata(uri: &str) -> (&'static str, &'static str) {
+    match uri {
+        "ui://mutiny/workspace" => (
+            "Mutiny Workspace Topology",
+            "Live windows, tabs, binary split trees, working directories, and pane attention flags",
+        ),
+        "ui://mutiny/actions" => (
+            "Mutiny Action Catalog",
+            "Every registered ActionSpec verb with its slug, shortcut, and consent tier; the slugs run_action accepts",
+        ),
+        "ui://mutiny/exited" => (
+            "Recently Exited Panes",
+            "Final screens and exit codes of the last 8 closed or failed panes",
+        ),
+        "ui://mutiny/audit" => (
+            "Agent Audit Trail",
+            "Redacted log of IPC and MCP calls with consent decisions and the carrier each arrived on",
+        ),
+        _ => ("Mutiny Resource", "Mutiny workspace state"),
+    }
+}
+
+pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "list_workspace",
             "description": "Tier-1 Observe: list windows, tabs, split trees, working directories, prompt/output counters, and attention state.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_actions",
+            "description": "Tier-1 Observe: every registered ActionSpec verb with slug, shortcut, consent tier, and summary. Use the slugs with run_action.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "read_screen_text",
+            "description": "Tier-1 Observe: the visible viewport text of a pane, untrimmed, as a single string.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "pane": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "wait_prompt",
+            "description": "Tier-1 Observe: block until the next OSC 133 prompt arrives on a pane. Use await_turn instead for raw-mode TUIs that emit no shell integration.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer" },
+                    "since_seq": { "type": "integer" },
+                    "timeout_ms": { "type": "integer" }
+                }
+            }
         },
         {
             "name": "read_pane_snapshot",
@@ -668,4 +799,94 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::verb_samples;
+    use std::io::Cursor;
+
+    fn advertised_tool_names() -> Vec<String> {
+        tool_definitions()
+            .as_array()
+            .expect("tool definitions are an array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool has a name").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn every_ipc_verb_is_reachable_from_mcp() {
+        let tools = advertised_tool_names();
+        for sample in verb_samples() {
+            let verb = sample.verb_name();
+            let surface = mcp_surface_for(&sample)
+                .unwrap_or_else(|| panic!("verb '{verb}' has no MCP surface"));
+            match surface {
+                McpSurface::Tool(name) => assert!(
+                    tools.iter().any(|t| t == name),
+                    "verb '{verb}' maps to tool '{name}', which tools/list does not advertise"
+                ),
+                McpSurface::Resource(uri) => assert!(
+                    STATIC_RESOURCES.contains(&uri),
+                    "verb '{verb}' maps to resource '{uri}', which resources/list does not list"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn no_advertised_tool_is_dead_surface() {
+        let reachable: Vec<&'static str> = verb_samples()
+            .iter()
+            .filter_map(|s| match mcp_surface_for(s) {
+                Some(McpSurface::Tool(name)) => Some(name),
+                _ => None,
+            })
+            .collect();
+        for name in advertised_tool_names() {
+            assert!(
+                reachable.contains(&name.as_str()),
+                "tool '{name}' is advertised but no IPC verb maps to it"
+            );
+        }
+    }
+
+    #[test]
+    fn initialize_negotiates_instead_of_echoing() {
+        let mut bridge = McpBridge::new(
+            PathBuf::from("/nonexistent.sock"),
+            ConsentMode::ObserveOnly,
+            String::from("tester"),
+        );
+        let input = format!(
+            "{}\n{}\n",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01","clientInfo":{"name":"peer"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}),
+        );
+        let mut reader = Cursor::new(input.into_bytes());
+        let mut out = Vec::new();
+        bridge.serve(&mut reader, &mut out).unwrap();
+        let replies: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            replies[0]["result"]["protocolVersion"],
+            json!(DEFAULT_PROTOCOL_VERSION),
+            "unsupported revision must fall back to ours, not echo"
+        );
+        assert_eq!(replies[1]["result"]["protocolVersion"], json!("2025-03-26"));
+        assert_eq!(replies[0]["result"]["serverInfo"]["name"], json!("mutiny"));
+    }
+
+    #[test]
+    fn actions_resource_is_listed_and_readable_without_a_workspace() {
+        assert!(STATIC_RESOURCES.contains(&"ui://mutiny/actions"));
+        let (name, desc) = resource_metadata("ui://mutiny/actions");
+        assert!(name.contains("Action"));
+        assert!(desc.contains("run_action"));
+    }
 }

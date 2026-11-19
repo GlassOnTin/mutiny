@@ -10,7 +10,9 @@ use gtk4::prelude::*;
 
 use mutiny::action::{ACTIONS, build_menubar_model, by_slug};
 use mutiny::app::AppController;
-use mutiny::ipc::{ConsentMode, IpcRequest, IpcResponse, default_socket_path, send_request};
+use mutiny::ipc::{
+    ConsentMode, IpcRequest, IpcResponse, agent_socket_path, default_socket_path, send_request,
+};
 use mutiny::mcp::McpBridge;
 use mutiny::topology::{PaneId, SplitAxis, TabId, WindowId};
 
@@ -32,6 +34,12 @@ struct Cli {
     /// Override shell command to launch (e.g. --shell /bin/bash)
     #[arg(long)]
     shell: Option<String>,
+
+    /// GUI only: consent mode the agent carrier assigns to MCP connections.
+    /// This is the operator-side grant; a bridge cannot raise it. `paired`
+    /// allows Tier-2 acts without a prompt, so opt in deliberately.
+    #[arg(long, value_enum, default_value_t = McpConsentArg::Ask)]
+    agent_consent: McpConsentArg,
 
     #[command(subcommand)]
     command: Option<TopCommand>,
@@ -214,15 +222,18 @@ enum CtlVerb {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let socket_path = cli.socket.unwrap_or_else(default_socket_path);
+    let explicit_socket = cli.socket.clone();
+    let operator_path = explicit_socket.clone().unwrap_or_else(default_socket_path);
 
     match cli.command {
-        Some(TopCommand::Ctl { verb }) => run_ctl(&socket_path, verb),
+        Some(TopCommand::Ctl { verb }) => run_ctl(&operator_path, verb),
         Some(TopCommand::Mcp {
             consent,
             client_name,
         }) => {
-            let mut bridge = McpBridge::new(socket_path, consent.into(), client_name);
+            // Agents arrive on the agent carrier, never the operator one.
+            let path = explicit_socket.unwrap_or_else(|| agent_socket_path(&operator_path));
+            let mut bridge = McpBridge::new(path, consent.into(), client_name);
             match bridge.serve_stdio() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -231,7 +242,12 @@ fn main() -> ExitCode {
                 }
             }
         }
-        None => run_gui_app(socket_path, cli.working_directory, cli.shell),
+        None => run_gui_app(
+            operator_path,
+            cli.working_directory,
+            cli.shell,
+            cli.agent_consent.into(),
+        ),
     }
 }
 
@@ -390,6 +406,7 @@ fn run_gui_app(
     socket_path: PathBuf,
     initial_cwd: Option<PathBuf>,
     shell_prog: Option<String>,
+    agent_consent: ConsentMode,
 ) -> ExitCode {
     if socket_path.exists()
         && let Ok(IpcResponse::Ok { .. }) = send_request(
@@ -415,6 +432,14 @@ fn run_gui_app(
         eprintln!(
             "warning: could not bind IPC socket at {}: {err}",
             socket_path.display()
+        );
+    }
+
+    let agent_path = agent_socket_path(&socket_path);
+    if let Err(err) = controller.start_agent_listener(&agent_path, agent_consent) {
+        eprintln!(
+            "warning: could not bind agent socket at {}: {err}",
+            agent_path.display()
         );
     }
 

@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,6 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::action::{ACTIONS, ActionId, ConsentTier, spec};
 use crate::engine::{CommandRecord, PaneSnapshot, ScrollbackMatch};
 use crate::topology::{ExitedPaneRecord, PaneId, SplitAxis, TabId, WindowId, WorkspaceSummary};
+
+/// Wire version of the JSONL envelope. Bump on any breaking shape change;
+/// the server refuses envelopes that do not match.
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+
+fn default_ipc_version() -> u32 {
+    IPC_PROTOCOL_VERSION
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -24,16 +33,19 @@ pub enum ConsentMode {
     ObserveOnly,
 }
 
+/// Caller-supplied label only. The consent mode is deliberately absent: it is
+/// assigned by the carrier that accepted the connection, never by the client.
+/// See `parse_envelope`, which refuses any envelope that tries to send one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CallerMeta {
     #[serde(default)]
     pub client: Option<String>,
-    #[serde(default)]
-    pub consent_mode: ConsentMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcEnvelope {
+    #[serde(default = "default_ipc_version")]
+    pub version: u32,
     #[serde(flatten)]
     pub meta: CallerMeta,
     #[serde(flatten)]
@@ -272,6 +284,9 @@ pub struct AuditEntry {
     pub client: String,
     pub verb: String,
     pub tier: ConsentTier,
+    /// Mode the carrier assigned to this connection, recorded so the trail
+    /// shows which trust path a call arrived on.
+    pub carrier: ConsentMode,
     pub decision: AuditDecision,
     pub detail: String,
 }
@@ -369,6 +384,39 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/mutiny-{uid}.sock"))
 }
 
+/// The agent carrier sits beside the operator carrier. `mutiny mcp` connects
+/// here, so the mode the GUI pinned for agents applies to it; `mutiny ctl`
+/// connects to the operator socket and is the operator by virtue of being a
+/// same-uid peer on that carrier.
+pub fn agent_socket_path(operator_path: &Path) -> PathBuf {
+    let stem = operator_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("mutiny"));
+    let name = match operator_path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{stem}-agent.{ext}"),
+        None => format!("{stem}-agent"),
+    };
+    operator_path.with_file_name(name)
+}
+
+/// Durable audit trail location. State, not config: it is written by the app
+/// rather than edited by the user.
+pub fn default_audit_path() -> PathBuf {
+    let base = env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("state"))
+        })
+        .unwrap_or_else(env::temp_dir);
+    base.join("mutiny").join("audit.jsonl")
+}
+
 pub fn bind_socket(path: &Path) -> io::Result<UnixListener> {
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
@@ -398,7 +446,72 @@ pub fn read_envelope(stream: &mut UnixStream) -> io::Result<IpcEnvelope> {
             "empty IPC request",
         ));
     }
-    serde_json::from_str(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    parse_envelope(line.trim())
+}
+
+/// Decodes one envelope, enforcing the two carrier rules that a client must
+/// not be able to talk its way past: it cannot claim a consent mode, and it
+/// cannot speak a wire version the server does not implement.
+pub fn parse_envelope(line: &str) -> io::Result<IpcEnvelope> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    if value.get("consent_mode").is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "consent_mode is assigned by the transport and must not be sent by the client",
+        ));
+    }
+
+    let envelope: IpcEnvelope =
+        serde_json::from_value(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    if envelope.version != IPC_PROTOCOL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported IPC protocol version {} (server speaks {})",
+                envelope.version, IPC_PROTOCOL_VERSION
+            ),
+        ));
+    }
+    Ok(envelope)
+}
+
+/// Reads the peer's uid/gid/pid from the kernel via `SO_PEERCRED`. This is the
+/// only identity a Unix socket peer cannot forge: it is set by the kernel at
+/// connect time, not by anything the client writes.
+pub fn peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred)
+}
+
+/// A peer is admitted only when its kernel-reported uid matches the server's.
+/// Split out from the socket call so the refusal path is testable without
+/// needing a second user account.
+pub fn carrier_permits_peer(cred: &libc::ucred, server_uid: u32) -> bool {
+    cred.uid == server_uid
+}
+
+pub fn server_uid() -> u32 {
+    unsafe { libc::getuid() }
 }
 
 pub fn write_response(stream: &mut UnixStream, resp: &IpcResponse) -> io::Result<()> {
@@ -417,6 +530,7 @@ pub fn send_request(
     send_envelope(
         socket_path,
         &IpcEnvelope {
+            version: IPC_PROTOCOL_VERSION,
             meta: CallerMeta::default(),
             request: req.clone(),
         },
@@ -462,6 +576,113 @@ pub fn action_catalog() -> Vec<ActionCatalogItem> {
         .collect()
 }
 
+/// One canonical instance of every IPC verb, in `variant_ordinal` order. The
+/// parity test drives off this list, so a verb missing here is a verb whose
+/// MCP reachability is unasserted.
+pub fn verb_samples() -> Vec<IpcRequest> {
+    vec![
+        IpcRequest::List,
+        IpcRequest::Actions,
+        IpcRequest::AuditLog { limit: 50 },
+        IpcRequest::Snapshot {
+            pane: None,
+            max_lines: None,
+        },
+        IpcRequest::ReadExited { pane: None },
+        IpcRequest::Search {
+            pane: None,
+            pattern: String::from("needle"),
+            ignore_case: true,
+            max_matches: 20,
+        },
+        IpcRequest::RunAction {
+            action: ActionId::NewTab,
+            window: None,
+        },
+        IpcRequest::SpawnWindow { cwd: None },
+        IpcRequest::SpawnTab {
+            window: None,
+            cwd: None,
+        },
+        IpcRequest::Split {
+            pane: None,
+            axis: SplitAxis::Horizontal,
+            cwd: None,
+        },
+        IpcRequest::Focus { pane: PaneId(1) },
+        IpcRequest::DetachSplit { pane: None },
+        IpcRequest::MovePane {
+            pane: PaneId(1),
+            target_tab: TabId(1),
+            axis: SplitAxis::Horizontal,
+        },
+        IpcRequest::SendText {
+            pane: None,
+            text: String::from("x"),
+        },
+        IpcRequest::SendInput {
+            pane: None,
+            text: Some(String::from("x")),
+            keys: vec![String::from("enter")],
+            bracketed_paste: false,
+            return_snapshot: false,
+        },
+        IpcRequest::SendToAgent {
+            pane: None,
+            message: String::from("x"),
+            max_lines: None,
+        },
+        IpcRequest::PresentNotice {
+            pane: None,
+            message: Some(String::from("x")),
+        },
+        IpcRequest::LastOutput { pane: None },
+        IpcRequest::ScreenText { pane: None },
+        IpcRequest::WaitPrompt {
+            pane: None,
+            since_seq: None,
+            timeout_ms: 1_000,
+        },
+        IpcRequest::AwaitTurn {
+            pane: None,
+            since_prompt_seq: None,
+            since_output_seq: None,
+            settle_ms: 250,
+            timeout_ms: 1_000,
+        },
+    ]
+}
+
+/// Exhaustiveness lock for `verb_samples`. Adding an `IpcRequest` variant
+/// fails compilation here, and the parity test then fails on the ordinal
+/// bounds check until a sample is added. Together those two locks are what
+/// make verb parity a property rather than an intention.
+pub fn variant_ordinal(req: &IpcRequest) -> usize {
+    match req {
+        IpcRequest::List => 0,
+        IpcRequest::Actions => 1,
+        IpcRequest::AuditLog { .. } => 2,
+        IpcRequest::Snapshot { .. } => 3,
+        IpcRequest::ReadExited { .. } => 4,
+        IpcRequest::Search { .. } => 5,
+        IpcRequest::RunAction { .. } => 6,
+        IpcRequest::SpawnWindow { .. } => 7,
+        IpcRequest::SpawnTab { .. } => 8,
+        IpcRequest::Split { .. } => 9,
+        IpcRequest::Focus { .. } => 10,
+        IpcRequest::DetachSplit { .. } => 11,
+        IpcRequest::MovePane { .. } => 12,
+        IpcRequest::SendText { .. } => 13,
+        IpcRequest::SendInput { .. } => 14,
+        IpcRequest::SendToAgent { .. } => 15,
+        IpcRequest::PresentNotice { .. } => 16,
+        IpcRequest::LastOutput { .. } => 17,
+        IpcRequest::ScreenText { .. } => 18,
+        IpcRequest::WaitPrompt { .. } => 19,
+        IpcRequest::AwaitTurn { .. } => 20,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +726,99 @@ mod tests {
 
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn client_asserted_consent_mode_is_refused() {
+        for mode in ["operator", "paired", "ask", "observe-only"] {
+            let line = format!(r#"{{"op":"list","consent_mode":"{mode}"}}"#);
+            let err = parse_envelope(&line).expect_err("must refuse a client-claimed mode");
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                err.to_string().contains("assigned by the transport"),
+                "unhelpful refusal: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_without_consent_mode_parses_and_defaults_version() {
+        let env = parse_envelope(r#"{"op":"list","client":"ctl"}"#).expect("plain envelope");
+        assert_eq!(env.version, IPC_PROTOCOL_VERSION);
+        assert_eq!(env.meta.client.as_deref(), Some("ctl"));
+        assert!(matches!(env.request, IpcRequest::List));
+    }
+
+    #[test]
+    fn mismatched_protocol_version_is_refused() {
+        let line = format!(r#"{{"version":{},"op":"list"}}"#, IPC_PROTOCOL_VERSION + 1);
+        let err = parse_envelope(&line).expect_err("must refuse unknown version");
+        assert!(err.to_string().contains("unsupported IPC protocol version"));
+    }
+
+    #[test]
+    fn carrier_admits_only_matching_uid() {
+        let ours = server_uid();
+        let same = libc::ucred {
+            pid: 1,
+            uid: ours,
+            gid: ours,
+        };
+        let other = libc::ucred {
+            pid: 2,
+            uid: ours.wrapping_add(1),
+            gid: ours,
+        };
+        let root = libc::ucred {
+            pid: 3,
+            uid: 0,
+            gid: 0,
+        };
+        assert!(carrier_permits_peer(&same, ours));
+        assert!(!carrier_permits_peer(&other, ours));
+        // Root is not exempt: a different uid is a different trust domain.
+        assert_eq!(carrier_permits_peer(&root, ours), ours == 0);
+    }
+
+    #[test]
+    fn live_socket_peer_credentials_match_server_uid() {
+        let sock_path = env::temp_dir().join(format!("mutiny-cred-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = bind_socket(&sock_path).expect("bind");
+        let client = UnixStream::connect(&sock_path).expect("connect");
+        let (server_side, _) = listener.accept().expect("accept");
+        let cred = peer_credentials(&server_side).expect("SO_PEERCRED");
+        assert!(carrier_permits_peer(&cred, server_uid()));
+        assert!(cred.pid > 0);
+        drop(client);
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn verb_samples_cover_every_variant_exactly_once() {
+        let samples = verb_samples();
+        let mut seen = vec![false; samples.len()];
+        for sample in &samples {
+            let ord = variant_ordinal(sample);
+            assert!(
+                ord < seen.len(),
+                "variant ordinal {ord} has no sample; extend verb_samples()"
+            );
+            assert!(!seen[ord], "duplicate sample for ordinal {ord}");
+            seen[ord] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "some variant has no sample");
+    }
+
+    #[test]
+    fn agent_socket_path_sits_beside_operator_socket() {
+        assert_eq!(
+            agent_socket_path(Path::new("/run/user/1000/mutiny.sock")),
+            PathBuf::from("/run/user/1000/mutiny-agent.sock")
+        );
+        assert_eq!(
+            agent_socket_path(Path::new("/tmp/custom")),
+            PathBuf::from("/tmp/custom-agent")
+        );
     }
 }

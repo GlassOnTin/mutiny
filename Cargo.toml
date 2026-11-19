@@ -13,3 +13,8 @@ gtk4 = { version = "0.11.5", features = ["v4_22"] }
 libc = "0.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+# Headless engine baseline, std-only timing so `cargo bench` adds no deps.
+[[bench]]
+name = "latency"
+harness = false
