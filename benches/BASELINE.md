@@ -58,10 +58,16 @@ change:
 - One chunk: 223 us median, 233 us max, which is 5.8% of the 4 ms tick.
 - A full-history miss spreads over 20 ticks, 4196 us total.
 
-The trade is explicit: total wall time for a miss rises about 14% (3674 us
-blocking versus 4196 us chunked, same run), and in exchange no single tick
-spends more than 233 us scanning. The whole-scan `search_scrollback` wrapper is
-kept for callers that are not tick-bound, and the figures above are from it.
+The trade is per-tick cost, not total cost. Across three runs the maximum
+chunk was 176 to 233 us (4.4% to 5.8% of the tick), while the whole-scan miss
+measured 3034 to 3674 us. Total wall time for the chunked miss was 2752 to
+4196 us, which overlaps the whole-scan range: chunking does not measurably
+increase total cost, it caps what any one tick spends. An earlier revision of
+this file claimed a 14% total slowdown; that came from a single sample and did
+not survive repetition.
+
+The whole-scan `search_scrollback` wrapper is kept for callers that are not
+tick-bound, and the whole-scan figures above are from it.
 
 `engine::tests::one_chunk_cannot_scan_a_full_history` asserts the budget
 deterministically, so the guarantee does not rest on a timing measurement that
