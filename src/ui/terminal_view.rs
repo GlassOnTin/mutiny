@@ -34,6 +34,9 @@ mod imp {
         pub cell_h: Cell<f32>,
         pub drag_origin_px: Cell<(f64, f64)>,
         pub context_popover: RefCell<Option<gtk4::PopoverMenu>>,
+        pub im_context: RefCell<Option<gtk4::IMMulticontext>>,
+        /// In-progress composition text, drawn at the cursor until committed.
+        pub preedit: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -115,6 +118,7 @@ impl TerminalView {
         *self.imp().font_desc.borrow_mut() = Some(desc);
         // Cell size changed, so the grid must be recomputed and the PTY resized.
         self.recompute_grid_dimensions(self.width(), self.height());
+        self.update_im_cursor_location();
         self.queue_draw();
     }
 
@@ -122,8 +126,65 @@ impl TerminalView {
         self.imp().pane_id.get()
     }
 
+    /// The IM context wired to this view's key controller. Exposed so tests can
+    /// drive composition and assert the commit path.
+    pub fn im_context(&self) -> Option<gtk4::IMMulticontext> {
+        self.imp().im_context.borrow().clone()
+    }
+
+    /// Current in-progress composition text, empty when nothing is composing.
+    pub fn preedit_text(&self) -> String {
+        self.imp().preedit.borrow().clone()
+    }
+
     fn upgrade_controller(&self) -> Option<Rc<AppController>> {
         self.imp().controller.borrow().upgrade()
+    }
+
+    /// Text committed by the IME: composed CJK, dead-key results, compose
+    /// sequences. Written as UTF-8 directly rather than bracketed, because it
+    /// is typed input, not a paste.
+    pub fn commit_im_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let (Some(ctrl), Some(pid)) = (self.upgrade_controller(), self.pane_id()) else {
+            return;
+        };
+        *self.imp().preedit.borrow_mut() = String::new();
+        {
+            let mut ws = ctrl.workspace.borrow_mut();
+            if let Some(eng) = ws.pane_mut(pid) {
+                eng.scroll(Scroll::Bottom);
+                let _ = eng.write_to_pty(text.as_bytes());
+            }
+        }
+        self.queue_draw();
+    }
+
+    /// Tells the IME where the cursor is so its candidate window lands nearby.
+    fn update_im_cursor_location(&self) {
+        let (Some(ctrl), Some(pid)) = (self.upgrade_controller(), self.pane_id()) else {
+            return;
+        };
+        let Some(im) = self.imp().im_context.borrow().clone() else {
+            return;
+        };
+        let (row, col) = {
+            let ws = ctrl.workspace.borrow();
+            let Some(eng) = ws.pane(pid) else { return };
+            let point = eng.term().grid().cursor.point;
+            (point.line.0, point.column.0)
+        };
+        let cw = self.imp().cell_w.get();
+        let ch = self.imp().cell_h.get();
+        let padding = self.padding_px();
+        im.set_cursor_location(&gdk::Rectangle::new(
+            (padding + col as f32 * cw) as i32,
+            (padding + row as f32 * ch) as i32,
+            cw as i32,
+            ch as i32,
+        ));
     }
 
     fn padding_px(&self) -> f32 {
@@ -142,6 +203,12 @@ impl TerminalView {
     }
 
     fn recompute_grid_dimensions(&self, width_px: i32, height_px: i32) {
+        // An unrealized widget has no allocation. Resizing from 0x0 would
+        // shrink the pane to the minimum grid and wrap every wide glyph, so
+        // wait for a real allocation instead.
+        if width_px <= 0 || height_px <= 0 {
+            return;
+        }
         let Some(pane_id) = self.pane_id() else {
             return;
         };
@@ -165,6 +232,42 @@ impl TerminalView {
 
     fn install_controllers(&self) {
         let key_ctrl = gtk4::EventControllerKey::new();
+
+        // IME: dead keys, compose sequences, and CJK input. IMMulticontext
+        // delegates to the system IM module (ibus, fcitx) and falls back to
+        // GTK's simple context, which handles compose and dead keys itself.
+        // set_im_context makes the controller filter keys through the IM
+        // before connect_key_pressed sees them, so consumed keys never reach
+        // the raw key encoder.
+        let im = gtk4::IMMulticontext::new();
+        im.set_client_widget(Some(self));
+        key_ctrl.set_im_context(Some(&im));
+
+        let view_weak = self.downgrade();
+        im.connect_commit(move |_, text| {
+            if let Some(view) = view_weak.upgrade() {
+                view.commit_im_text(text);
+            }
+        });
+
+        let view_weak = self.downgrade();
+        im.connect_preedit_changed(move |im_ctx| {
+            let Some(view) = view_weak.upgrade() else {
+                return;
+            };
+            let (text, _attrs, _cursor) = im_ctx.preedit_string();
+            *view.imp().preedit.borrow_mut() = text.to_string();
+            view.queue_draw();
+        });
+
+        let im_focus = im.clone();
+        let focus = gtk4::EventControllerFocus::new();
+        focus.connect_enter(move |_| im_focus.focus_in());
+        let im_leave = im.clone();
+        focus.connect_leave(move |_| im_leave.focus_out());
+        self.add_controller(focus);
+        *self.imp().im_context.borrow_mut() = Some(im);
+
         let view_weak = self.downgrade();
         key_ctrl.connect_key_pressed(move |_, keyval, _keycode, state| {
             let Some(view) = view_weak.upgrade() else {
@@ -513,6 +616,27 @@ impl TerminalView {
                     &graphene::Rect::new(cx + cw - 1.5, cy, 1.5, ch),
                 );
             }
+        }
+
+        // Preedit: in-progress composition drawn at the cursor, underlined, so
+        // CJK and dead-key input is visible before it commits.
+        let preedit = self.imp().preedit.borrow().clone();
+        if !preedit.is_empty() && display_offset == 0 {
+            let cursor_pt = grid.cursor.point;
+            let px = padding + (cursor_pt.column.0 as f32) * cw;
+            let py = padding + (cursor_pt.line.0 as f32) * ch;
+            layout.set_font_description(Some(&base_font));
+            layout.set_text(&preedit);
+            let (ink_w, _) = layout.pixel_size();
+            snapshot.save();
+            snapshot.translate(&graphene::Point::new(px, py));
+            snapshot.append_layout(&layout, &rgb_to_gdk(fg, 1.0));
+            snapshot.restore();
+            // Underline drawn as a rect, matching how cell underlines render.
+            snapshot.append_color(
+                &rgb_to_gdk(fg, 0.85),
+                &graphene::Rect::new(px, py + ch - 1.5, ink_w as f32, 1.0),
+            );
         }
 
         // Pass 4: Subtle top accent bar on active split pane for instant visual orientation

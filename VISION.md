@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v10, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, and terminal capability queries are shipped; the growth diagnostic below says which is which. The next rung is IME and font fallback (see M1).
+Status: draft v11, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, and IME with font fallback are shipped; the growth diagnostic below says which is which. The next rung is Kitty graphics (see M1).
 
 ## Thesis
 
@@ -178,7 +178,15 @@ Terminfo answers only what mutiny can truthfully claim. `query-os-name` returns 
 
 Evidence: `tests/terminal_queries.rs` asserts each reply's exact bytes, that queries split across reads are still answered, that ordinary output produces no replies, and that a real fish 4 starts, receives answers, and executes a command. The fish assertion counts replies rather than only checking that fish ran, because some fish versions time out their queries and proceed anyway; disabling the responses makes the test fail with zero replies. CI installs fish so the assertion runs against Arch's fish 4.9 rather than skipping.
 
-**Next rung: IME and font fallback.** `map_gdk_key` falls back to `keyval.to_unicode()` with no `GtkIMContext`, so CJK input, dead keys, and compose sequences do not work, and there is no font fallback chain for CJK, emoji, or box-drawing glyphs. For a terminal claiming first-class desktop citizenship this is a correctness gap, not a nicety.
+**Shipped rung: IME and font fallback.** Each `TerminalView` now owns a `GtkIMMulticontext` wired to its key controller via `set_im_context`, so the controller filters keys through the system IM module (ibus, fcitx) or GTK's simple context before the raw key encoder sees them. Committed text is written to the PTY as UTF-8, preedit is drawn underlined at the cursor and cleared on commit, and the IME is told the cursor location so its candidate window lands nearby. Font fallback is Pango's, resolved through fontconfig; the rung verified it rather than reimplementing it.
+
+Evidence: `tests/ime_and_fallback.rs` drives the real commit signal with CJK, accented, and emoji text and asserts each appears in the pane, that preedit clears, that CJK/emoji/box-drawing/accented samples produce zero unknown glyphs, and that a mixed Latin+CJK string resolves to two different fonts (DejaVu Sans Mono and Noto Sans Mono CJK JP on the test host). GTK needs one thread, so all of it lives in a single test function; it skips without a display and CI runs it under Xvfb with CJK and emoji fonts installed.
+
+The rung also found and fixed a real bug: an unrealized view has a 0x0 allocation, and `recompute_grid_dimensions` was resizing its pane to the minimum 4x2 grid, which wrapped every wide glyph and ate characters. It now waits for a real allocation, with a regression assertion.
+
+**Carried follow-up:** the fish startup test skips when fish is absent, so a CI run where the fish package fails to install would report green without exercising it. Add a CI step asserting `fish --version` so the skip cannot pass silently.
+
+**Next rung: Kitty graphics.** Image placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays. This is the largest remaining M1 feature and the one that completes the reach-back direction of the presence contract on the desktop.
 
 - Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
 - Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.

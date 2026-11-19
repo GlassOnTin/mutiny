@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v10). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, and terminal capability queries are shipped. The next rung is IME and font fallback, then the rest of M1 (Kitty graphics, drag gestures, OSC 777). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v11). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, and IME with font fallback are shipped. The next rung is Kitty graphics, then the rest of M1 (drag gestures, OSC 777, damage tracking). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 70 tests: 44 unit + 7 config + 11 e2e + 1 shell + 7 queries
+cargo test                               # 71 tests: 44 unit + 7 config + 11 e2e + 1 ime + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -90,6 +90,16 @@ Two mechanisms, matching the two sequence families. OSC 10/11 ride the existing 
 OSC 10/11 report `reported_bg` / `reported_fg`, which the controller sets from config at spawn and on reload via `set_reported_colors`, so the answer matches what is rendered. Terminfo answers only `query-os-name` (linux, a fact) and declines everything else with `DCS 0 + r ST`. A decline is a valid answer that unblocks the caller; silence is what blocks it. Do not claim capabilities the engine has not been shown to implement.
 
 `query_replies_sent()` counts replies. The fish startup test asserts it is non-zero, which is what makes the test discriminate: some fish versions time out their queries and proceed anyway, so "fish ran a command" alone passes even with responses disabled.
+
+### IME and font fallback
+
+Each `TerminalView` owns a `GtkIMMulticontext` wired to its key controller with `set_im_context`, so keys are filtered through the system IM module (or GTK's simple context for compose and dead keys) before `on_key_pressed` sees them. Do not bypass that ordering: consumed keys must not reach the raw encoder. `commit` writes UTF-8 straight to the PTY (typed input, not bracketed paste); `preedit_changed` stores the in-progress string, which `render_snapshot` draws underlined at the cursor and clears on commit. `update_im_cursor_location` tells the IME where to put its candidate window.
+
+Font fallback is Pango's, via fontconfig. Do not reimplement it. The test proves it engages by asserting zero `unknown_glyphs_count` for CJK/emoji/box-drawing and that a mixed Latin+CJK string resolves to two different fonts.
+
+Two traps worth remembering. GTK must be initialized and used from one thread while libtest spawns a thread per test, so all GTK assertions live in a single test function. And a bare `pango::Context::new()` has no font map, which makes itemization a no-op and `unknown_glyphs_count` vacuously zero; use a real widget's `pango_context()`.
+
+`recompute_grid_dimensions` returns early on a zero allocation. An unrealized view is 0x0, and resizing from that shrank the pane to the minimum 4x2 grid, wrapping every wide glyph and eating characters. Keep that guard.
 
 ### Config store and live reload
 
@@ -171,9 +181,9 @@ These look closer to done than they are:
 - **No config file.** VISION specifies TOML with live reload; there is no config module and no `toml` dependency. Font (`Monospace 11`), colours, and the 16-colour palette are constants in `src/ui/terminal_view.rs`.
 - **Split ratios are stored but not applied.** `SplitNode::Split { ratio }` is preserved through tree surgery, but `build_split_widget` never calls `set_position`, and user drags are not written back. Splits render at GTK's default.
 - **No shell integration snippets shipped.** OSC 133/7 tracking works only if the shell emits the markers; nothing in the repo installs them. PTYs do get `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID=<id>` for that purpose.
-- **No IME or font fallback (next rung).** `map_gdk_key` falls back to `keyval.to_unicode()` with no `GtkIMContext`, so CJK, dead keys, and compose sequences do not work.
 - **No in-app settings UI.** The TOML file is the only config surface.
-- **The fish startup test skips when fish is absent.** CI installs fish so it runs there. Locally, point `MUTINY_TEST_FISH` at a fish binary to exercise it.
+- **Carried follow-up: assert `fish --version` in CI.** The fish startup test skips when fish is absent, so a run where the package install fails would report green without exercising it. CI installs fish today, but nothing asserts it succeeded.
+- **The fish and IME tests skip when their prerequisites are absent.** CI installs fish and runs under Xvfb with CJK/emoji fonts so both execute. Locally, point `MUTINY_TEST_FISH` at a fish binary; the IME test needs a display.
 - **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell.
 - **CI runs on GitHub and is green.** `origin` is `https://github.com/GlassOnTin/mutiny` (public, AGPL-3.0-or-later). `.github/workflows/ci.yml` runs fmt, clippy, the displayless suite, the suite under Xvfb, and a release build in an Arch container, with cargo caching keyed on rustc and GTK versions. `./scripts/ci.sh` runs the same checks locally. `.github/workflows/release.yml` is tag-triggered and gated on CI, but has not been exercised: no tag has been pushed.
 - Untested by the current suite: real GUI rendering, Kitty graphics, drag gestures, session restore, and the M2 HTTP MCP listener.
