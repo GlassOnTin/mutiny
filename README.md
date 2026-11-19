@@ -37,7 +37,7 @@ Not built yet:
 - Split ratios persist within the session but not across restarts; that arrives with session restore.
 - Drag gestures work, but their GTK wiring is not covered by tests (the model operations they call are).
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
-- Rendering repaints every cell. The damage-tracking API exists but is unwired.
+- Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
 - No session restore. There is no multiplexer daemon, so a GUI crash kills every shell. `tmux` and `zellij` compose alongside rather than being reimplemented.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
