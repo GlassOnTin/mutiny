@@ -130,6 +130,26 @@ pub enum IpcRequest {
         pane: Option<PaneId>,
         message: Option<String>,
     },
+    /// Lists tmux/zellij sessions. `host: None` means THIS machine only, which
+    /// is Observe. Naming a host authenticates to it with the user's keys and
+    /// runs a command there, so that case is Act: an observe-only carrier must
+    /// not get lateral movement for free.
+    ListSessions {
+        host: Option<String>,
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Attaches a pane to a multiplexer session, locally or over SSH. The
+    /// multiplexer owns process survival; closing the pane kills only its
+    /// client.
+    OpenSession {
+        kind: crate::mux::MuxKind,
+        name: String,
+        host: Option<String>,
+        mode: crate::mux::SessionMode,
+        window: Option<WindowId>,
+        pane: Option<PaneId>,
+    },
     /// Reads an image file and places it inline in a pane via Kitty graphics.
     /// Additive verb; existing request and response shapes are unchanged.
     PresentMedia {
@@ -192,6 +212,17 @@ impl IpcRequest {
 
             IpcRequest::RunAction { action, .. } => spec(*action).consent_tier,
 
+            // Local listing is observation. Naming a remote host spends the
+            // user's SSH credentials and runs a command there, which is not.
+            IpcRequest::ListSessions { host, .. } => {
+                if host.is_some() {
+                    ConsentTier::Act
+                } else {
+                    ConsentTier::Observe
+                }
+            }
+            IpcRequest::OpenSession { .. } => ConsentTier::Act,
+
             IpcRequest::SpawnWindow { .. }
             | IpcRequest::SpawnTab { .. }
             | IpcRequest::Split { .. }
@@ -209,6 +240,8 @@ impl IpcRequest {
     pub fn verb_name(&self) -> &'static str {
         match self {
             IpcRequest::List => "list",
+            IpcRequest::ListSessions { .. } => "list-sessions",
+            IpcRequest::OpenSession { .. } => "open-session",
             IpcRequest::Actions => "actions",
             IpcRequest::AuditLog { .. } => "audit-log",
             IpcRequest::Snapshot { .. } => "snapshot",
@@ -258,6 +291,19 @@ impl IpcRequest {
                     .unwrap_or_else(|| String::from("<cleared>"));
                 format!("pane={pane:?} notice={preview:?}")
             }
+            IpcRequest::ListSessions { host, refresh } => {
+                format!("host={host:?} refresh={refresh}")
+            }
+            IpcRequest::OpenSession {
+                kind,
+                name,
+                host,
+                mode,
+                ..
+            } => format!(
+                "kind={kind:?} host={host:?} mode={mode:?} name={:?}",
+                crate::mux::sanitize_text(name, 64)
+            ),
             IpcRequest::PresentMedia {
                 pane,
                 path,
@@ -368,6 +414,10 @@ pub enum IpcResponse {
         image_id: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         placement_id: Option<u32>,
+        /// Multiplexer session inventory, with per-host status so a failed host
+        /// is reported alongside the sessions that did answer.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sessions: Option<crate::mux::MuxInventory>,
     },
     Error {
         message: String,
@@ -394,6 +444,7 @@ impl IpcResponse {
             output_seq: None,
             image_id: None,
             placement_id: None,
+            sessions: None,
         }
     }
 
@@ -820,6 +871,18 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             cols: None,
             rows: None,
         },
+        IpcRequest::ListSessions {
+            host: None,
+            refresh: false,
+        },
+        IpcRequest::OpenSession {
+            kind: crate::mux::MuxKind::Tmux,
+            name: String::from("mutiny-probe"),
+            host: None,
+            mode: crate::mux::SessionMode::Tab,
+            window: None,
+            pane: None,
+        },
     ]
 }
 
@@ -851,6 +914,8 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::WaitPrompt { .. } => 19,
         IpcRequest::AwaitTurn { .. } => 20,
         IpcRequest::PresentMedia { .. } => 21,
+        IpcRequest::ListSessions { .. } => 22,
+        IpcRequest::OpenSession { .. } => 23,
     }
 }
 
@@ -1047,6 +1112,60 @@ mod tests {
         assert_eq!(
             consent_outcome(ConsentTier::Act, ConsentMode::Ask, recycled, &grants, true),
             ConsentOutcome::Park
+        );
+    }
+
+    /// Remote discovery spends the user's SSH credentials and runs a command on
+    /// another machine, so it must not be free on an observe-only carrier.
+    #[test]
+    fn listing_locally_is_observe_but_naming_a_host_is_act() {
+        use crate::action::ConsentTier;
+        use std::collections::HashSet;
+
+        let local = IpcRequest::ListSessions {
+            host: None,
+            refresh: false,
+        };
+        let remote = IpcRequest::ListSessions {
+            host: Some(String::from("meteor")),
+            refresh: false,
+        };
+        let open = IpcRequest::OpenSession {
+            kind: crate::mux::MuxKind::Tmux,
+            name: String::from("work"),
+            host: None,
+            mode: crate::mux::SessionMode::Tab,
+            window: None,
+            pane: None,
+        };
+        assert_eq!(local.consent_tier(), ConsentTier::Observe);
+        assert_eq!(remote.consent_tier(), ConsentTier::Act);
+        assert_eq!(open.consent_tier(), ConsentTier::Act);
+
+        let grants = HashSet::new();
+        let p = peer(4_242, 7);
+        assert!(matches!(
+            consent_outcome(
+                local.consent_tier(),
+                ConsentMode::ObserveOnly,
+                p,
+                &grants,
+                true
+            ),
+            ConsentOutcome::Allow(_)
+        ));
+        assert!(
+            matches!(
+                consent_outcome(
+                    remote.consent_tier(),
+                    ConsentMode::ObserveOnly,
+                    p,
+                    &grants,
+                    true
+                ),
+                ConsentOutcome::Deny(_)
+            ),
+            "an observe-only carrier must not get lateral movement for free"
         );
     }
 

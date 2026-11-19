@@ -6,6 +6,7 @@ pub mod graphics;
 pub mod http_mcp;
 pub mod ipc;
 pub mod mcp;
+pub mod mux;
 pub mod notify;
 pub mod session;
 pub mod shell_integration;

@@ -10,6 +10,7 @@ use gtk4::prelude::*;
 use crate::action::{ACTIONS, ActionId, build_menubar_model, filter_palette};
 use crate::app::{AppController, ConsentResolution};
 use crate::engine::AttentionReason;
+use crate::mux::{HostState, MuxInventory, MuxKind, MuxSession, SessionMode};
 use crate::topology::{PaneId, SplitAxis, SplitNode, TabId, WindowId};
 use crate::ui::terminal_view::TerminalView;
 
@@ -37,6 +38,7 @@ struct MutinyWindowInner {
     tab_buttons: RefCell<Vec<(TabId, gtk4::Button)>>,
     controller: Weak<AppController>,
     closing_programmatically: Cell<bool>,
+    session_picker: RefCell<Option<Rc<SessionPicker>>>,
 }
 
 impl MutinyWindow {
@@ -242,6 +244,7 @@ impl MutinyWindow {
                 tab_buttons: RefCell::new(Vec::new()),
                 controller: Rc::downgrade(&controller),
                 closing_programmatically: Cell::new(false),
+                session_picker: RefCell::new(None),
             }),
         };
 
@@ -260,11 +263,17 @@ impl MutinyWindow {
 
         let inner_weak = Rc::downgrade(&this.inner);
         gtk_window.connect_close_request(move |_| {
-            if let Some(inner) = inner_weak.upgrade()
-                && !inner.closing_programmatically.get()
-                && let Some(ctrl) = inner.controller.upgrade()
-            {
-                ctrl.handle_window_closed(inner.window_id);
+            if let Some(inner) = inner_weak.upgrade() {
+                // Any close path takes the picker with it, including a WM close.
+                let picker = inner.session_picker.borrow_mut().take();
+                if let Some(picker) = picker {
+                    picker.dialog.close();
+                }
+                if !inner.closing_programmatically.get()
+                    && let Some(ctrl) = inner.controller.upgrade()
+                {
+                    ctrl.handle_window_closed(inner.window_id);
+                }
             }
             glib::Propagation::Proceed
         });
@@ -438,9 +447,33 @@ impl MutinyWindow {
         self.inner.gtk_window.present();
     }
 
+    /// Drops the session picker and closes its dialog. The window owns the
+    /// picker slot, so it clears it on every close path rather than relying on
+    /// GTK's transient-destroy propagation, which does not fire for a
+    /// programmatic close.
+    fn dismiss_session_picker(&self) {
+        let picker = self.inner.session_picker.borrow_mut().take();
+        if let Some(picker) = picker {
+            picker.dialog.close();
+        }
+    }
+
     pub fn close_programmatically(&self) {
         self.inner.closing_programmatically.set(true);
+        self.dismiss_session_picker();
         self.inner.gtk_window.close();
+    }
+
+    /// Test/inspection accessors for the open session picker: row count and the
+    /// selected session name. `None` when no picker is open.
+    pub fn session_picker_rows(&self) -> Option<usize> {
+        let picker = self.inner.session_picker.borrow().clone()?;
+        Some(picker.rows.borrow().len())
+    }
+
+    pub fn session_picker_selected(&self) -> Option<String> {
+        let picker = self.inner.session_picker.borrow().clone()?;
+        picker.selected_row_session().map(|s| s.name)
     }
 
     /// Current tab button labels, including status badges. Exposed so tests
@@ -815,6 +848,209 @@ impl MutinyWindow {
         search.grab_focus();
     }
 
+    /// Lists tmux and zellij sessions, local and remote, and opens the chosen
+    /// one in a new tab (Return) or window (Shift+Return). Cloned from the
+    /// command palette's structure: a separate modal top-level, so a topology
+    /// rebuild cannot tear it down.
+    pub fn show_session_picker(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let win_id = self.inner.window_id;
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("Sessions")
+            .default_width(620)
+            .default_height(440)
+            .build();
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        vbox.set_margin_top(10);
+        vbox.set_margin_bottom(10);
+        vbox.set_margin_start(10);
+        vbox.set_margin_end(10);
+
+        let search = gtk4::SearchEntry::new();
+        search.set_placeholder_text(Some("Filter by session, host, or multiplexer…"));
+        vbox.append(&search);
+
+        let list = gtk4::ListBox::new();
+        list.set_selection_mode(gtk4::SelectionMode::Single);
+        let scroller = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
+            .child(&list)
+            .build();
+        vbox.append(&scroller);
+
+        let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let hint = gtk4::Label::new(Some("Return: new tab   Shift+Return: new window"));
+        hint.set_xalign(0.0);
+        hint.set_hexpand(true);
+        hint.add_css_class("dim-label");
+        let refresh = gtk4::Button::with_label("Refresh");
+        refresh.set_can_focus(false);
+        let status = gtk4::Label::new(None);
+        status.add_css_class("dim-label");
+        footer.append(&hint);
+        footer.append(&status);
+        footer.append(&refresh);
+        vbox.append(&footer);
+        dialog.set_child(Some(&vbox));
+
+        let picker = Rc::new(SessionPicker {
+            dialog: dialog.clone(),
+            list: list.clone(),
+            search: search.clone(),
+            status,
+            rows: RefCell::new(Vec::new()),
+            selected: RefCell::new(None),
+            last_gen: Cell::new(u64::MAX),
+        });
+        *self.inner.session_picker.borrow_mut() = Some(Rc::clone(&picker));
+
+        {
+            let picker = Rc::clone(&picker);
+            let ctrl = Rc::clone(&ctrl);
+            search.connect_search_changed(move |entry| {
+                let inventory = ctrl.session_inventory();
+                rebuild_session_rows(&picker, &inventory, &entry.text());
+            });
+        }
+
+        // Open the selected session. The dialog closes BEFORE dispatch, like the
+        // palette, so the rebuild triggered by the new tab finds no live picker.
+        let open_selected = {
+            let picker = Rc::clone(&picker);
+            let ctrl = Rc::downgrade(&ctrl);
+            move |mode: SessionMode| {
+                let chosen = picker.selected_row_session();
+                picker.dialog.close();
+                if let (Some(session), Some(c)) = (chosen, ctrl.upgrade())
+                    && let Err(err) = c.open_session(
+                        session.kind,
+                        &session.name,
+                        session.host.as_deref(),
+                        mode,
+                        Some(win_id),
+                        None,
+                    )
+                {
+                    eprintln!("failed to open session: {err}");
+                }
+            }
+        };
+
+        {
+            let open = open_selected.clone();
+            list.connect_row_activated(move |_, row| {
+                if row.is_activatable() {
+                    open(SessionMode::Tab);
+                }
+            });
+        }
+        {
+            let open = open_selected.clone();
+            let list_for_key = list.clone();
+            search.connect_activate(move |_| {
+                if let Some(row) = list_for_key.selected_row()
+                    && row.is_activatable()
+                {
+                    open(SessionMode::Tab);
+                }
+            });
+        }
+        // Shift+Return opens a window, mirroring the search bar's
+        // Return / Shift+Return idiom.
+        {
+            let open = open_selected.clone();
+            let keys = gtk4::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, key, _, mods| {
+                if (key == gdk::Key::Return || key == gdk::Key::KP_Enter)
+                    && mods.contains(gdk::ModifierType::SHIFT_MASK)
+                {
+                    open(SessionMode::Window);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            dialog.add_controller(keys);
+        }
+        // Track selection by identity so results arriving mid-refresh do not
+        // move the highlight under the user.
+        {
+            let picker = Rc::clone(&picker);
+            list.connect_row_selected(move |_, row| {
+                let identity = row
+                    .and_then(|r| {
+                        picker
+                            .rows
+                            .borrow()
+                            .get(r.index() as usize)
+                            .and_then(|s| s.clone())
+                    })
+                    .map(|s| s.identity());
+                *picker.selected.borrow_mut() = identity;
+            });
+        }
+        {
+            let ctrl = Rc::clone(&ctrl);
+            refresh.connect_clicked(move |_| {
+                let targets = ctrl.discovery_targets_all();
+                ctrl.begin_discovery(targets, true, None);
+            });
+        }
+        {
+            let inner_slot = Rc::downgrade(&self.inner);
+            dialog.connect_close_request(move |_| {
+                if let Some(inner) = inner_slot.upgrade() {
+                    *inner.session_picker.borrow_mut() = None;
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        // destroy_with_parent destroys the dialog WITHOUT a close-request, so
+        // the slot must also be cleared on destroy. Otherwise the stored picker
+        // outlives its window and later refreshes write into dead widgets.
+        {
+            let inner_slot = Rc::downgrade(&self.inner);
+            dialog.connect_destroy(move |_| {
+                if let Some(inner) = inner_slot.upgrade() {
+                    *inner.session_picker.borrow_mut() = None;
+                }
+            });
+        }
+
+        attach_escape_to_close(&dialog);
+        dialog.present();
+        search.grab_focus();
+
+        let inventory = ctrl.session_inventory();
+        rebuild_session_rows(&picker, &inventory, "");
+        let targets = ctrl.discovery_targets_all();
+        ctrl.begin_discovery(targets, true, None);
+    }
+
+    /// Called from the controller when the inventory generation moves. Reads a
+    /// cloned snapshot in a short borrow, then only touches widgets, following
+    /// `refresh_search_bar`. Rebuilding every tick would fight focus.
+    pub fn refresh_session_picker(&self, generation: u64) {
+        let picker = self.inner.session_picker.borrow().clone();
+        let Some(picker) = picker else { return };
+        if picker.last_gen.get() == generation {
+            return;
+        }
+        picker.last_gen.set(generation);
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let inventory = ctrl.session_inventory();
+        let query = picker.search.text().to_string();
+        rebuild_session_rows(&picker, &inventory, &query);
+    }
+
     pub fn show_agent_audit(&self) {
         let Some(ctrl) = self.inner.controller.upgrade() else {
             return;
@@ -960,6 +1196,178 @@ impl MutinyWindow {
         attach_escape_to_close(&dialog);
         dialog.present();
     }
+}
+
+/// Live state of an open session picker. Stored on the window so the controller
+/// can refresh it when discovery results land, and cleared on close so a stale
+/// dialog cannot open sessions into a dead window.
+struct SessionPicker {
+    dialog: gtk4::Window,
+    list: gtk4::ListBox,
+    search: gtk4::SearchEntry,
+    status: gtk4::Label,
+    /// One entry per ListBox row, `None` for host-status rows, so row indices
+    /// line up with the model.
+    rows: RefCell<Vec<Option<MuxSession>>>,
+    selected: RefCell<Option<(Option<String>, MuxKind, String)>>,
+    last_gen: Cell<u64>,
+}
+
+impl SessionPicker {
+    fn selected_row_session(&self) -> Option<MuxSession> {
+        let row = self.list.selected_row()?;
+        let index = row.index();
+        if index < 0 {
+            return None;
+        }
+        self.rows
+            .borrow()
+            .get(index as usize)
+            .and_then(|s| s.clone())
+    }
+}
+
+/// Rebuilds the picker rows from a snapshot. Rows are built first and the index
+/// borrow is dropped before any `append`/`select_row`, because the selection
+/// handler reads that same index and would otherwise panic on a double borrow.
+fn rebuild_session_rows(picker: &Rc<SessionPicker>, inventory: &MuxInventory, query: &str) {
+    while let Some(child) = picker.list.first_child() {
+        picker.list.remove(&child);
+    }
+    let needle = query.trim().to_ascii_lowercase();
+    let terms: Vec<&str> = needle.split_whitespace().collect();
+
+    let mut entries: Vec<Option<MuxSession>> = Vec::new();
+    let mut widgets: Vec<gtk4::ListBoxRow> = Vec::new();
+
+    for session in inventory.sorted_for_display() {
+        let hay = format!(
+            "{} {} {}",
+            session.name,
+            session.host.clone().unwrap_or_default(),
+            session.kind.label()
+        )
+        .to_ascii_lowercase();
+        if !terms.iter().all(|t| hay.contains(t)) {
+            continue;
+        }
+        let mut detail = format!(
+            "{} · {} window{}",
+            session.kind.label(),
+            session.windows,
+            if session.windows == 1 { "" } else { "s" }
+        );
+        if session.attached > 0 {
+            detail.push_str(&format!(" · attached ×{}", session.attached));
+        }
+        if session.exited {
+            detail.push_str(" · EXITED (attach to resurrect)");
+        }
+        let right = session
+            .host
+            .clone()
+            .unwrap_or_else(|| String::from("local"));
+        widgets.push(session_row(&session.name, &detail, &right, true));
+        entries.push(Some(session.clone()));
+    }
+
+    for host in &inventory.hosts {
+        if host.state == HostState::Ok {
+            continue;
+        }
+        let where_ = host.host.clone().unwrap_or_else(|| String::from("local"));
+        let detail = match host.state {
+            HostState::Scanning => format!("{} · scanning…", host.kind.label()),
+            _ => format!(
+                "{} · {}",
+                host.kind.label(),
+                host.error.clone().unwrap_or_else(|| String::from("failed"))
+            ),
+        };
+        widgets.push(session_row(&where_, &detail, "", false));
+        entries.push(None);
+    }
+
+    {
+        let mut rows = picker.rows.borrow_mut();
+        rows.clear();
+        rows.extend(entries);
+    }
+    for widget in widgets {
+        picker.list.append(&widget);
+    }
+
+    // Restore selection by identity, not index: results arriving mid-refresh
+    // must not move the highlight under the user.
+    let wanted = picker.selected.borrow().clone();
+    let index = wanted.and_then(|identity| {
+        picker
+            .rows
+            .borrow()
+            .iter()
+            .position(|entry| entry.as_ref().map(|s| s.identity()) == Some(identity.clone()))
+    });
+    let target = index
+        .and_then(|i| picker.list.row_at_index(i as i32))
+        .or_else(|| picker.list.row_at_index(0));
+    if let Some(row) = target {
+        picker.list.select_row(Some(&row));
+    }
+
+    let live = inventory.sessions.len();
+    let failed = inventory
+        .hosts
+        .iter()
+        .filter(|h| h.state == HostState::Error)
+        .count();
+    let scanning = inventory
+        .hosts
+        .iter()
+        .filter(|h| h.state == HostState::Scanning)
+        .count();
+    let mut status = format!("{live} session{}", if live == 1 { "" } else { "s" });
+    if scanning > 0 {
+        status.push_str(&format!(" · scanning {scanning}"));
+    }
+    if failed > 0 {
+        status.push_str(&format!(" · {failed} unavailable"));
+    }
+    if inventory.partial {
+        status.push_str(" · partial");
+    }
+    picker.status.set_text(&status);
+}
+
+fn session_row(title: &str, detail: &str, right: &str, activatable: bool) -> gtk4::ListBoxRow {
+    let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    row_box.set_margin_top(6);
+    row_box.set_margin_bottom(6);
+    row_box.set_margin_start(8);
+    row_box.set_margin_end(8);
+
+    let left = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    left.set_hexpand(true);
+    let name = gtk4::Label::new(Some(title));
+    name.set_xalign(0.0);
+    name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let sub = gtk4::Label::new(Some(detail));
+    sub.set_xalign(0.0);
+    sub.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    sub.add_css_class("dim-label");
+    left.append(&name);
+    left.append(&sub);
+    row_box.append(&left);
+    if !right.is_empty() {
+        let host = gtk4::Label::new(Some(right));
+        host.add_css_class("dim-label");
+        row_box.append(&host);
+    }
+
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&row_box));
+    row.set_activatable(activatable);
+    row.set_selectable(activatable);
+    row
 }
 
 fn attach_escape_to_close(dialog: &gtk4::Window) {

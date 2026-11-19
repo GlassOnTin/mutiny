@@ -310,6 +310,9 @@ pub struct PaneEngine {
     pty: Option<Pty>,
     size: GridSize,
     title: String,
+    /// Pinned label for a pane attached to an external multiplexer. Survives
+    /// OSC title resets, which would otherwise leave the tab reading "shell".
+    mux_label: Option<String>,
     cwd: Option<PathBuf>,
     progress: ProgressState,
     attention: Option<AttentionReason>,
@@ -390,6 +393,7 @@ impl PaneEngine {
             pty: None,
             size,
             title: String::from("shell"),
+            mux_label: None,
             cwd: None,
             progress: ProgressState::Hidden,
             attention: None,
@@ -583,8 +587,16 @@ impl PaneEngine {
         self.title = title;
     }
 
+    /// Pins a label that survives OSC title resets. A pane attached to an
+    /// external multiplexer would otherwise read "shell", because tmux does not
+    /// set the outer terminal title unless `set-titles` is on, and
+    /// `Event::ResetTitle` clears whatever we set at spawn.
+    pub fn set_mux_label(&mut self, label: Option<String>) {
+        self.mux_label = label;
+    }
+
     pub fn title(&self) -> &str {
-        &self.title
+        self.mux_label.as_deref().unwrap_or(&self.title)
     }
 
     pub fn cwd(&self) -> Option<&Path> {

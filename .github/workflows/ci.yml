@@ -29,7 +29,7 @@ jobs:
         run: |
           set -eu
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb zstd fish noto-fonts noto-fonts-cjk noto-fonts-emoji ttf-dejavu
+          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb zstd fish tmux noto-fonts noto-fonts-cjk noto-fonts-emoji ttf-dejavu
           rustup default stable
           rustup component add clippy rustfmt
 
@@ -39,6 +39,13 @@ jobs:
           # The fish startup test skips when fish is absent. Without this
           # assertion a failed install would report green without running it.
           fish --version
+
+      - name: Assert tmux is installed
+        run: |
+          set -eu
+          # The session-discovery tests skip when tmux is absent. Without this
+          # assertion a failed install would report green without running them.
+          tmux -V
 
       - name: Require GTK 4.22 or newer
         run: |

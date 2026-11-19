@@ -60,6 +60,8 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::WaitPrompt { .. } => Some(McpSurface::Tool("wait_prompt")),
         IpcRequest::AwaitTurn { .. } => Some(McpSurface::Tool("await_turn")),
         IpcRequest::PresentMedia { .. } => Some(McpSurface::Tool("present_media")),
+        IpcRequest::ListSessions { .. } => Some(McpSurface::Tool("list_sessions")),
+        IpcRequest::OpenSession { .. } => Some(McpSurface::Tool("open_session")),
     }
 }
 
@@ -561,6 +563,53 @@ impl McpBridge {
                     Duration::from_secs(30),
                 )
             }
+            "list_sessions" => {
+                let host = args.get("host").and_then(Value::as_str).map(str::to_owned);
+                let refresh = args
+                    .get("refresh")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                // A named host can take seconds to answer, so allow more than
+                // the local listing needs.
+                let timeout = if host.is_some() {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_secs(15)
+                };
+                (IpcRequest::ListSessions { host, refresh }, timeout)
+            }
+            "open_session" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`name` is required")))?
+                    .to_owned();
+                let kind = match args.get("kind").and_then(Value::as_str).unwrap_or("tmux") {
+                    "tmux" => crate::mux::MuxKind::Tmux,
+                    "zellij" => crate::mux::MuxKind::Zellij,
+                    other => {
+                        return Err((-32602, format!("unknown kind {other:?}: tmux or zellij")));
+                    }
+                };
+                let mode_text = args.get("mode").and_then(Value::as_str).unwrap_or("tab");
+                let mode = crate::mux::SessionMode::parse(mode_text).ok_or_else(|| {
+                    (
+                        -32602,
+                        format!("unknown mode {mode_text:?}: window, tab, split-right, split-down"),
+                    )
+                })?;
+                (
+                    IpcRequest::OpenSession {
+                        kind,
+                        name,
+                        host: args.get("host").and_then(Value::as_str).map(str::to_owned),
+                        mode,
+                        window: opt_win("window"),
+                        pane: opt_pane("pane"),
+                    },
+                    Duration::from_secs(30),
+                )
+            }
             "present_media" => {
                 let path = args
                     .get("path")
@@ -800,6 +849,33 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "slug": { "type": "string" },
                     "window": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "list_sessions",
+            "description": "Tier-1 Observe locally, Tier-2 Act when a host is named: list tmux and zellij sessions. Omit host for THIS machine only. Naming a host authenticates to it over SSH with the operator's keys and runs a listing command there, which is why that case requires consent. Returns sessions plus per-host status, so an unavailable host is reported alongside the sessions that answered.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "SSH destination to scan. Omit for local only." },
+                    "refresh": { "type": "boolean", "description": "Force a rescan instead of returning the cached inventory." }
+                }
+            }
+        },
+        {
+            "name": "open_session",
+            "description": "Tier-2 Act: attach a pane to an existing tmux or zellij session, in a new window, tab, or split. With host set, this runs the multiplexer ON THAT HOST over SSH. Attaches alongside other clients and never detaches them; creates the session if it does not exist. The multiplexer owns process survival, so closing the pane kills only its client.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string", "description": "Session name, exactly as listed by list_sessions." },
+                    "kind": { "type": "string", "enum": ["tmux", "zellij"], "description": "Defaults to tmux." },
+                    "host": { "type": "string", "description": "SSH destination. Omit for a local session." },
+                    "mode": { "type": "string", "enum": ["window", "tab", "split-right", "split-down"], "description": "Defaults to tab." },
+                    "window": { "type": "integer" },
+                    "pane": { "type": "integer" }
                 }
             }
         },

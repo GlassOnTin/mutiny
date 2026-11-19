@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v18). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; the next rung is the quick terminal. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v19). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore, the authenticated HTTP MCP listener with per-peer identity, and a tmux/zellij session picker are shipped; the next rung is the quick terminal. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,9 +14,11 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 114 tests: 68 unit + 7 config + 11 e2e + 4 http + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 147 tests: 90 unit + 7 config + 11 e2e + 4 http + 10 mux + 1 picker + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
+cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
+cargo test --test session_picker         # picker lifetime under rebuild (needs a display)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
@@ -123,6 +125,30 @@ Per-peer identity works by giving each token its own relay carrier. `start_http_
 Do not collapse these back into one socket: that is precisely the shared-identity bug, and `two_peer_tokens_produce_two_distinct_audit_identities` fails if you do.
 
 Two limits remain. Requests are stateless (no MCP session id), so `initialize`'s client name does not persist; calls audit under the peer's configured label. And the consent *mode* is still one setting for the whole listener, because every relay carrier reads the same `agent_mode`. Per-peer mode means storing a mode per `HttpPeerCarrier` and a CLI way to set it; the identity and grant half is done.
+
+### Multiplexer sessions: pure argv core, tick-polled discovery
+
+`src/mux.rs` is pure data and command construction, like `graphics.rs`: parsers, argv builders, and quoting, with no GTK and no subprocess execution. That is what makes the security rules unit-testable without tmux, zellij, or ssh installed. The controller owns the processes.
+
+Three hazards are load-bearing, each verified against the real programs:
+
+- The tmux listing format separates fields with a **literal TAB**, never `|`. A `|` is legal in a session name (`tmux has-session -t 'a|b'` reports it intact), so a pipe delimiter silently corrupts the parse. `splitn(5, '\t')` keeps `session_path` whole.
+- tmux re-parses a **trailing `;` in its own argv**, with no shell involved. `tmux_escape_name` inserts one backslash before a final `;` only. Escaping interior semicolons is a bug: tmux preserves the backslash there.
+- ssh joins its command arguments into a string the **remote login shell** parses. `shell_quote_posix` is applied to every element including the `-F` format string, and the program name is part of that string. The host is preceded by `--` and validated, because a leading-dash host would otherwise be read as an ssh option (`-oProxyCommand=…` is local code execution).
+
+Discovery and attach use different ssh shapes on purpose: discovery is `-n -o BatchMode=yes` with no tty so it can never prompt; attach is `-t -e none` so the user can type a passphrase and a typed `~.` cannot kill the session. Remote attach prefixes `TERM=xterm-256color` because mutiny advertises `TERM=alacritty`.
+
+**Discovery is polled, not threaded.** `PendingDiscovery` holds a `std::process::Child`; `advance_discoveries` runs in `poll_once` between `advance_searches` and `expire_pending_consents`, draining pipes with `O_NONBLOCK` under `DISCOVERY_BYTES_PER_TICK` and reaping with `try_wait`. Threads are deliberately avoided: alacritty's `tty::setup_env` calls `unsafe env::set_var` on every pane spawn, so a worker thread reading `environ` concurrently would be unsound. Drain incrementally, never wait-then-read: a child that fills the pipe buffer would block forever and `try_wait` would never fire. On deadline, `kill` then keep reaping, because `Child::drop` does neither.
+
+`begin_discovery` returns `Option<IpcResponse>` with the usual parking convention. One reply slot: a second requester during a pass gets the current snapshot. `cache_gen` bumps on every change and the picker refreshes only when it moves, never every tick.
+
+**Consent follows what the verb does.** `ListSessions { host: None }` is Observe (this machine only); naming a host is Act, because it spends the user's SSH credentials on another machine. The GUI picker scans configured remotes through `discovery_targets_all`, which IPC never calls: the human is the consent there. Do not make `host: None` mean "local plus configured remotes", or an observe-only carrier gets lateral movement for free.
+
+`spawn_engine` takes a per-pane `command` override; `create_*_with_command` are the entry points and the plain `create_*` delegate with `None`. There are four `spawn_engine` callers including `restore_session`. A pane's multiplexer label is pinned via `set_mux_label`, because `Event::ResetTitle` would otherwise leave the tab reading "shell".
+
+The picker is a separate modal top-level cloned from `show_command_palette`, so `rebuild_from_model` cannot tear it down. It is stored on the window and cleared on **every** close path (`close_request` and `close_programmatically`), not left to GTK's transient-destroy propagation, which does not fire for a programmatic close. Build rows and drop the index borrow before `append`/`select_row`: the selection handler reads that same index. Selection is restored by identity, not row index.
+
+Tests must use a **private tmux socket** (`-S` in `[sessions]`) and `kill-server` on teardown. `window-size` is `latest`, so attaching to a developer's live session resizes every other viewer, including a phone.
 
 ### Damage-driven redraw
 
@@ -256,6 +282,9 @@ These look closer to done than they are:
 - **No in-app settings UI.** The TOML file is the only config surface.
 - **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Processes are never restored, by contract.
 - **No quick terminal yet (M2).**
+- **Session restore does not re-attach multiplexer clients.** `SessionPane` has no command field, so a restored tmux pane returns as a plain shell. Changing that edits the stated restore contract and needs its own rung.
+- **Multiplexer panes get no shell integration.** tmux classifies as `ShellKind::Other`, so no OSC 133/7 injection; prompt jumping and command capture do not work inside them.
+- **Only tmux and zellij are discovered.** screen, abduco, and dtach are not.
 - **The HTTP MCP carrier is a slice.** No SSE, session management, or DELETE. Requests are stateless. Identity and session grants are per token, but the consent mode is one setting for the whole listener, so one peer cannot be `paired` while another is `observe-only`. Driven end to end from Haven on a phone over an SSH local forward: unpaired 401, paired 200, a command sent and its output read back, `spawn_pane` and `present_notice` accepted, and both Act verbs denied when the carrier was pinned to `observe-only`. Also driven over a real WireGuard tunnel with the listener bound to the workstation's WG address, so both named transports are exercised.
 - **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.
 - **Tests skip when prerequisites are absent.** CI installs fish and asserts `fish --version`, and runs under Xvfb with CJK/emoji fonts, so the fish, IME, and graphics render tests execute there. Locally the fish test needs `MUTINY_TEST_FISH` or fish on PATH, and the GTK tests need a display.

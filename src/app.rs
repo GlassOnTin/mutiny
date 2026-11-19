@@ -1,8 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +21,10 @@ use crate::ipc::{
     AuditDecision, AuditEntry, ConsentMode, ConsentOutcome, IpcEnvelope, IpcRequest, IpcResponse,
     PeerIdentity, action_catalog, bind_socket, carrier_permits_peer, consent_outcome,
     default_audit_path, peer_credentials, read_envelope, server_uid, write_response,
+};
+use crate::mux::{
+    self, DISCOVERY_BYTES_PER_TICK, HostState, MAX_CONCURRENT_DISCOVERIES, MAX_DISCOVERY_BYTES,
+    MuxHostStatus, MuxInventory, MuxKind, MuxSession,
 };
 use crate::notify::{DBusNotifier, DesktopNotifier};
 use crate::session::{self, SessionState};
@@ -67,6 +73,33 @@ pub enum ConsentResolution {
     Deny,
 }
 
+/// A finished discovery job: which target, its sessions or an error, and how
+/// long it took.
+type DiscoveryOutcome = (
+    Option<String>,
+    MuxKind,
+    Result<Vec<MuxSession>, String>,
+    u64,
+);
+
+/// One in-flight discovery child. Spawned on the tick (fork+exec is well under
+/// a millisecond) and polled with `try_wait`, so nothing slow ever blocks the
+/// GUI loop. Threads are deliberately not used: alacritty's `tty::setup_env`
+/// mutates the process environment on every pane spawn, so a worker thread
+/// reading `environ` concurrently would be unsound.
+struct PendingDiscovery {
+    host: Option<String>,
+    kind: MuxKind,
+    child: std::process::Child,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    started: Instant,
+    deadline: Instant,
+    /// Set once the deadline passed and we sent SIGKILL. The job stays until
+    /// `try_wait` reaps it, because `Child::drop` neither kills nor reaps.
+    killed: bool,
+}
+
 /// One relay carrier for an HTTP peer token. The identity is assigned when the
 /// operator configures the peer, not by anything the remote client sends.
 struct HttpPeerCarrier {
@@ -87,6 +120,14 @@ pub struct AppController {
     /// One relay carrier per HTTP peer token, each assigning a distinct
     /// token-derived identity. Empty unless the HTTP listener is enabled.
     http_peers: RefCell<Vec<HttpPeerCarrier>>,
+    discovery_jobs: RefCell<Vec<PendingDiscovery>>,
+    discovery_queue: RefCell<VecDeque<(Option<String>, MuxKind)>>,
+    session_cache: RefCell<MuxInventory>,
+    /// Bumped whenever the cache changes, so the picker refreshes on change
+    /// rather than every 4 ms tick.
+    cache_gen: Cell<u64>,
+    pending_session_reply: RefCell<Option<UnixStream>>,
+    discovery_deadline: Cell<Option<Instant>>,
     /// Mode the agent carrier assigns to every connection it accepts. Pinned
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
@@ -160,6 +201,12 @@ impl AppController {
             socket_path: RefCell::new(None),
             agent_listener: RefCell::new(None),
             http_peers: RefCell::new(Vec::new()),
+            discovery_jobs: RefCell::new(Vec::new()),
+            discovery_queue: RefCell::new(VecDeque::new()),
+            session_cache: RefCell::new(MuxInventory::default()),
+            cache_gen: Cell::new(0),
+            pending_session_reply: RefCell::new(None),
+            discovery_deadline: Cell::new(None),
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
@@ -222,7 +269,7 @@ impl AppController {
         let mut engines = Vec::new();
         for sp in &state.panes {
             let mut eng = self
-                .spawn_engine(sp.id, sp.cwd.clone())
+                .spawn_engine(sp.id, sp.cwd.clone(), None)
                 .map_err(|e| format!("pane {}: {e}", sp.id))?;
             eng.resize(GridSize::new(sp.cols, sp.rows, 9, 18));
             eng.set_title(sp.title.clone());
@@ -370,6 +417,7 @@ impl AppController {
         for peer in self.http_peers.borrow_mut().drain(..) {
             let _ = std::fs::remove_file(peer.path);
         }
+        self.shutdown_discoveries();
     }
 
     pub fn active_agent_badge(&self) -> Option<String> {
@@ -532,7 +580,14 @@ impl AppController {
         self.refresh_all_window_chromes();
     }
 
-    fn spawn_engine(&self, pane_id: PaneId, cwd: Option<PathBuf>) -> io::Result<PaneEngine> {
+    /// `command` overrides the controller-wide shell for this one pane, which is
+    /// how a multiplexer attach runs `tmux`/`ssh` instead of a login shell.
+    fn spawn_engine(
+        &self,
+        pane_id: PaneId,
+        cwd: Option<PathBuf>,
+        command: Option<(String, Vec<String>)>,
+    ) -> io::Result<PaneEngine> {
         let (cols, rows, scrollback, bg, fg) = {
             let cfg = self.config.borrow();
             (
@@ -544,11 +599,362 @@ impl AppController {
             )
         };
         let size = GridSize::new(cols, rows, 9, 18);
-        let shell = self.shell_override.borrow().clone();
+        let shell = command.or_else(|| self.shell_override.borrow().clone());
         let mut engine = PaneEngine::spawn_pty(size, cwd, shell, pane_id.0, scrollback)?;
         // OSC 10/11 queries must answer with the colors actually rendered.
         engine.set_reported_colors(bg, fg);
         Ok(engine)
+    }
+
+    /// Attaches a pane to an existing multiplexer session, locally or over SSH.
+    /// The multiplexer owns process survival; closing the pane kills only the
+    /// client, never the server.
+    pub fn open_session(
+        self: &Rc<Self>,
+        kind: MuxKind,
+        name: &str,
+        host: Option<&str>,
+        mode: mux::SessionMode,
+        window: Option<WindowId>,
+        pane: Option<PaneId>,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
+        if name.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session name must not be empty",
+            ));
+        }
+        let opts = self.config.borrow().sessions.clone();
+        let command = match host {
+            None => mux::attach_argv(kind, name, &opts),
+            Some(host) => mux::remote_attach_argv(host, kind, name, &opts)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+        };
+        // A remote session's path is a path on that host, so it must never
+        // become a local cwd. alacritty ignores an invalid chdir silently.
+        let cwd = if host.is_some() {
+            None
+        } else {
+            self.active_cwd(window, pane)
+        };
+        let ids = match mode {
+            mux::SessionMode::Window => self.create_window_with_command(cwd, Some(command))?,
+            mux::SessionMode::Tab => self.create_tab_with_command(window, cwd, Some(command))?,
+            mux::SessionMode::SplitRight => {
+                self.split_pane_with_command(pane, SplitAxis::Horizontal, cwd, Some(command))?
+            }
+            mux::SessionMode::SplitDown => {
+                self.split_pane_with_command(pane, SplitAxis::Vertical, cwd, Some(command))?
+            }
+        };
+        let label = match host {
+            Some(host) => format!("{}: {name}@{host}", kind.label()),
+            None => format!("{}: {name}", kind.label()),
+        };
+        if let Some(engine) = self.workspace.borrow_mut().pane_mut(ids.2) {
+            engine.set_mux_label(Some(mux::sanitize_text(&label, 64)));
+        }
+        self.sync_ui_window(ids.0);
+        Ok(ids)
+    }
+
+    /// Local plus every configured remote host. For the GUI picker, where the
+    /// human is the consent. The IPC verb never uses this: `host: None` there
+    /// means local only, so an Observe call cannot spend the user's credentials.
+    pub fn discovery_targets_all(&self) -> Vec<Option<String>> {
+        let mut targets = vec![None];
+        let hosts = self.config.borrow().session_hosts.clone();
+        let hosts = if hosts.is_empty() {
+            std::fs::read_to_string(ssh_config_path())
+                .map(|text| mux::ssh_config_hosts(&text))
+                .unwrap_or_default()
+        } else {
+            hosts
+        };
+        for host in hosts.into_iter().take(mux::MAX_HOSTS_PER_REQUEST) {
+            targets.push(Some(host));
+        }
+        targets
+    }
+
+    pub fn session_inventory(&self) -> MuxInventory {
+        self.session_cache.borrow().clone()
+    }
+
+    pub fn session_cache_gen(&self) -> u64 {
+        self.cache_gen.get()
+    }
+
+    pub fn discovery_in_flight(&self) -> bool {
+        !self.discovery_jobs.borrow().is_empty() || !self.discovery_queue.borrow().is_empty()
+    }
+
+    /// Starts a discovery pass. Returns `Some` when the answer is already known
+    /// (cached, or a pass is running and this caller gets the current snapshot),
+    /// and `None` when the stream is parked until the pass completes.
+    pub fn begin_discovery(
+        &self,
+        targets: Vec<Option<String>>,
+        refresh: bool,
+        stream: Option<UnixStream>,
+    ) -> Option<IpcResponse> {
+        if !refresh && !self.discovery_in_flight() && !self.session_cache.borrow().hosts.is_empty()
+        {
+            return Some(self.inventory_response());
+        }
+        // A second requester while a pass runs gets the snapshot rather than a
+        // second parked stream: one reply slot, bounded.
+        if self.discovery_in_flight() {
+            if let Some(mut stream) = stream {
+                let _ = write_response(&mut stream, &self.inventory_response());
+            }
+            return None;
+        }
+
+        let timeout = Duration::from_millis(self.config.borrow().discovery_timeout_ms);
+        {
+            let mut cache = self.session_cache.borrow_mut();
+            cache.sessions.clear();
+            cache.hosts.clear();
+            cache.partial = false;
+            cache.scanned_at_ms = now_ms();
+            for target in &targets {
+                for kind in [MuxKind::Tmux, MuxKind::Zellij] {
+                    cache.hosts.push(MuxHostStatus {
+                        host: target.clone(),
+                        kind,
+                        state: HostState::Scanning,
+                        error: None,
+                        elapsed_ms: 0,
+                    });
+                }
+            }
+        }
+        self.bump_cache_gen();
+        {
+            let mut queue = self.discovery_queue.borrow_mut();
+            queue.clear();
+            for target in targets {
+                for kind in [MuxKind::Tmux, MuxKind::Zellij] {
+                    queue.push_back((target.clone(), kind));
+                }
+            }
+        }
+        *self.pending_session_reply.borrow_mut() = stream;
+        self.discovery_deadline.set(Some(Instant::now() + timeout));
+        self.start_queued_discoveries();
+        // Every program may have failed to spawn synchronously (not installed),
+        // in which case the pass is already over and no tick will complete it.
+        self.complete_discovery_pass();
+        None
+    }
+
+    /// Writes the parked reply once no job or queued target remains. Called both
+    /// from the tick and right after starting a pass, because a pass whose every
+    /// spawn failed finishes before any tick runs.
+    fn complete_discovery_pass(&self) {
+        if !self.discovery_jobs.borrow().is_empty() || !self.discovery_queue.borrow().is_empty() {
+            return;
+        }
+        self.discovery_deadline.set(None);
+        if let Some(mut stream) = self.pending_session_reply.borrow_mut().take() {
+            let _ = write_response(&mut stream, &self.inventory_response());
+        }
+    }
+
+    fn inventory_response(&self) -> IpcResponse {
+        let mut resp = IpcResponse::empty_ok();
+        if let IpcResponse::Ok { sessions, .. } = &mut resp {
+            *sessions = Some(self.session_inventory());
+        }
+        resp
+    }
+
+    fn bump_cache_gen(&self) {
+        self.cache_gen.set(self.cache_gen.get().wrapping_add(1));
+    }
+
+    fn start_queued_discoveries(&self) {
+        loop {
+            if self.discovery_jobs.borrow().len() >= MAX_CONCURRENT_DISCOVERIES {
+                break;
+            }
+            let next = self.discovery_queue.borrow_mut().pop_front();
+            let Some((host, kind)) = next else { break };
+            match self.spawn_discovery(host.clone(), kind) {
+                Ok(job) => self.discovery_jobs.borrow_mut().push(job),
+                Err(err) => self.record_discovery_result(host, kind, Err(err), 0),
+            }
+        }
+    }
+
+    fn spawn_discovery(
+        &self,
+        host: Option<String>,
+        kind: MuxKind,
+    ) -> Result<PendingDiscovery, String> {
+        let opts = self.config.borrow().sessions.clone();
+        let (program, argv) = match &host {
+            None => (
+                mux::local_program(kind, &opts),
+                mux::discovery_argv(kind, &opts),
+            ),
+            Some(host) => mux::remote_discovery_argv(host, kind, &opts)?,
+        };
+        let child = Command::new(&program)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    format!("{}: not installed ({program})", kind.label())
+                } else {
+                    format!("{}: could not run {program}: {e}", kind.label())
+                }
+            })?;
+        if let Some(out) = child.stdout.as_ref() {
+            set_nonblocking(out.as_raw_fd());
+        }
+        if let Some(err) = child.stderr.as_ref() {
+            set_nonblocking(err.as_raw_fd());
+        }
+        let started = Instant::now();
+        let timeout = Duration::from_millis(self.config.borrow().discovery_timeout_ms);
+        Ok(PendingDiscovery {
+            host,
+            kind,
+            child,
+            out: Vec::new(),
+            err: Vec::new(),
+            started,
+            deadline: started + timeout,
+            killed: false,
+        })
+    }
+
+    /// Polls discovery children without blocking. Called from `poll_once`.
+    fn advance_discoveries(self: &Rc<Self>) {
+        if self.discovery_jobs.borrow().is_empty() && self.discovery_queue.borrow().is_empty() {
+            self.complete_discovery_pass();
+            return;
+        }
+        let mut budget = DISCOVERY_BYTES_PER_TICK;
+        let mut finished: Vec<DiscoveryOutcome> = Vec::new();
+        {
+            let mut jobs = self.discovery_jobs.borrow_mut();
+            let mut index = 0;
+            while index < jobs.len() {
+                let job = &mut jobs[index];
+                if let Some(out) = job.child.stdout.as_mut() {
+                    drain_bounded(out, &mut job.out, &mut budget);
+                }
+                if let Some(err) = job.child.stderr.as_mut() {
+                    drain_bounded(err, &mut job.err, &mut budget);
+                }
+                if !job.killed && Instant::now() >= job.deadline {
+                    let _ = job.child.kill();
+                    job.killed = true;
+                }
+                match job.child.try_wait() {
+                    Ok(Some(status)) => {
+                        let elapsed = job.started.elapsed().as_millis() as u64;
+                        let stdout = String::from_utf8_lossy(&job.out).into_owned();
+                        let stderr = String::from_utf8_lossy(&job.err).into_owned();
+                        let result = if job.killed {
+                            Err(format!("{}: timed out", job.kind.label()))
+                        } else {
+                            parse_discovery(
+                                job.kind,
+                                &stdout,
+                                &stderr,
+                                status.code(),
+                                job.host.as_deref(),
+                            )
+                        };
+                        finished.push((job.host.clone(), job.kind, result, elapsed));
+                        jobs.remove(index);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let elapsed = job.started.elapsed().as_millis() as u64;
+                        finished.push((
+                            job.host.clone(),
+                            job.kind,
+                            Err(format!("{}: {e}", job.kind.label())),
+                            elapsed,
+                        ));
+                        jobs.remove(index);
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+        }
+        for (host, kind, result, elapsed) in finished {
+            self.record_discovery_result(host, kind, result, elapsed);
+        }
+        self.start_queued_discoveries();
+
+        self.complete_discovery_pass();
+        self.refresh_session_pickers();
+    }
+
+    fn record_discovery_result(
+        &self,
+        host: Option<String>,
+        kind: MuxKind,
+        result: Result<Vec<MuxSession>, String>,
+        elapsed_ms: u64,
+    ) {
+        let show_exited = self.config.borrow().show_exited_sessions;
+        {
+            let mut cache = self.session_cache.borrow_mut();
+            cache
+                .sessions
+                .retain(|s| !(s.host == host && s.kind == kind));
+            cache.hosts.retain(|h| !(h.host == host && h.kind == kind));
+            let (state, error) = match &result {
+                Ok(sessions) => {
+                    for session in sessions {
+                        if session.exited && !show_exited {
+                            continue;
+                        }
+                        cache.sessions.push(session.clone());
+                    }
+                    (HostState::Ok, None)
+                }
+                Err(err) => (HostState::Error, Some(err.clone())),
+            };
+            cache.hosts.push(MuxHostStatus {
+                host,
+                kind,
+                state,
+                error,
+                elapsed_ms,
+            });
+            if cache.sessions.len() > mux::MAX_SESSIONS_PER_HOST * mux::MAX_HOSTS_PER_REQUEST {
+                cache
+                    .sessions
+                    .truncate(mux::MAX_SESSIONS_PER_HOST * mux::MAX_HOSTS_PER_REQUEST);
+            }
+        }
+        self.bump_cache_gen();
+    }
+
+    /// Kills and reaps any outstanding discovery child. `Child::drop` does
+    /// neither, so leaving them would leak zombies.
+    fn shutdown_discoveries(&self) {
+        self.discovery_queue.borrow_mut().clear();
+        let jobs = std::mem::take(&mut *self.discovery_jobs.borrow_mut());
+        for mut job in jobs {
+            let _ = job.child.kill();
+            let _ = job.child.wait();
+        }
+        self.pending_session_reply.borrow_mut().take();
+        self.discovery_deadline.set(None);
     }
 
     fn active_cwd(&self, win_hint: Option<WindowId>, pane_hint: Option<PaneId>) -> Option<PathBuf> {
@@ -563,9 +969,18 @@ impl AppController {
         self: &Rc<Self>,
         cwd: Option<PathBuf>,
     ) -> io::Result<(WindowId, TabId, PaneId)> {
+        self.create_window_with_command(cwd, None)
+    }
+
+    /// New window whose pane runs `command` instead of a login shell.
+    pub fn create_window_with_command(
+        self: &Rc<Self>,
+        cwd: Option<PathBuf>,
+        command: Option<(String, Vec<String>)>,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
         let inherited_cwd = cwd.or_else(|| self.active_cwd(None, None));
         let pane_id = self.workspace.borrow_mut().reserve_pane_id();
-        let engine = self.spawn_engine(pane_id, inherited_cwd)?;
+        let engine = self.spawn_engine(pane_id, inherited_cwd, command)?;
         let (win_id, tab_id) = self.workspace.borrow_mut().insert_window_with_pane(
             pane_id,
             engine,
@@ -581,12 +996,22 @@ impl AppController {
         target_win: Option<WindowId>,
         cwd: Option<PathBuf>,
     ) -> io::Result<(WindowId, TabId, PaneId)> {
+        self.create_tab_with_command(target_win, cwd, None)
+    }
+
+    /// New tab whose pane runs `command` instead of a login shell.
+    pub fn create_tab_with_command(
+        self: &Rc<Self>,
+        target_win: Option<WindowId>,
+        cwd: Option<PathBuf>,
+        command: Option<(String, Vec<String>)>,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
         let win_id = target_win
             .or_else(|| self.workspace.borrow().active_window_id())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active window"))?;
         let inherited_cwd = cwd.or_else(|| self.active_cwd(Some(win_id), None));
         let pane_id = self.workspace.borrow_mut().reserve_pane_id();
-        let engine = self.spawn_engine(pane_id, inherited_cwd)?;
+        let engine = self.spawn_engine(pane_id, inherited_cwd, command)?;
         let tab_id = self
             .workspace
             .borrow_mut()
@@ -602,12 +1027,23 @@ impl AppController {
         axis: SplitAxis,
         cwd: Option<PathBuf>,
     ) -> io::Result<(WindowId, TabId, PaneId)> {
+        self.split_pane_with_command(target_pane, axis, cwd, None)
+    }
+
+    /// New split whose pane runs `command` instead of a login shell.
+    pub fn split_pane_with_command(
+        self: &Rc<Self>,
+        target_pane: Option<PaneId>,
+        axis: SplitAxis,
+        cwd: Option<PathBuf>,
+        command: Option<(String, Vec<String>)>,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
         let anchor = target_pane
             .or_else(|| self.workspace.borrow().active_pane_id())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active pane"))?;
         let inherited_cwd = cwd.or_else(|| self.active_cwd(None, Some(anchor)));
         let new_pane = self.workspace.borrow_mut().reserve_pane_id();
-        let engine = self.spawn_engine(new_pane, inherited_cwd)?;
+        let engine = self.spawn_engine(new_pane, inherited_cwd, command)?;
         let (win_id, tab_id) = self
             .workspace
             .borrow_mut()
@@ -814,6 +1250,13 @@ impl AppController {
                     ui_win.show_command_palette();
                 }
             }
+            ActionId::SessionPicker => {
+                if let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.show_session_picker();
+                }
+            }
             ActionId::AgentAudit => {
                 if let Some(win_id) = active_win
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
@@ -870,6 +1313,13 @@ impl AppController {
             eng.set_agent_notice(None);
         }
         self.refresh_all_window_chromes();
+    }
+
+    /// The live view for a window, if one exists. The controller owns these
+    /// instances; a separately constructed `MutinyWindow` is not the one the
+    /// tick refreshes.
+    pub fn ui_window(&self, win_id: WindowId) -> Option<MutinyWindow> {
+        self.ui_windows.borrow().get(&win_id).cloned()
     }
 
     fn ensure_ui_window(self: &Rc<Self>, win_id: WindowId) {
@@ -981,6 +1431,7 @@ impl AppController {
 
         self.satisfy_pending_waits();
         self.advance_searches();
+        self.advance_discoveries();
         self.expire_pending_consents();
 
         for pid in panes_exited {
@@ -1262,6 +1713,35 @@ impl AppController {
                 });
                 None
             }
+            IpcRequest::ListSessions { host, refresh } => {
+                // `host: None` is local only. Scanning configured remotes is the
+                // GUI picker's job, where the human is the consent; an Observe
+                // IPC call must not spend the user's SSH credentials.
+                let targets = match host {
+                    Some(host) => {
+                        if let Err(err) = mux::validate_host(&host) {
+                            return Some(IpcResponse::err(err));
+                        }
+                        vec![Some(host)]
+                    }
+                    None => vec![None],
+                };
+                let Ok(stream) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                self.begin_discovery(targets, refresh, Some(stream))
+            }
+            IpcRequest::OpenSession {
+                kind,
+                name,
+                host,
+                mode,
+                window,
+                pane,
+            } => match self.open_session(kind, &name, host.as_deref(), mode, window, pane) {
+                Ok((w, t, p)) => Some(ids_ok(Some(w), Some(t), Some(p))),
+                Err(err) => Some(IpcResponse::err(err.to_string())),
+            },
             IpcRequest::PresentMedia {
                 pane,
                 path,
@@ -1721,6 +2201,18 @@ impl AppController {
         }
     }
 
+    /// Refreshes open session pickers. Collects window clones first, exactly as
+    /// `refresh_search_bars` does, because each window call re-borrows state.
+    /// The window itself decides whether the generation moved, so this is cheap
+    /// when nothing changed.
+    pub fn refresh_session_pickers(&self) {
+        let generation = self.cache_gen.get();
+        let wins: Vec<MutinyWindow> = self.ui_windows.borrow().values().cloned().collect();
+        for w in wins {
+            w.refresh_session_picker(generation);
+        }
+    }
+
     fn satisfy_pending_waits(&self) {
         let now = Instant::now();
         let mut remaining = Vec::new();
@@ -1873,5 +2365,76 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         output_seq: None,
         image_id: None,
         placement_id: None,
+        sessions: None,
     }
+}
+
+/// Wall-clock milliseconds for the inventory timestamp.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ssh_config_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".ssh").join("config"))
+        .unwrap_or_else(|_| PathBuf::from(".ssh/config"))
+}
+
+/// Pipes must be nonblocking so a tick never waits on a child.
+fn set_nonblocking(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Drains up to the shared per-tick budget. Bytes past `MAX_DISCOVERY_BYTES`
+/// are read and discarded rather than left in the pipe: a child that fills the
+/// pipe buffer would block forever and `try_wait` would never fire.
+fn drain_bounded<R: Read>(reader: &mut R, sink: &mut Vec<u8>, budget: &mut usize) {
+    let mut buf = [0u8; 8192];
+    while *budget > 0 {
+        let want = (*budget).min(buf.len());
+        match reader.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                *budget -= n;
+                if sink.len() < MAX_DISCOVERY_BYTES {
+                    let keep = (MAX_DISCOVERY_BYTES - sink.len()).min(n);
+                    sink.extend_from_slice(&buf[..keep]);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Turns one child's output into sessions or an actionable error. A non-zero
+/// exit with no sessions is normal for tmux when no server is running, so it is
+/// reported as "no sessions" rather than a hard failure.
+fn parse_discovery(
+    kind: MuxKind,
+    stdout: &str,
+    stderr: &str,
+    code: Option<i32>,
+    host: Option<&str>,
+) -> Result<Vec<MuxSession>, String> {
+    let sessions = match kind {
+        MuxKind::Tmux => mux::parse_tmux(stdout, host),
+        MuxKind::Zellij => mux::parse_zellij(stdout, host),
+    };
+    if !sessions.is_empty() {
+        return Ok(sessions);
+    }
+    if code == Some(0) {
+        return Ok(sessions);
+    }
+    Err(mux::classify_failure(kind.label(), code, stderr))
 }

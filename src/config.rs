@@ -101,6 +101,53 @@ impl Default for TerminalConfig {
     }
 }
 
+/// Session picker: which multiplexers to run, which hosts to scan, and the
+/// policy for attaching. Tunables live here rather than as constants beside the
+/// code, so a test can drive everything through a temp TOML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionsConfig {
+    /// Remote hosts to scan. Empty means fall back to literal `Host` aliases in
+    /// ~/.ssh/config.
+    pub hosts: Vec<String>,
+    pub tmux_program: String,
+    pub zellij_program: String,
+    pub ssh_program: String,
+    /// tmux `-S` socket. Set this to a private path to keep experiments away
+    /// from your live sessions.
+    pub tmux_socket: Option<String>,
+    pub connect_timeout_s: u32,
+    /// Wall-clock budget for a whole discovery pass before it reports partial.
+    pub discovery_timeout_ms: u64,
+    /// TERM sent to remote hosts. mutiny advertises `alacritty`, which they will
+    /// not have terminfo for.
+    pub remote_term: String,
+    /// Attach-or-create (`tmux new-session -A`, `zellij attach --create`).
+    pub create_if_missing: bool,
+    /// tmux `-f ignore-size`: do not let this client resize other viewers.
+    pub ignore_size: bool,
+    /// Show zellij's resurrectable EXITED sessions, badged and sorted last.
+    pub show_exited: bool,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            tmux_program: String::from("tmux"),
+            zellij_program: String::from("zellij"),
+            ssh_program: String::from("ssh"),
+            tmux_socket: None,
+            connect_timeout_s: 5,
+            discovery_timeout_ms: 8_000,
+            remote_term: String::from("xterm-256color"),
+            create_if_missing: true,
+            ignore_size: false,
+            show_exited: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -108,6 +155,7 @@ pub struct Config {
     pub colors: ColorConfig,
     pub geometry: GeometryConfig,
     pub terminal: TerminalConfig,
+    pub sessions: SessionsConfig,
 }
 
 /// CLI flags that shadow config keys. Applied after the file on every load.
@@ -144,6 +192,10 @@ pub struct ResolvedConfig {
     pub window_height: i32,
     pub padding_px: f32,
     pub scrollback_lines: usize,
+    pub sessions: crate::mux::MuxOptions,
+    pub session_hosts: Vec<String>,
+    pub show_exited_sessions: bool,
+    pub discovery_timeout_ms: u64,
 }
 
 impl Default for ResolvedConfig {
@@ -275,6 +327,32 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
         window_height: config.geometry.window_height.clamp(200, 4320),
         padding_px: config.geometry.padding_px.clamp(0.0, 64.0),
         scrollback_lines: config.terminal.scrollback_lines.min(1_000_000),
+        sessions: crate::mux::MuxOptions {
+            tmux_program: config.sessions.tmux_program.clone(),
+            zellij_program: config.sessions.zellij_program.clone(),
+            ssh_program: config.sessions.ssh_program.clone(),
+            tmux_socket: config.sessions.tmux_socket.clone(),
+            connect_timeout_s: config.sessions.connect_timeout_s.clamp(1, 60),
+            remote_term: config.sessions.remote_term.clone(),
+            create_if_missing: config.sessions.create_if_missing,
+            ignore_size: config.sessions.ignore_size,
+        },
+        session_hosts: config
+            .sessions
+            .hosts
+            .iter()
+            .filter(|h| match crate::mux::validate_host(h) {
+                Ok(()) => true,
+                Err(err) => {
+                    eprintln!("warning: config sessions.hosts entry skipped: {err}");
+                    false
+                }
+            })
+            .take(crate::mux::MAX_HOSTS_PER_REQUEST)
+            .cloned()
+            .collect(),
+        show_exited_sessions: config.sessions.show_exited,
+        discovery_timeout_ms: config.sessions.discovery_timeout_ms.clamp(200, 60_000),
     }
 }
 

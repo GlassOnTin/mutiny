@@ -43,12 +43,28 @@ impl TestServer {
         let (mode_tx, mode_rx) = mpsc::channel::<ConsentMode>();
         let (grant_tx, grant_rx) = mpsc::channel::<(PeerIdentity, String)>();
 
+        // A temp config with the multiplexer and ssh programs pointed nowhere.
+        // Without this the open_session dispatch probe would run the real tmux
+        // and CREATE a session on the developer's default server, and the tests
+        // would read the developer's own config. The probe asserts dispatch, not
+        // success, exactly as present_media targets a nonexistent file.
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "[sessions]\ntmux_program = \"/nonexistent-tmux\"\nzellij_program = \"/nonexistent-zellij\"\nssh_program = \"/nonexistent-ssh\"\nhosts = []\n",
+        )
+        .expect("test config");
+
         let op = operator_sock.clone();
         let ag = agent_sock.clone();
         let audit = audit_path.clone();
         let handle = thread::spawn(move || {
-            let ctrl =
-                AppController::with_audit_path(Some((String::from("/bin/sh"), Vec::new())), audit);
+            let ctrl = AppController::with_config(
+                Some((String::from("/bin/sh"), Vec::new())),
+                audit,
+                config_path,
+                mutiny::config::Overrides::default(),
+            );
             ctrl.start_ipc_listener(&op).expect("operator listener");
             ctrl.start_agent_listener(&ag, initial_agent_mode)
                 .expect("agent listener");
@@ -566,6 +582,8 @@ fn every_advertised_mcp_tool_dispatches() {
             "run_action" => json!({"slug": "new-tab"}),
             "present_notice" => json!({"pane": p1.0, "message": "x"}),
             "present_media" => json!({"pane": p1.0, "path": "/nonexistent-probe.png"}),
+            "list_sessions" => json!({}),
+            "open_session" => json!({"kind": "tmux", "name": "mutiny-probe", "mode": "tab"}),
             _ => return None,
         })
     };

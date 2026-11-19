@@ -227,6 +227,30 @@ enum CtlVerb {
         pane: Option<u64>,
         message: Option<String>,
     },
+    /// List tmux and zellij sessions. Omit --host for this machine only
+    Sessions {
+        #[arg(long)]
+        host: Option<String>,
+        /// Force a rescan instead of returning the cached inventory
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Attach a pane to a tmux or zellij session, locally or over SSH
+    OpenSession {
+        name: String,
+        /// tmux (default) or zellij
+        #[arg(long, default_value = "tmux")]
+        kind: String,
+        #[arg(long)]
+        host: Option<String>,
+        /// window, tab (default), split-right, split-down
+        #[arg(long, default_value = "tab")]
+        mode: String,
+        #[arg(long)]
+        window: Option<u64>,
+        #[arg(long)]
+        pane: Option<u64>,
+    },
     /// Place an image file inline in a pane via Kitty graphics
     PresentMedia {
         path: PathBuf,
@@ -319,6 +343,10 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::Wait { timeout_ms, .. } | CtlVerb::AwaitTurn { timeout_ms, .. } => {
             Duration::from_millis(timeout_ms.saturating_add(1_500))
         }
+        // A named host has to authenticate and run a command remotely, which
+        // takes far longer than a local listing.
+        CtlVerb::Sessions { host: Some(_), .. } => Duration::from_secs(40),
+        CtlVerb::Sessions { host: None, .. } => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     };
 
@@ -416,6 +444,36 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             pane: pane.map(PaneId),
             message,
         },
+        CtlVerb::Sessions { host, refresh } => IpcRequest::ListSessions { host, refresh },
+        CtlVerb::OpenSession {
+            name,
+            kind,
+            host,
+            mode,
+            window,
+            pane,
+        } => {
+            let kind = match kind.as_str() {
+                "tmux" => mutiny::mux::MuxKind::Tmux,
+                "zellij" => mutiny::mux::MuxKind::Zellij,
+                other => {
+                    eprintln!("unknown kind {other:?}: expected tmux or zellij");
+                    return ExitCode::from(2);
+                }
+            };
+            let Some(mode) = mutiny::mux::SessionMode::parse(&mode) else {
+                eprintln!("unknown mode: expected window, tab, split-right, or split-down");
+                return ExitCode::from(2);
+            };
+            IpcRequest::OpenSession {
+                kind,
+                name,
+                host,
+                mode,
+                window: window.map(WindowId),
+                pane: pane.map(PaneId),
+            }
+        }
         CtlVerb::PresentMedia {
             path,
             pane,

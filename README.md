@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 114 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 147 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -29,6 +29,7 @@ Working today:
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
 - Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 131x cheaper than a full repaint, measured under Xvfb.
 - Session restore: layout, split ratios, working directories, and scrollback survive a restart. See [Session restore](#session-restore).
+- A session picker (`Ctrl+Shift+S`) lists tmux and zellij sessions, local and over SSH, and opens one in a new tab or window. See [Multiplexer sessions](#multiplexer-sessions).
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
 - Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
 
@@ -41,6 +42,9 @@ Not built yet:
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
 - Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
+- Session restore does not re-attach multiplexer clients: a restored pane that was running tmux comes back as a plain shell.
+- A pane attached to tmux or zellij gets no shell integration, so prompt jumping and command capture do not work inside it.
+- The session picker scans local tmux and zellij plus configured SSH hosts. screen, abduco, and dtach are not discovered.
 - The HTTP MCP carrier is a slice: no SSE and no session management. Peer identity and session grants are per token; the consent mode is still one setting for the whole listener. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
@@ -232,6 +236,19 @@ padding_px = 6.0               # clamped 0..64
 
 [terminal]
 scrollback_lines = 10000       # capped at 1000000
+
+[sessions]
+hosts = []                     # remote hosts to scan; empty falls back to ~/.ssh/config Host aliases
+tmux_program = "tmux"
+zellij_program = "zellij"
+ssh_program = "ssh"
+# tmux_socket = "/tmp/private.sock"   # -S socket; set to keep experiments off your live sessions
+connect_timeout_s = 5          # clamped 1..60
+discovery_timeout_ms = 8000    # clamped 200..60000, then the pass reports partial
+remote_term = "xterm-256color" # mutiny advertises TERM=alacritty, which remote hosts lack
+create_if_missing = true       # attach-or-create
+ignore_size = false            # true adds tmux -f ignore-size, so this client cannot resize other viewers
+show_exited = true             # show zellij's resurrectable EXITED sessions, badged
 ```
 
 Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are computed, not configurable.
@@ -239,6 +256,18 @@ Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are c
 **Live reload.** The file is stat'd every 250 ms and reloaded when it changes. Font, colors, palette, and padding apply immediately to every open pane: cell metrics are recomputed, which resizes the grid and the PTY. Geometry and scrollback depth apply to *newly created* panes and windows, because alacritty fixes scrollback at construction and resizing existing windows under you would be rude. Deleting the file reverts to defaults.
 
 **Errors are survivable.** Unknown keys are rejected so a typo is reported rather than silently ignored. A malformed file leaves the previous config in place and warns, and does not retry until the file changes again. An invalid color falls back to that key's default; a palette that is not exactly 16 entries falls back to the whole default palette. Out-of-range numbers are clamped. None of these stop the terminal.
+
+### Multiplexer sessions
+
+`Ctrl+Shift+S` lists tmux and zellij sessions and opens the one you pick. Return opens it in a new tab, Shift+Return in a new window. Type to filter by session name, host, or multiplexer.
+
+Mutiny does not reimplement multiplexing. The picker runs `tmux list-sessions` and `zellij list-sessions`, and attaching execs `tmux new-session -A -s NAME` (or `zellij attach --create NAME`) in the new pane. The multiplexer owns process survival: closing the pane kills only its client, never the server.
+
+Sessions already attached elsewhere are **shared, not taken over**. Mutiny never passes `-d`, so opening a session that Haven is viewing on your phone leaves that client connected. Note that tmux's `window-size` defaults to `latest`, so the newest client's size wins and the other view may letterbox; set `ignore_size = true` to stop this client from resizing anyone.
+
+Remote hosts come from `[sessions] hosts`, falling back to literal `Host` aliases in `~/.ssh/config`. Discovery uses `BatchMode=yes` and never prompts; attaching allocates a tty and lets you type a passphrase in the pane. A host that is unreachable or lacks the multiplexer is shown as an unavailable row with the reason, alongside the sessions that did answer.
+
+Two limits worth knowing. A pane running tmux gets no shell integration, because tmux is not a shell mutiny injects into: prompt jumping and command capture do not work inside it unless tmux passes those sequences through. And session restore does not re-attach: a restored pane that was a tmux client comes back as a plain shell.
 
 ### Session restore
 
@@ -274,6 +303,7 @@ Not implemented: animation frames, file and shared-memory transmission, unicode 
 | Search scrollback | `Ctrl+Shift+F` |
 | Toggle menu bar | `Ctrl+Shift+M` |
 | Command palette | `Ctrl+Shift+P` |
+| Multiplexer session picker | `Ctrl+Shift+S` |
 | Agent activity and audit log | `Ctrl+Shift+J` |
 | Keybind cheatsheet | `Ctrl+Shift+?` |
 
@@ -300,12 +330,14 @@ Ask mode fails closed when no GUI window is open to present a prompt. Consent ch
 
 One limit is worth stating plainly: same-uid processes are mutually trusted under the Unix model. Any process running as you can reach the operator socket and act as the operator. The uid check closes the cross-user hole, not that one.
 
+The tier follows what a verb actually does, not just its name. `list_sessions` with no host is Observe: it reads this machine. Naming a host makes the same verb Act, because it authenticates to that machine with your keys and runs a command there, and an observe-only agent must not get lateral movement for free. `open_session` is always Act.
+
 The HTTP carrier adds a third path with a lower ceiling. It reaches the agent socket only, so the mode pinned by `--agent-consent` is the most a network peer can ever hold, and Operator is unreachable by construction. Pairing is a bearer token checked before the body is read.
 
 ## Development
 
 ```sh
-cargo test                    # 114 tests, no display required
+cargo test                    # 147 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
