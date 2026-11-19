@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use mutiny::engine::{GridSize, KeyInput, KeyKind, PaneEngine};
+use mutiny::engine::{GridSize, KeyInput, KeyKind, PaneEngine, SEARCH_LINES_PER_TICK};
 
 const COLS: usize = 120;
 const ROWS: usize = 40;
@@ -23,6 +23,7 @@ fn main() {
     pty_echo_latency();
     snapshot_cost();
     scrollback_search_cost();
+    search_chunk_budget();
 
     println!("{}", "-".repeat(72));
     println!("engine-only figures exclude GTK rendering, which needs a display.");
@@ -229,4 +230,54 @@ fn scrollback_search_cost() {
         fmt_us(miss_median),
         fmt_us(miss_p95)
     );
+}
+
+/// Tick-budget evidence for the chunked scan. Times each individual chunk of a
+/// full-history no-match search, which is the work one GUI tick performs. The
+/// whole-scan figure above is what the chunking replaced.
+fn search_chunk_budget() {
+    let mut engine = PaneEngine::new_headless(COLS, ROWS);
+    engine.advance_bytes(&mixed_stream(2000));
+    let history = engine.snapshot(None).scrollback_lines;
+
+    engine.begin_search("needle-that-is-not-present", true, 20);
+    let mut chunk_times = Vec::new();
+    let total_start = Instant::now();
+    let mut chunks = 0usize;
+    loop {
+        let start = Instant::now();
+        let progress = engine
+            .advance_search(SEARCH_LINES_PER_TICK)
+            .expect("active search");
+        chunk_times.push(start.elapsed());
+        chunks += 1;
+        if progress.done {
+            break;
+        }
+        assert!(chunks < 10_000, "scan must terminate");
+    }
+    let total = total_start.elapsed();
+    let (median, p95, _) = stats(chunk_times.clone());
+    let max = *chunk_times.iter().max().expect("at least one chunk");
+    let tick = Duration::from_micros(4_000);
+
+    println!(
+        "search chunk budget  {:>10} median  {:>10} p95   {:>10} max  ({} lines/chunk, {} history)",
+        fmt_us(median),
+        fmt_us(p95),
+        fmt_us(max),
+        SEARCH_LINES_PER_TICK,
+        history
+    );
+    println!(
+        "  full miss spread over {chunks} ticks ({} total); max chunk {:.1}% of the 4 ms tick: {}",
+        fmt_us(total),
+        max.as_secs_f64() / tick.as_secs_f64() * 100.0,
+        if max < tick {
+            "WITHIN BUDGET"
+        } else {
+            "OVER BUDGET"
+        }
+    );
+    assert!(engine.search().expect("search").matches().is_empty());
 }

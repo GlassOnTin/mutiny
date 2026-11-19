@@ -29,6 +29,9 @@ struct MutinyWindowInner {
     active_consent_id: Cell<Option<u64>>,
     notice_bar: gtk4::Box,
     notice_label: gtk4::Label,
+    search_bar: gtk4::Box,
+    search_entry: gtk4::SearchEntry,
+    search_status: gtk4::Label,
     content_slot: gtk4::Box,
     pane_views: RefCell<HashMap<PaneId, TerminalView>>,
     tab_buttons: RefCell<Vec<(TabId, gtk4::Button)>>,
@@ -143,6 +146,37 @@ impl MutinyWindow {
         notice_bar.append(&notice_label);
         notice_bar.append(&ack_btn);
 
+        // Viewport search over the chunked scan. The query lives here; the
+        // scan state lives in the PaneEngine, so it survives a reparent.
+        let search_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        search_bar.set_margin_start(8);
+        search_bar.set_margin_end(8);
+        search_bar.set_margin_top(4);
+        search_bar.set_margin_bottom(4);
+        search_bar.set_visible(false);
+
+        let search_entry = gtk4::SearchEntry::new();
+        search_entry.set_hexpand(true);
+        search_entry.set_placeholder_text(Some("Search scrollback…"));
+        search_bar.append(&search_entry);
+
+        let search_status = gtk4::Label::new(None);
+        search_status.set_xalign(0.0);
+        search_bar.append(&search_status);
+
+        let search_prev = gtk4::Button::with_label("↑");
+        search_prev.set_tooltip_text(Some("Previous match (Shift+Enter)"));
+        search_prev.set_can_focus(false);
+        let search_next = gtk4::Button::with_label("↓");
+        search_next.set_tooltip_text(Some("Next match (Enter)"));
+        search_next.set_can_focus(false);
+        let search_close = gtk4::Button::with_label("✕");
+        search_close.set_tooltip_text(Some("Close search (Escape)"));
+        search_close.set_can_focus(false);
+        search_bar.append(&search_prev);
+        search_bar.append(&search_next);
+        search_bar.append(&search_close);
+
         let content_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_slot.set_hexpand(true);
         content_slot.set_vexpand(true);
@@ -152,6 +186,7 @@ impl MutinyWindow {
         root_vbox.append(&chrome_bar);
         root_vbox.append(&consent_bar);
         root_vbox.append(&notice_bar);
+        root_vbox.append(&search_bar);
         root_vbox.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         root_vbox.append(&content_slot);
         gtk_window.set_child(Some(&root_vbox));
@@ -168,6 +203,9 @@ impl MutinyWindow {
                 active_consent_id: Cell::new(None),
                 notice_bar,
                 notice_label,
+                search_bar,
+                search_entry,
+                search_status,
                 content_slot,
                 pane_views: RefCell::new(HashMap::new()),
                 tab_buttons: RefCell::new(Vec::new()),
@@ -177,6 +215,7 @@ impl MutinyWindow {
         };
 
         this.wire_banner_buttons(&allow_once_btn, &allow_sess_btn, &deny_btn, &ack_btn);
+        this.wire_search_bar(&search_prev, &search_next, &search_close);
         this.register_window_actions(&controller);
 
         let ctrl_weak = Rc::downgrade(&controller);
@@ -240,6 +279,113 @@ impl MutinyWindow {
                 }
             }
         });
+    }
+
+    fn wire_search_bar(&self, prev: &gtk4::Button, next: &gtk4::Button, close: &gtk4::Button) {
+        let inner_weak = Rc::downgrade(&self.inner);
+        self.inner
+            .search_entry
+            .connect_search_changed(move |entry| {
+                if let Some(inner) = inner_weak.upgrade()
+                    && let Some(ctrl) = inner.controller.upgrade()
+                {
+                    ctrl.begin_pane_search(None, &entry.text());
+                }
+            });
+
+        for (btn, forward) in [(prev, false), (next, true)] {
+            let inner_weak = Rc::downgrade(&self.inner);
+            btn.connect_clicked(move |_| {
+                if let Some(inner) = inner_weak.upgrade()
+                    && let Some(ctrl) = inner.controller.upgrade()
+                {
+                    ctrl.navigate_pane_search(None, forward);
+                }
+            });
+        }
+
+        let inner_weak = Rc::downgrade(&self.inner);
+        close.connect_clicked(move |_| {
+            if let Some(inner) = inner_weak.upgrade() {
+                inner.search_bar.set_visible(false);
+                if let Some(ctrl) = inner.controller.upgrade() {
+                    ctrl.cancel_pane_search(None);
+                }
+            }
+        });
+
+        let inner_weak = Rc::downgrade(&self.inner);
+        let keys = gtk4::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, keyval, _, state| {
+            let Some(inner) = inner_weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(ctrl) = inner.controller.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            match keyval {
+                gdk::Key::Escape => {
+                    inner.search_bar.set_visible(false);
+                    ctrl.cancel_pane_search(None);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    let forward = !state.contains(gdk::ModifierType::SHIFT_MASK);
+                    ctrl.navigate_pane_search(None, forward);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        self.inner.search_entry.add_controller(keys);
+    }
+
+    pub fn show_search_bar(&self) {
+        self.inner.search_bar.set_visible(true);
+        self.inner.search_entry.grab_focus();
+        if let Some(ctrl) = self.inner.controller.upgrade() {
+            ctrl.begin_pane_search(None, &self.inner.search_entry.text());
+        }
+    }
+
+    /// Reflects the active pane's scan state. The scan itself is advanced by
+    /// the controller's tick, never here, so painting cannot stall on a search.
+    pub fn refresh_search_bar(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let state = {
+            let ws = ctrl.workspace.borrow();
+            ws.window(self.inner.window_id)
+                .and_then(|w| w.active_pane())
+                .and_then(|pid| ws.pane(pid))
+                .and_then(|e| e.search())
+                .map(|s| {
+                    (
+                        s.matches().len(),
+                        s.lines_scanned(),
+                        s.is_done(),
+                        s.cursor(),
+                    )
+                })
+        };
+        match state {
+            None => self.inner.search_bar.set_visible(false),
+            Some((count, scanned, done, cursor)) => {
+                self.inner.search_bar.set_visible(true);
+                let text = if !done {
+                    format!("{count} matches, scanning {scanned} lines…")
+                } else if count == 0 {
+                    format!("no matches ({scanned} lines scanned)")
+                } else {
+                    match cursor {
+                        Some(i) => format!("{} of {count}", i + 1),
+                        None => format!("{count} matches"),
+                    }
+                };
+                self.inner.search_status.set_text(&text);
+            }
+        }
     }
 
     fn register_window_actions(&self, controller: &Rc<AppController>) {

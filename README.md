@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rung. The engine, pane mobility, and agent surface are implemented and covered by 35 tests that run without a display. The GUI itself is not exercised by the automated suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 42 tests that run without a display. The GUI itself is not exercised by the automated suite.
 
 Working today:
 
@@ -18,6 +18,7 @@ Working today:
 - Binary split trees and tabs. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback.
 - `urgent-next` jumps across windows, tabs, and splits to the next pane needing attention (a bell, a failed command, or an agent notice).
 - A ring of the last eight exited panes keeps the final screen and exit code, so a session that fails on startup is still diagnosable.
+- Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
 - One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 21 IPC verbs, 17 MCP tools, 4 MCP resources, held at parity by tests.
 - Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
@@ -126,6 +127,7 @@ Identifiers are stable regardless of the public product name, which is still ope
 | Jump to next urgent pane | `Ctrl+Shift+A` |
 | Jump to previous / next OSC 133 prompt | `Ctrl+Shift+Up` / `Down` |
 | Copy / paste | `Ctrl+Shift+C` / `V` |
+| Search scrollback | `Ctrl+Shift+F` |
 | Toggle menu bar | `Ctrl+Shift+M` |
 | Command palette | `Ctrl+Shift+P` |
 | Agent activity and audit log | `Ctrl+Shift+J` |
@@ -157,7 +159,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 35 tests, no display required
+cargo test                    # 42 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
@@ -166,7 +168,7 @@ cargo bench                   # headless engine baseline
 
 The suite runs headless because `AppController` works without a GTK application attached, so engine, topology, IPC, and MCP behavior are all testable without a desktop. CI additionally runs it under Xvfb so the GTK-dependent assertions execute too.
 
-[benches/BASELINE.md](benches/BASELINE.md) records the measured engine baseline. One finding from it shapes the next milestone: a full 10 000-line scrollback scan with no match costs about 3.2 ms against the 4 ms GUI tick, so search must be chunked across ticks rather than run whole on the main loop.
+[benches/BASELINE.md](benches/BASELINE.md) records the measured engine baseline. One finding from it shaped the search design: a full 10 000-line scrollback scan with no match costs about 3.2 ms against the 4 ms GUI tick. Search is therefore chunked at 512 lines per tick, which measures 233 us worst case, and a full-history miss spreads over 20 ticks instead of blocking one.
 
 [CLAUDE.md](CLAUDE.md) documents the architecture for contributors and coding agents, including the invariants that are easy to break: state lives outside widgets, one thread and one 4 ms tick, and the OSC side channel slices the byte stream so markers see the exact cursor position.
 

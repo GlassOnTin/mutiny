@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v6). M0, the trust/parity half of M0.5, and peer-identity grant binding are shipped. The next rung is chunked scrollback search, then M1 (config, shell integration, Kitty graphics, IME). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v7). M0, the trust/parity half of M0.5, peer-identity grant binding, and chunked scrollback search are shipped. The next rung is bundled shell integration snippets, then the rest of M1 (config, Kitty graphics, IME). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 35 tests: 26 unit + 9 integration
+cargo test                               # 42 tests: 31 unit + 11 integration
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -116,6 +116,16 @@ One limit to keep in mind: same-uid processes are mutually trusted under the Uni
 
 Testing grant behavior needs **two real processes**. Every thread in one process shares a pid, so in-process `McpBridge` instances all have the same peer identity. `tests/e2e_ipc_pty.rs` has a `PeerProcess` helper that re-invokes the test binary (`--exact raw_peer_helper`) as a stdin-driven raw socket client; `raw_peer_helper` is a no-op when its env var is unset, so the normal suite stays headless-green.
 
+### Search is chunked across ticks
+
+A whole 10 000-line scan costs about 3.2 ms, most of the 4 ms tick, so nothing on the main loop scans whole. `ScrollbackSearch` is a resumable bottom-up cursor; `PaneEngine::scan_search_chunk` advances it by at most `SEARCH_LINES_PER_TICK` (512) lines. `AppController::advance_searches` runs in `poll_once` and divides that budget across every active scan, so N concurrent searches still cost one budget total.
+
+Two holders, one code path: the pane's own slot (`begin_search` / `advance_search`) drives the viewport bar, and `PendingSearch` holds a separate cursor for an in-flight IPC `search` so the two do not clobber each other. The IPC reply is parked across ticks like `wait`; the request and response shapes are unchanged.
+
+Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
+
+`search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
 ### Rendering
 
 `TerminalView` is a `gtk4::Widget` subclass implementing `WidgetImpl::snapshot`, drawing into `GtkSnapshot` render nodes. There is no `GLArea` and no per-pane GL context, so reparenting cannot tear down GPU state. Four passes: background runs, styled text runs via Pango layout, cursor, active-pane accent. Cell metrics come from Pango at construction; `size_allocate` → `recompute_grid_dimensions` → `PaneEngine::resize` → PTY `TIOCSWINSZ`. Panes spawn at 100×30 and are resized to fit on first allocation.
@@ -129,7 +139,7 @@ These look closer to done than they are:
 - **No config file.** VISION specifies TOML with live reload; there is no config module and no `toml` dependency. Font (`Monospace 11`), colours, and the 16-colour palette are constants in `src/ui/terminal_view.rs`.
 - **Split ratios are stored but not applied.** `SplitNode::Split { ratio }` is preserved through tree surgery, but `build_split_widget` never calls `set_position`, and user drags are not written back. Splits render at GTK's default.
 - **No shell integration snippets shipped.** OSC 133/7 tracking works only if the shell emits the markers; nothing in the repo installs them. PTYs do get `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID=<id>` for that purpose.
-- **Scrollback search blocks the tick (next rung).** A full 10 000-line scan with no match costs about 3.2 ms median against the 4 ms tick, so it drops a frame. `search_scrollback` needs a resumable form with a per-tick line budget, and the M1 search bar must use it. See `benches/BASELINE.md`.
+- **No shell integration snippets (next rung).** OSC 133 prompt jumping, command-output capture, and the prompt path of `await-turn` all need markers the shell emits, and nothing in the repo installs them. A fresh install gets none of those without manual setup.
 - **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell.
 - **CI runs on GitHub and is green.** `origin` is `https://github.com/GlassOnTin/mutiny` (public, AGPL-3.0-or-later). `.github/workflows/ci.yml` runs fmt, clippy, the displayless suite, the suite under Xvfb, and a release build in an Arch container, with cargo caching keyed on rustc and GTK versions. `./scripts/ci.sh` runs the same checks locally. `.github/workflows/release.yml` is tag-triggered and gated on CI, but has not been exercised: no tag has been pushed.
 - Untested by the current suite: real GUI rendering, Kitty graphics, drag gestures, session restore, and the M2 HTTP MCP listener.

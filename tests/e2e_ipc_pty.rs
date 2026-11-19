@@ -801,3 +801,215 @@ fn audit_entries_written_before_peer_identity_still_load() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The viewport search bar's logic layer, driven headlessly through the same
+/// controller methods the widgets call. The widgets themselves need a display.
+#[test]
+fn viewport_search_progresses_across_ticks_and_navigates() {
+    let dir = env::temp_dir().join(format!("mutiny-vsearch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let ctrl = AppController::with_audit_path(None, dir.join("audit.jsonl"));
+    let (_w, _t, p1) = ctrl.create_window(None).expect("window");
+
+    let mut buf = String::new();
+    for i in 0..12_000 {
+        buf.push_str(&format!("row {i} some searchable content here\r\n"));
+    }
+    ctrl.workspace
+        .borrow_mut()
+        .pane_mut(p1)
+        .unwrap()
+        .advance_bytes(buf.as_bytes());
+    let history = ctrl
+        .workspace
+        .borrow()
+        .pane(p1)
+        .unwrap()
+        .snapshot(None)
+        .scrollback_lines;
+    assert!(history >= 10_000, "expected full scrollback, got {history}");
+
+    // A no-match query over the whole history must not complete in one tick.
+    ctrl.begin_pane_search(Some(p1), "absent-needle-xyz");
+    let mut ticks = 0usize;
+    loop {
+        ctrl.poll_once();
+        ticks += 1;
+        let done = ctrl
+            .workspace
+            .borrow()
+            .pane(p1)
+            .unwrap()
+            .search()
+            .unwrap()
+            .is_done();
+        if done {
+            break;
+        }
+        assert!(ticks < 1_000, "scan must terminate");
+    }
+    assert!(
+        ticks > 1,
+        "a full-history miss must spread across ticks, finished in {ticks}"
+    );
+    assert!(
+        ctrl.workspace
+            .borrow()
+            .pane(p1)
+            .unwrap()
+            .search()
+            .unwrap()
+            .matches()
+            .is_empty()
+    );
+
+    // A hit query completes, then navigation moves the cursor and scrolls.
+    // The needle must survive the 10 000-line cap: with 12 000 lines emitted,
+    // only roughly rows 1970 onward are retained.
+    ctrl.begin_pane_search(Some(p1), "row 2500 ");
+    for _ in 0..1_000 {
+        ctrl.poll_once();
+        if ctrl
+            .workspace
+            .borrow()
+            .pane(p1)
+            .unwrap()
+            .search()
+            .unwrap()
+            .is_done()
+        {
+            break;
+        }
+    }
+    let offset_before = ctrl
+        .workspace
+        .borrow()
+        .pane(p1)
+        .unwrap()
+        .snapshot(None)
+        .display_offset;
+    ctrl.navigate_pane_search(Some(p1), true);
+    let (cursor, offset_after) = {
+        let ws = ctrl.workspace.borrow();
+        let eng = ws.pane(p1).unwrap();
+        (
+            eng.search().unwrap().cursor(),
+            eng.snapshot(None).display_offset,
+        )
+    };
+    assert_eq!(cursor, Some(0));
+    assert_ne!(
+        offset_before, offset_after,
+        "navigation must scroll into history"
+    );
+
+    ctrl.cancel_pane_search(Some(p1));
+    assert!(ctrl.workspace.borrow().pane(p1).unwrap().search().is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The IPC search is now parked across ticks. Its request and response shapes
+/// are unchanged, and the server stays responsive while a scan is in flight.
+#[test]
+fn ipc_search_is_chunked_and_keeps_the_wire_shape() {
+    let server = TestServer::spawn("search", ConsentMode::Paired);
+    let sock = server.operator_sock.clone();
+    let p1 = server.first_pane;
+
+    send_request(
+        &sock,
+        &IpcRequest::SendText {
+            pane: Some(p1),
+            text: String::from("seq 1 12000\n"),
+        },
+        Duration::from_secs(3),
+    )
+    .expect("fill scrollback");
+    thread::sleep(Duration::from_millis(900));
+
+    let history = match send_request(
+        &sock,
+        &IpcRequest::Snapshot {
+            pane: Some(p1),
+            max_lines: Some(1),
+        },
+        Duration::from_secs(3),
+    )
+    .expect("snapshot")
+    {
+        IpcResponse::Ok {
+            snapshot: Some(s), ..
+        } => s.scrollback_lines,
+        other => panic!("unexpected snapshot: {other:?}"),
+    };
+    assert!(history >= 10_000, "expected full scrollback, got {history}");
+
+    let search_sock = sock.clone();
+    let searcher = thread::spawn(move || {
+        send_request(
+            &search_sock,
+            &IpcRequest::Search {
+                pane: Some(p1),
+                pattern: String::from("absent-needle-xyz"),
+                ignore_case: true,
+                max_matches: 20,
+            },
+            Duration::from_secs(10),
+        )
+        .expect("search reply")
+    });
+
+    // While the scan is in flight the tick must still service other requests.
+    // The per-tick line budget itself is asserted deterministically in
+    // engine::tests::one_chunk_cannot_scan_a_full_history; this checks the
+    // server is not blocked, with a generous bound to stay non-flaky.
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let resp = send_request(&sock, &IpcRequest::List, Duration::from_secs(5)).expect("list");
+        assert!(matches!(resp, IpcResponse::Ok { .. }));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "server stalled while a search was in flight: {:?}",
+            start.elapsed()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    match searcher.join().expect("searcher") {
+        IpcResponse::Ok {
+            matches: Some(hits),
+            pane: Some(pid),
+            ..
+        } => {
+            assert_eq!(pid, p1);
+            assert!(
+                hits.is_empty(),
+                "no-match search must return no hits: {hits:?}"
+            );
+        }
+        other => panic!("unexpected search response: {other:?}"),
+    }
+
+    // A hit query still returns matches in the same shape.
+    match send_request(
+        &sock,
+        &IpcRequest::Search {
+            pane: Some(p1),
+            pattern: String::from("12000"),
+            ignore_case: true,
+            max_matches: 5,
+        },
+        Duration::from_secs(10),
+    )
+    .expect("hit search")
+    {
+        IpcResponse::Ok {
+            matches: Some(hits),
+            ..
+        } => {
+            assert!(!hits.is_empty(), "expected a hit for the last emitted line");
+        }
+        other => panic!("unexpected hit response: {other:?}"),
+    }
+}

@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v6, 2026-11-19. Owner: Ian. Public name remains open until first public release; internal identifiers are fixed now (see "Contracts that must not drift"). M0, the trust/parity half of M0.5, and the peer-identity grant binding are shipped; the growth diagnostic below says which is which. The next rung is chunked scrollback search (see M1).
+Status: draft v7, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, and chunked scrollback search are shipped; the growth diagnostic below says which is which. The next rung is bundled shell integration snippets (see M1).
 
 ## Thesis
 
@@ -158,18 +158,20 @@ One honest gap remains. The release workflow is tag-triggered and gated on CI, b
 
 ### M1: the surface becomes configurable and complete
 
-**Next rung: chunk scrollback search across ticks.** The M0.5 baseline measured a full 10 000-line scan at about 3.2 ms median against a 4 ms GUI tick, so a non-matching needle run inline drops a frame. `search_scrollback` needs a resumable form that scans a bounded number of lines per tick and yields, and the viewport search bar must be built on that rather than on the whole-scan call. This comes first in M1 because it is a measured defect in the current shape, not a new feature.
+**Shipped rung: chunked scrollback search.** `ScrollbackSearch` is a resumable bottom-up cursor advanced by `SEARCH_LINES_PER_TICK` (512 lines). Both the viewport search bar (`Ctrl+Shift+F`) and the IPC `search` verb use it, sharing one tick budget across however many scans are in flight. The IPC request and response shapes are unchanged; only the latency differs, with the reply parked across ticks like `wait` and `await-turn`. A scan restarts if output shifts the grid mid-flight, so collected matches never point at lines that moved.
 
-- Resumable `search_scrollback` with a per-tick line budget, plus the viewport search bar over it.
+Evidence: one chunk measures 223 us median and 233 us max, 5.8% of the 4 ms tick, and a full-history miss spreads over 20 ticks. `one_chunk_cannot_scan_a_full_history` asserts the budget deterministically rather than by timing. Total wall time for a miss rises about 14%, which is the deliberate trade for never occupying a tick.
+
+**Next rung: bundled shell integration snippets.** OSC 133 prompt jumping, command-output capture, and `await-turn`'s prompt path all depend on markers the shell emits, and nothing in the repo installs them. A fresh install therefore gets none of those features without manual setup, which makes this the highest-leverage remaining M1 item. Ship snippets for bash, zsh, fish, and nushell, keyed off the `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID` the PTY already exports.
+
 - TOML config at `$XDG_CONFIG_HOME/mutiny/config.toml` with live reload, a documented key set, and defined precedence against CLI flags.
-- Bundled shell integration snippets (OSC 133 + OSC 7) for bash, zsh, fish, and nushell. PTYs already export `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID` for this.
 - Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
 - Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.
 - OSC 777 notifications through the desktop portal, with tab badges.
 - Text input correctness: `GtkIMContext` for IME and dead keys, and a font fallback chain for CJK, emoji, and box-drawing glyphs.
 - Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: a search with no matches never stalls a tick, a fresh install reads config, a plain bash session emits OSC 133 without manual setup, an image renders inline, and a CJK or accented compose sequence types correctly.
+Done when: a plain bash session emits OSC 133 without manual setup, a fresh install reads config, an image renders inline, and a CJK or accented compose sequence types correctly.
 
 ### M2: persistence and reach *(forward-looking)*
 

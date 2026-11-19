@@ -116,6 +116,98 @@ pub struct ScrollbackMatch {
     pub text: String,
 }
 
+/// Lines one tick may spend scanning. The M0.5 baseline measured a full
+/// 10 000-line no-match scan at about 3.2 ms, roughly 0.32 us per line, against
+/// a 4 ms tick. 512 lines is about 0.16 ms, leaving headroom for PTY draining
+/// and rendering. A full-history miss therefore spreads over about 20 ticks
+/// instead of occupying one.
+pub const SEARCH_LINES_PER_TICK: usize = 512;
+
+/// A resumable bottom-up scrollback scan. Holds its own cursor so several
+/// searches (the viewport bar, an in-flight IPC request) can progress
+/// independently without clobbering each other.
+#[derive(Debug, Clone)]
+pub struct ScrollbackSearch {
+    needle: String,
+    ignore_case: bool,
+    max_matches: usize,
+    first_line: i32,
+    next_line: i32,
+    matches: Vec<ScrollbackMatch>,
+    cursor: Option<usize>,
+    lines_scanned: usize,
+    done: bool,
+    output_seq: u64,
+}
+
+impl ScrollbackSearch {
+    pub fn new(
+        needle: &str,
+        ignore_case: bool,
+        max_matches: usize,
+        first_line: i32,
+        last_line: i32,
+        output_seq: u64,
+    ) -> Self {
+        let folded = if ignore_case {
+            needle.to_lowercase()
+        } else {
+            needle.to_owned()
+        };
+        Self {
+            needle: folded,
+            ignore_case,
+            max_matches,
+            first_line,
+            next_line: last_line,
+            matches: Vec::new(),
+            cursor: None,
+            lines_scanned: 0,
+            done: needle.is_empty() || max_matches == 0,
+            output_seq,
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    pub fn matches(&self) -> &[ScrollbackMatch] {
+        &self.matches
+    }
+
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    pub fn lines_scanned(&self) -> usize {
+        self.lines_scanned
+    }
+
+    /// Restarts against a grid that moved under us. Grid line indices are
+    /// relative to the current screen, so output arriving mid-scan invalidates
+    /// both the cursor and every match already collected.
+    fn restart(&mut self, first_line: i32, last_line: i32, output_seq: u64) {
+        self.first_line = first_line;
+        self.next_line = last_line;
+        self.matches.clear();
+        self.cursor = None;
+        self.lines_scanned = 0;
+        self.done = self.needle.is_empty() || self.max_matches == 0;
+        self.output_seq = output_seq;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub matches: usize,
+    pub lines_scanned: usize,
+    pub done: bool,
+    /// True when output arrived mid-scan and the scan started over, so results
+    /// always describe the current grid rather than a stale one.
+    pub restarted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum EngineNotification {
     TitleChanged(String),
@@ -178,6 +270,7 @@ pub struct PaneEngine {
     last_output_at: Option<Instant>,
     last_child_exit_code: Option<i32>,
     pending_pty_writes: Vec<u8>,
+    search: Option<ScrollbackSearch>,
 }
 
 impl PaneEngine {
@@ -212,6 +305,7 @@ impl PaneEngine {
             last_output_at: None,
             last_child_exit_code: None,
             pending_pty_writes: Vec::new(),
+            search: None,
         }
     }
 
@@ -916,50 +1010,211 @@ impl PaneEngine {
         }
     }
 
+    /// Scans at most `line_budget` lines of `search`, newest first. Takes `&self`
+    /// and an external search state so the viewport bar and an in-flight IPC
+    /// request can each hold their own cursor over the same grid.
+    pub fn scan_search_chunk(
+        &self,
+        search: &mut ScrollbackSearch,
+        line_budget: usize,
+    ) -> SearchProgress {
+        let last_col = Column(self.size.cols.saturating_sub(1));
+        let mut scanned = 0usize;
+        while scanned < line_budget && !search.done {
+            if search.next_line < search.first_line {
+                search.done = true;
+                break;
+            }
+            let line_idx = search.next_line;
+            search.next_line -= 1;
+            scanned += 1;
+
+            let row_text = self.term.bounds_to_string(
+                Point::new(Line(line_idx), Column(0)),
+                Point::new(Line(line_idx), last_col),
+            );
+            let trimmed = row_text.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let hit = if search.ignore_case {
+                trimmed.to_lowercase().contains(&search.needle)
+            } else {
+                trimmed.contains(&search.needle)
+            };
+            if hit {
+                search.matches.push(ScrollbackMatch {
+                    grid_line: line_idx,
+                    text: trimmed.to_owned(),
+                });
+                if search.matches.len() >= search.max_matches {
+                    search.done = true;
+                }
+            }
+        }
+        search.lines_scanned += scanned;
+        SearchProgress {
+            matches: search.matches.len(),
+            lines_scanned: search.lines_scanned,
+            done: search.done,
+            restarted: false,
+        }
+    }
+
+    fn search_bounds(&self) -> (i32, i32) {
+        let history = self.term.grid().history_size() as i32;
+        let last_line = self.size.rows.saturating_sub(1) as i32;
+        (-history, last_line)
+    }
+
+    /// Builds a search cursor bound to this grid, for a caller that keeps its
+    /// own state (an in-flight IPC request) rather than the pane's own slot.
+    pub fn new_search(
+        &self,
+        needle: &str,
+        ignore_case: bool,
+        max_matches: usize,
+    ) -> ScrollbackSearch {
+        let (first, last) = self.search_bounds();
+        ScrollbackSearch::new(
+            needle,
+            ignore_case,
+            max_matches,
+            first,
+            last,
+            self.output_seq,
+        )
+    }
+
+    /// Starts the pane's own resumable search, replacing any previous one.
+    pub fn begin_search(&mut self, needle: &str, ignore_case: bool, max_matches: usize) {
+        let (first, last) = self.search_bounds();
+        self.search = Some(ScrollbackSearch::new(
+            needle,
+            ignore_case,
+            max_matches,
+            first,
+            last,
+            self.output_seq,
+        ));
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search = None;
+    }
+
+    pub fn search(&self) -> Option<&ScrollbackSearch> {
+        self.search.as_ref()
+    }
+
+    /// Advances an externally-held cursor, restarting it if output moved the
+    /// grid since the scan began. Shared by the pane's own search and by
+    /// in-flight IPC searches so both get the same staleness guard.
+    pub fn advance_external_search(
+        &self,
+        search: &mut ScrollbackSearch,
+        line_budget: usize,
+    ) -> SearchProgress {
+        let mut restarted = false;
+        if search.output_seq != self.output_seq {
+            let (first, last) = self.search_bounds();
+            search.restart(first, last, self.output_seq);
+            restarted = true;
+        }
+        let mut progress = self.scan_search_chunk(search, line_budget.max(1));
+        progress.restarted = restarted;
+        progress
+    }
+
+    /// Advances the pane's search by at most `line_budget` lines.
+    pub fn advance_search(&mut self, line_budget: usize) -> Option<SearchProgress> {
+        let mut search = self.search.take()?;
+        let progress = self.advance_external_search(&mut search, line_budget);
+        self.search = Some(search);
+        Some(progress)
+    }
+
+    /// Moves the match cursor, scrolls the target line into view, and selects
+    /// it so the existing selection rendering highlights it.
+    pub fn navigate_search(&mut self, forward: bool) -> Option<usize> {
+        let (next, line) = {
+            let search = self.search.as_mut()?;
+            let len = search.matches.len();
+            if len == 0 {
+                return None;
+            }
+            let next = match search.cursor {
+                None => {
+                    if forward {
+                        0
+                    } else {
+                        len - 1
+                    }
+                }
+                Some(i) => {
+                    if forward {
+                        (i + 1) % len
+                    } else {
+                        (i + len - 1) % len
+                    }
+                }
+            };
+            search.cursor = Some(next);
+            (next, search.matches[next].grid_line)
+        };
+        self.scroll_to_grid_line(line);
+        self.highlight_grid_line(line);
+        Some(next)
+    }
+
+    /// Scrolls so `line` sits near the middle of the viewport. Returns whether
+    /// the display offset actually changed.
+    pub fn scroll_to_grid_line(&mut self, line: i32) -> bool {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let current = grid.display_offset() as i32;
+        let rows = self.size.rows as i32;
+        let desired_top = line - rows / 2;
+        let offset = (-desired_top).clamp(0, history);
+        if offset == current {
+            return false;
+        }
+        self.term.scroll_display(Scroll::Delta(offset - current));
+        true
+    }
+
+    fn highlight_grid_line(&mut self, line: i32) {
+        let offset = self.term.grid().display_offset() as i32;
+        let row = line + offset;
+        if row < 0 || row as usize >= self.size.rows {
+            return;
+        }
+        let last_col = self.size.cols.saturating_sub(1);
+        self.start_selection(0, row as usize, SelectionType::Simple);
+        self.update_selection(last_col, row as usize);
+    }
+
+    /// Runs a scan to completion. Kept for callers that are not tick-bound;
+    /// the GUI and IPC paths use the chunked form instead.
     pub fn search_scrollback(
         &self,
         needle: &str,
         ignore_case: bool,
         max_matches: usize,
     ) -> Vec<ScrollbackMatch> {
-        if needle.is_empty() || max_matches == 0 {
-            return Vec::new();
+        let (first, last) = self.search_bounds();
+        let mut search = ScrollbackSearch::new(
+            needle,
+            ignore_case,
+            max_matches,
+            first,
+            last,
+            self.output_seq,
+        );
+        while !search.done {
+            self.scan_search_chunk(&mut search, usize::MAX);
         }
-        let grid = self.term.grid();
-        let history = grid.history_size() as i32;
-        let last_line = self.size.rows.saturating_sub(1) as i32;
-        let last_col = Column(self.size.cols.saturating_sub(1));
-        let folded_needle = if ignore_case {
-            needle.to_lowercase()
-        } else {
-            needle.to_owned()
-        };
-
-        let mut matches = Vec::new();
-        for line_idx in (-history..=last_line).rev() {
-            let pt_start = Point::new(Line(line_idx), Column(0));
-            let pt_end = Point::new(Line(line_idx), last_col);
-            let row_text = self.term.bounds_to_string(pt_start, pt_end);
-            let trimmed = row_text.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let hit = if ignore_case {
-                trimmed.to_lowercase().contains(&folded_needle)
-            } else {
-                trimmed.contains(&folded_needle)
-            };
-            if hit {
-                matches.push(ScrollbackMatch {
-                    grid_line: line_idx,
-                    text: trimmed.to_owned(),
-                });
-                if matches.len() >= max_matches {
-                    break;
-                }
-            }
-        }
-        matches
+        search.matches
     }
 }
 
@@ -1241,5 +1496,130 @@ mod tests {
         assert_eq!(engine.encode_key(enter).unwrap(), b"\r");
         let ctrl_c = parse_named_key("ctrl-c").unwrap();
         assert_eq!(engine.encode_key(ctrl_c).unwrap(), vec![0x03]);
+    }
+
+    fn fill_history(engine: &mut PaneEngine, lines: usize) {
+        let mut buf = String::new();
+        for i in 0..lines {
+            buf.push_str(&format!("row {i} some searchable content here\r\n"));
+        }
+        engine.advance_bytes(buf.as_bytes());
+    }
+
+    #[test]
+    fn chunked_scan_equals_whole_scan_for_hits_and_misses() {
+        let mut engine = PaneEngine::new_headless(40, 6);
+        fill_history(&mut engine, 500);
+        for needle in ["searchable", "absent-needle"] {
+            let whole = engine.search_scrollback(needle, true, 20);
+            let mut cursor = engine.new_search(needle, true, 20);
+            while !cursor.is_done() {
+                engine.scan_search_chunk(&mut cursor, 7);
+            }
+            assert_eq!(cursor.matches(), whole.as_slice(), "needle {needle}");
+        }
+    }
+
+    #[test]
+    fn one_chunk_cannot_scan_a_full_history() {
+        let mut engine = PaneEngine::new_headless(40, 6);
+        fill_history(&mut engine, 12_000);
+        let history = engine.snapshot(None).scrollback_lines;
+        assert!(
+            history >= 10_000,
+            "expected a full scrollback, got {history}"
+        );
+
+        engine.begin_search("absent-needle", true, 20);
+        let first = engine
+            .advance_search(SEARCH_LINES_PER_TICK)
+            .expect("search");
+        assert!(
+            !first.done,
+            "a full-history miss must not finish in one chunk"
+        );
+        assert_eq!(first.lines_scanned, SEARCH_LINES_PER_TICK);
+        assert_eq!(first.matches, 0);
+
+        let mut chunks = 1usize;
+        loop {
+            let p = engine
+                .advance_search(SEARCH_LINES_PER_TICK)
+                .expect("search");
+            chunks += 1;
+            assert!(
+                p.lines_scanned <= chunks * SEARCH_LINES_PER_TICK,
+                "chunk exceeded its line budget"
+            );
+            if p.done {
+                break;
+            }
+            assert!(chunks < 1_000, "scan must terminate");
+        }
+        let total_lines = history + 6;
+        assert!(
+            chunks >= total_lines / SEARCH_LINES_PER_TICK,
+            "expected the miss to spread over many ticks, took {chunks}"
+        );
+        assert_eq!(engine.search().unwrap().matches().len(), 0);
+    }
+
+    #[test]
+    fn search_restarts_when_output_shifts_the_grid() {
+        let mut engine = PaneEngine::new_headless(40, 6);
+        fill_history(&mut engine, 200);
+        engine.begin_search("row 150", true, 20);
+        let first = engine.advance_search(50).expect("search");
+        assert!(!first.restarted);
+
+        engine.advance_bytes(b"new output line\r\n");
+        let after = engine.advance_search(50).expect("search");
+        assert!(after.restarted, "output must invalidate the stale cursor");
+
+        while !engine.search().unwrap().is_done() {
+            engine.advance_search(SEARCH_LINES_PER_TICK);
+        }
+        let matches = engine.search().unwrap().matches();
+        assert!(
+            matches.iter().any(|m| m.text.contains("row 150")),
+            "restarted scan must still find the needle: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn navigate_search_scrolls_to_a_scrollback_match_and_highlights_it() {
+        let mut engine = PaneEngine::new_headless(40, 6);
+        fill_history(&mut engine, 300);
+        engine.begin_search("row 5 ", true, 5);
+        while !engine.search().unwrap().is_done() {
+            engine.advance_search(64);
+        }
+        assert_eq!(engine.search().unwrap().matches().len(), 1);
+
+        let before = engine.snapshot(None).display_offset;
+        assert_eq!(engine.navigate_search(true), Some(0));
+        let after = engine.snapshot(None).display_offset;
+        assert_ne!(before, after, "navigating into history must scroll");
+        assert!(
+            engine
+                .selection_text()
+                .is_some_and(|t| t.contains("row 5 ")),
+            "the matched line should be selected for highlighting"
+        );
+        assert_eq!(engine.search().unwrap().cursor(), Some(0));
+    }
+
+    #[test]
+    fn empty_query_and_zero_cap_finish_immediately() {
+        let mut engine = PaneEngine::new_headless(40, 6);
+        fill_history(&mut engine, 50);
+        engine.begin_search("", true, 20);
+        assert!(engine.advance_search(1).unwrap().done);
+        engine.begin_search("row", true, 0);
+        assert!(engine.advance_search(1).unwrap().done);
+        assert!(engine.search().unwrap().matches().is_empty());
+        engine.cancel_search();
+        assert!(engine.search().is_none());
+        assert!(engine.advance_search(64).is_none());
     }
 }

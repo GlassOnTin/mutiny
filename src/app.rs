@@ -10,7 +10,10 @@ use gtk4::gdk;
 use gtk4::prelude::*;
 
 use crate::action::ActionId;
-use crate::engine::{EngineNotification, GridSize, PaneEngine, parse_named_key};
+use crate::engine::{
+    EngineNotification, GridSize, PaneEngine, SEARCH_LINES_PER_TICK, ScrollbackSearch,
+    parse_named_key,
+};
 use crate::ipc::{
     AuditDecision, AuditEntry, ConsentMode, ConsentOutcome, IpcEnvelope, IpcRequest, IpcResponse,
     PeerIdentity, action_catalog, bind_socket, carrier_permits_peer, consent_outcome,
@@ -28,6 +31,16 @@ struct PendingWait {
     since_prompt_seq: u64,
     since_output_seq: Option<u64>,
     settle: Duration,
+    deadline: Instant,
+    stream: UnixStream,
+}
+
+/// An IPC search parked across ticks. Holds its own cursor so it does not
+/// disturb the viewport bar's search on the same pane. The response shape is
+/// unchanged; only the latency differs.
+struct PendingSearch {
+    pane: PaneId,
+    search: ScrollbackSearch,
     deadline: Instant,
     stream: UnixStream,
 }
@@ -64,6 +77,7 @@ pub struct AppController {
     agent_mode: Cell<ConsentMode>,
     audit_path: RefCell<Option<PathBuf>>,
     pending_waits: RefCell<Vec<PendingWait>>,
+    pending_searches: RefCell<Vec<PendingSearch>>,
     pending_consents: RefCell<VecDeque<PendingConsent>>,
     session_approved_clients: RefCell<HashSet<PeerIdentity>>,
     /// Display labels for the granted identities, so the audit dialog can show
@@ -101,6 +115,7 @@ impl AppController {
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
             pending_waits: RefCell::new(Vec::new()),
+            pending_searches: RefCell::new(Vec::new()),
             pending_consents: RefCell::new(VecDeque::new()),
             session_approved_clients: RefCell::new(HashSet::new()),
             session_grant_labels: RefCell::new(HashMap::new()),
@@ -533,6 +548,13 @@ impl AppController {
                         });
                 }
             }
+            ActionId::Search => {
+                if let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.show_search_bar();
+                }
+            }
             ActionId::ToggleMenuBar => {
                 if let Some(win_id) = active_win {
                     let next = {
@@ -714,6 +736,7 @@ impl AppController {
         }
 
         self.satisfy_pending_waits();
+        self.advance_searches();
         self.expire_pending_consents();
 
         for pid in panes_exited {
@@ -951,12 +974,21 @@ impl AppController {
                 let Some(eng) = ws.pane(pid) else {
                     return Some(IpcResponse::err(format!("pane {pid} not found")));
                 };
-                let hits = eng.search_scrollback(&pattern, ignore_case, max_matches.clamp(1, 100));
-                let mut resp = ids_ok(None, None, Some(pid));
-                if let IpcResponse::Ok { matches, .. } = &mut resp {
-                    *matches = Some(hits);
-                }
-                Some(resp)
+                // Chunked rather than scanned whole: a 10 000-line miss costs
+                // about 3.2 ms, most of a 4 ms tick. The reply is parked and
+                // completed across ticks; the wire shape is unchanged.
+                let search = eng.new_search(&pattern, ignore_case, max_matches.clamp(1, 100));
+                drop(ws);
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("failed to clone IPC stream for search"));
+                };
+                self.pending_searches.borrow_mut().push(PendingSearch {
+                    pane: pid,
+                    search,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    stream: cloned,
+                });
+                None
             }
             IpcRequest::RunAction { action, window } => {
                 self.execute_action(action, window);
@@ -1256,6 +1288,122 @@ impl AppController {
             stream: cloned_stream,
         });
         None
+    }
+
+    /// Advances every active scan by a share of one tick's line budget. A
+    /// full-history no-match scan therefore spreads across ticks instead of
+    /// occupying one, no matter how many searches are in flight.
+    fn advance_searches(self: &Rc<Self>) {
+        let pane_ids = self.workspace.borrow().pane_ids();
+        let ui_scans: Vec<PaneId> = pane_ids
+            .into_iter()
+            .filter(|pid| {
+                self.workspace
+                    .borrow()
+                    .pane(*pid)
+                    .and_then(|e| e.search())
+                    .is_some_and(|s| !s.is_done())
+            })
+            .collect();
+        let pending_count = self.pending_searches.borrow().len();
+        let total = ui_scans.len() + pending_count;
+        if total == 0 {
+            return;
+        }
+        let per_scan = (SEARCH_LINES_PER_TICK / total).max(1);
+
+        let mut ui_progressed = false;
+        for pid in &ui_scans {
+            let moved = self
+                .workspace
+                .borrow_mut()
+                .pane_mut(*pid)
+                .and_then(|e| e.advance_search(per_scan));
+            if moved.is_some() {
+                ui_progressed = true;
+                self.queue_redraw_pane(*pid);
+            }
+        }
+
+        let now = Instant::now();
+        let mut remaining = Vec::new();
+        let searches: Vec<PendingSearch> = self.pending_searches.borrow_mut().drain(..).collect();
+        for mut item in searches {
+            let outcome = {
+                let ws = self.workspace.borrow();
+                match ws.pane(item.pane) {
+                    None => Err(String::from("pane closed while searching")),
+                    Some(eng) => Ok(eng.advance_external_search(&mut item.search, per_scan)),
+                }
+            };
+            match outcome {
+                Err(msg) => {
+                    let _ = write_response(&mut item.stream, &IpcResponse::err(msg));
+                }
+                Ok(progress) if progress.done => {
+                    let mut resp = ids_ok(None, None, Some(item.pane));
+                    if let IpcResponse::Ok { matches, .. } = &mut resp {
+                        *matches = Some(item.search.matches().to_vec());
+                    }
+                    let _ = write_response(&mut item.stream, &resp);
+                }
+                Ok(_) if now >= item.deadline => {
+                    let _ = write_response(&mut item.stream, &IpcResponse::err("search timed out"));
+                }
+                Ok(_) => remaining.push(item),
+            }
+        }
+        *self.pending_searches.borrow_mut() = remaining;
+
+        if ui_progressed {
+            self.refresh_search_bars();
+        }
+    }
+
+    /// Starts (or replaces) the viewport search on a pane. Empty queries are
+    /// allowed so the bar stays open while the operator types.
+    pub fn begin_pane_search(&self, pane: Option<PaneId>, query: &str) {
+        let Some(pid) = pane.or_else(|| self.workspace.borrow().active_pane_id()) else {
+            return;
+        };
+        if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid) {
+            eng.begin_search(query, true, 100);
+        }
+        self.refresh_search_bars();
+    }
+
+    pub fn cancel_pane_search(&self, pane: Option<PaneId>) {
+        let Some(pid) = pane.or_else(|| self.workspace.borrow().active_pane_id()) else {
+            return;
+        };
+        if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid) {
+            eng.cancel_search();
+            eng.clear_selection();
+        }
+        self.queue_redraw_pane(pid);
+        self.refresh_search_bars();
+    }
+
+    pub fn navigate_pane_search(&self, pane: Option<PaneId>, forward: bool) {
+        let Some(pid) = pane.or_else(|| self.workspace.borrow().active_pane_id()) else {
+            return;
+        };
+        let moved = self
+            .workspace
+            .borrow_mut()
+            .pane_mut(pid)
+            .and_then(|e| e.navigate_search(forward));
+        if moved.is_some() {
+            self.queue_redraw_pane(pid);
+            self.refresh_search_bars();
+        }
+    }
+
+    pub fn refresh_search_bars(&self) {
+        let wins: Vec<MutinyWindow> = self.ui_windows.borrow().values().cloned().collect();
+        for w in wins {
+            w.refresh_search_bar();
+        }
     }
 
     fn satisfy_pending_waits(&self) {

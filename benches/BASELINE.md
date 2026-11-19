@@ -21,6 +21,7 @@ Median and p95 over the iteration counts in `benches/latency.rs`.
 | Pane snapshot | 6.7 us | 12.5 us | one agent poll on a populated grid |
 | Scrollback search, hit | 4.7 us | 6.6 us | 20 matches near live screen, early exit |
 | Scrollback search, miss | 3234 us | 3370 us | full 10 000-line scan, worst case |
+| Search chunk (512 lines) | 223 us | 233 us | one tick's worth of the chunked scan |
 
 Run-to-run variance on VT ingest was about 15% across two runs (2309 us then
 2655 us median) on an otherwise idle machine. Treat differences under roughly
@@ -43,9 +44,25 @@ Not covered:
   a tight poll loop and an idle shell. It is a floor, not a loaded percentile.
 - **IPC and MCP round trips.** Socket and JSON costs are not isolated here.
 
-## Implication worth acting on
+## Implication worth acting on (addressed)
 
 A full scrollback scan costs about 3.2 ms, which is most of the 4 ms GUI tick.
-Running `search_scrollback` inline on the main loop with a needle that does not
-match will drop a frame. The M1 viewport search bar should chunk the scan
-across ticks or cap the lines scanned per tick rather than calling it whole.
+Running it inline on the main loop with a needle that does not match drops a
+frame.
+
+The M1 chunked-search rung addressed this. `SEARCH_LINES_PER_TICK` is 512, and
+both the viewport search bar and the IPC `search` verb advance a resumable
+cursor by that budget per tick instead of scanning whole. Re-measured after the
+change:
+
+- One chunk: 223 us median, 233 us max, which is 5.8% of the 4 ms tick.
+- A full-history miss spreads over 20 ticks, 4196 us total.
+
+The trade is explicit: total wall time for a miss rises about 14% (3674 us
+blocking versus 4196 us chunked, same run), and in exchange no single tick
+spends more than 233 us scanning. The whole-scan `search_scrollback` wrapper is
+kept for callers that are not tick-bound, and the figures above are from it.
+
+`engine::tests::one_chunk_cannot_scan_a_full_history` asserts the budget
+deterministically, so the guarantee does not rest on a timing measurement that
+a loaded CI machine could skew.
