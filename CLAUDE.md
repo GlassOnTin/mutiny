@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v7). M0, the trust/parity half of M0.5, peer-identity grant binding, and chunked scrollback search are shipped. The next rung is bundled shell integration snippets, then the rest of M1 (config, Kitty graphics, IME). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v8). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, and bundled shell integration are shipped. The next rung is TOML config, then the rest of M1 (Kitty graphics, IME, drag gestures). Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 42 tests: 31 unit + 11 integration
+cargo test                               # 46 tests: 34 unit + 11 e2e + 1 shell integration
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -81,6 +81,16 @@ Deferred work is modelled as queues holding a cloned `UnixStream`, not futures: 
 
 Alacritty's own events (title, bell, OSC 52 clipboard, `PtyWrite` replies) arrive separately via `EventCollector` and are drained in `collect_term_events`. Two paths, both surfaced as `EngineNotification` to `poll_once`.
 
+### Shell integration is bundled and injected at spawn
+
+`src/shell_integration.rs` holds the snippets as `include_str!` assets from `src/shell_integration/`, so the binary is self-contained. `PaneEngine::spawn_pty` resolves the shell program (the override, else `$SHELL`), classifies it by basename, materializes the assets under `integration_dir()`, and applies an `Injection` of extra argv and env. When the shell is not one we ship for (dash, sh, a custom program), or injection fails, it falls through to alacritty's own default resolution, so existing behavior is unchanged. Injection is best-effort: an unwritable runtime dir logs a warning and costs the markers, never the pane.
+
+No dotfile is edited. Each shell gets a wrapper that loads the user's config first: bash `--rcfile bash_rc.sh`, zsh a `ZDOTDIR` set (`.zshenv`, `.zprofile`, `.zshrc`) that sources the originals by absolute path and restores `ZDOTDIR` at the end of `.zshrc`, fish `-C source`, nu a generated `--config` wrapper with the user's config path baked in as a literal (nu's `source` needs one). A caller's own `--rcfile`, `-C`, or `--config` wins over ours.
+
+Two shell facts worth remembering when editing snippets: fish 4 emits OSC 133 natively, so the snippet version-gates on `$FISH_VERSION` and contributes only OSC 7 on 4.x, otherwise every marker would be duplicated and the engine would double its command records. nu has no `char escape`; ESC is `char -i 27`, and `hostname` is not guaranteed to exist, so use `(sys host).hostname`.
+
+`tests/shell_integration.rs` is its own test binary with a single test because it sets process-wide `HOME`, `SHELL`, and `XDG_RUNTIME_DIR` to simulate a fresh install. Keep it that way: adding a second test to that file would race on the environment.
+
 ### Grid coordinates
 
 In alacritty, `Line(0)` is the top of the visible screen and negative lines are scrollback; `display_offset` is how far the viewport is scrolled up. Because `history_size` grows as lines scroll off, prompt markers and command-output bounds are stored as `line_from_history_top = history_size + cursor.line.0`, an absolute coordinate stable across scrolling. `jump_prev_prompt`, `jump_next_prompt`, and `extract_command_output` all translate between the two. Mixing them up silently targets the wrong line.
@@ -139,7 +149,8 @@ These look closer to done than they are:
 - **No config file.** VISION specifies TOML with live reload; there is no config module and no `toml` dependency. Font (`Monospace 11`), colours, and the 16-colour palette are constants in `src/ui/terminal_view.rs`.
 - **Split ratios are stored but not applied.** `SplitNode::Split { ratio }` is preserved through tree surgery, but `build_split_widget` never calls `set_position`, and user drags are not written back. Splits render at GTK's default.
 - **No shell integration snippets shipped.** OSC 133/7 tracking works only if the shell emits the markers; nothing in the repo installs them. PTYs do get `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID=<id>` for that purpose.
-- **No shell integration snippets (next rung).** OSC 133 prompt jumping, command-output capture, and the prompt path of `await-turn` all need markers the shell emits, and nothing in the repo installs them. A fresh install gets none of those without manual setup.
+- **No config file is the next rung.** Font, colours, and palette are compile-time constants.
+- **fish 4 blocks on unanswered terminal queries.** It waits for primary DA, cursor position report, XTVERSION, OSC 11 background, and DCS terminfo responses before becoming responsive. Whether mutiny answers all of them is unverified. Found while verifying the fish snippet in a container; a bare PTY that stays silent leaves fish alive but stuck.
 - **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell.
 - **CI runs on GitHub and is green.** `origin` is `https://github.com/GlassOnTin/mutiny` (public, AGPL-3.0-or-later). `.github/workflows/ci.yml` runs fmt, clippy, the displayless suite, the suite under Xvfb, and a release build in an Arch container, with cargo caching keyed on rustc and GTK versions. `./scripts/ci.sh` runs the same checks locally. `.github/workflows/release.yml` is tag-triggered and gated on CI, but has not been exercised: no tag has been pushed.
 - Untested by the current suite: real GUI rendering, Kitty graphics, drag gestures, session restore, and the M2 HTTP MCP listener.

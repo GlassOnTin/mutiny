@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v7, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, and chunked scrollback search are shipped; the growth diagnostic below says which is which. The next rung is bundled shell integration snippets (see M1).
+Status: draft v8, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, and bundled shell integration are shipped; the growth diagnostic below says which is which. The next rung is TOML config (see M1).
 
 ## Thesis
 
@@ -162,7 +162,13 @@ One honest gap remains. The release workflow is tag-triggered and gated on CI, b
 
 Evidence: across three runs the maximum chunk was 176 to 233 us, 4.4% to 5.8% of the 4 ms tick, and a full-history miss spreads over 20 ticks. Total wall time for the chunked miss overlaps the whole-scan range, so chunking caps per-tick cost without measurably raising total cost. `one_chunk_cannot_scan_a_full_history` asserts the budget deterministically rather than by timing.
 
-**Next rung: bundled shell integration snippets.** OSC 133 prompt jumping, command-output capture, and `await-turn`'s prompt path all depend on markers the shell emits, and nothing in the repo installs them. A fresh install therefore gets none of those features without manual setup, which makes this the highest-leverage remaining M1 item. Ship snippets for bash, zsh, fish, and nushell, keyed off the `TERM_PROGRAM=mutiny` and `MUTINY_PANE_ID` the PTY already exports.
+**Shipped rung: bundled shell integration.** Snippets for bash, zsh, fish, and nushell are compiled into the binary with `include_str!` and materialized under `$XDG_RUNTIME_DIR/mutiny/shell-integration/` when a pane spawns. Each shell is pointed at a wrapper that loads the user's own config first, then the snippet, so no dotfile is edited: bash gets `--rcfile`, zsh gets a `ZDOTDIR` wrapper set that preserves the original, fish gets `-C source`, and nu gets a generated `--config` wrapper. Injection is best-effort: an unwritable runtime dir costs the markers, never the pane.
+
+Evidence: `tests/shell_integration.rs` spawns a fresh bash with an empty HOME and no shell override, and asserts OSC 133;A on the first prompt, captured output and exit 0 for a successful command, exit 1 for `false`, OSC 7 cwd, and that no dotfile was created. zsh, fish, and nushell were driven in real PTYs in an Arch container and all emit A/B/C/D with correct exit codes. Two shell-specific facts shaped the snippets: fish 4 emits OSC 133 natively, so on 4.x the snippet contributes only OSC 7 to avoid duplicating every marker; and nu has no `char escape`, so ESC is `char -i 27`.
+
+Discovered defect, not yet fixed: fish 4 blocks at startup until the terminal answers its capability queries (primary DA, cursor position report, XTVERSION, OSC 11 background, DCS terminfo). A bare PTY that stays silent leaves fish alive but unresponsive. Whether mutiny answers all of these is unverified and needs checking before fish can be called supported.
+
+**Next rung: TOML config.** Font, colours, and palette are still compile-time constants, so a fresh install cannot be customized at all. Ship `$XDG_CONFIG_HOME/mutiny/config.toml` with live reload, a documented key set, and defined precedence against CLI flags.
 
 - TOML config at `$XDG_CONFIG_HOME/mutiny/config.toml` with live reload, a documented key set, and defined precedence against CLI flags.
 - Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
@@ -171,7 +177,7 @@ Evidence: across three runs the maximum chunk was 176 to 233 us, 4.4% to 5.8% of
 - Text input correctness: `GtkIMContext` for IME and dead keys, and a font fallback chain for CJK, emoji, and box-drawing glyphs.
 - Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: a plain bash session emits OSC 133 without manual setup, a fresh install reads config, an image renders inline, and a CJK or accented compose sequence types correctly.
+Done when: a fresh install reads config, an image renders inline, a CJK or accented compose sequence types correctly, and fish starts responsively in mutiny rather than blocking on unanswered terminal queries.
 
 ### M2: persistence and reach *(forward-looking)*
 

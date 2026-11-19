@@ -9,12 +9,13 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 42 tests that run without a display. The GUI itself is not exercised by the automated suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 46 tests that run without a display. The GUI itself is not exercised by the automated suite.
 
 Working today:
 
 - `alacritty_terminal` 0.26 engine with a PTY per pane, 10 000 lines of scrollback, and line-level search.
 - OSC 133 command journal, OSC 7 working directory, OSC 9;4 progress, OSC 8 hyperlinks, OSC 52 clipboard.
+- Shell integration bundled for bash, zsh, fish, and nushell, injected automatically at spawn. A fresh install gets prompt jumping, command-output capture, and exit-code reporting without editing any dotfile.
 - Binary split trees and tabs. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback.
 - `urgent-next` jumps across windows, tabs, and splits to the next pane needing attention (a bell, a failed command, or an agent notice).
 - A ring of the last eight exited panes keeps the final screen and exit code, so a session that fails on startup is still diagnosable.
@@ -26,7 +27,8 @@ Working today:
 Not built yet:
 
 - No config file. Font, colours, and palette are compile-time constants. TOML with live reload is M1.
-- No shell integration snippets shipped. OSC 133 tracking works only if your shell emits the markers, so prompt jumping and command-output capture need manual setup for now.
+- No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
+- fish 4 waits for terminal capability queries to be answered before it becomes responsive; whether mutiny answers all of them is not yet verified.
 - Split ratios are stored but not applied; splits render at the GTK default and drags are not persisted.
 - No Kitty graphics, no drag-to-detach gestures, no OSC 777 notifications, no IME or font fallback chain.
 - Rendering repaints every cell. The damage-tracking API exists but is unwired.
@@ -159,7 +161,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 42 tests, no display required
+cargo test                    # 46 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

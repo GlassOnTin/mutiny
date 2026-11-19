@@ -17,6 +17,8 @@ use alacritty_terminal::tty::{
 use alacritty_terminal::vte::ansi::Processor;
 use serde::{Deserialize, Serialize};
 
+use crate::shell_integration;
+
 const MAX_COMMAND_RECORDS: usize = 64;
 const MAX_PROMPT_MARKERS: usize = 256;
 const MAX_OSC_LEN: usize = 8192;
@@ -320,8 +322,48 @@ impl PaneEngine {
         env.insert(String::from("TERM_PROGRAM"), String::from("mutiny"));
         env.insert(String::from("MUTINY_PANE_ID"), pane_id_num.to_string());
 
+        // Resolve the program so integration can be classified. When we ship
+        // nothing for it, fall through to alacritty's own default resolution
+        // so existing behavior is unchanged.
+        let resolved = match &shell_override {
+            Some((prog, args)) => Some((prog.clone(), args.clone())),
+            None => std::env::var("SHELL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| (s, Vec::new())),
+        };
+
+        let mut shell = None;
+        let mut injected = false;
+        if let Some((prog, args)) = &resolved {
+            let kind = shell_integration::classify(prog);
+            if kind != shell_integration::ShellKind::Other {
+                let dir = shell_integration::integration_dir();
+                // Best-effort: an unwritable runtime dir must not stop a pane
+                // from spawning, it only costs the integration markers.
+                match shell_integration::install_assets(&dir)
+                    .and_then(|()| shell_integration::prepare(kind, &dir, args))
+                {
+                    Ok(Some(inj)) => {
+                        for (key, value) in inj.env {
+                            env.insert(key, value);
+                        }
+                        shell = Some(Shell::new(prog.clone(), inj.args));
+                        injected = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!("warning: shell integration unavailable: {err}");
+                    }
+                }
+            }
+        }
+        if !injected {
+            shell = shell_override.map(|(prog, args)| Shell::new(prog, args));
+        }
+
         let opts = PtyOptions {
-            shell: shell_override.map(|(prog, args)| Shell::new(prog, args)),
+            shell,
             working_directory: working_directory.clone(),
             drain_on_exit: true,
             env,

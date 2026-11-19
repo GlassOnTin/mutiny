@@ -3,5 +3,6 @@ pub mod app;
 pub mod engine;
 pub mod ipc;
 pub mod mcp;
+pub mod shell_integration;
 pub mod topology;
 pub mod ui;
