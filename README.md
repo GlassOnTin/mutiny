@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 63 tests that run without a display. The GUI itself is not exercised by the automated suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with the first M1 rungs. The engine, pane mobility, and agent surface are implemented and covered by 70 tests that run without a display. The GUI itself is not exercised by the automated suite.
 
 Working today:
 
@@ -24,12 +24,13 @@ Working today:
 - One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 21 IPC verbs, 17 MCP tools, 4 MCP resources, held at parity by tests.
 - Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
+- Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 
 Not built yet:
 
 - No config editor or in-app settings UI; the TOML file is the only surface.
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
-- fish 4 waits for terminal capability queries to be answered before it becomes responsive; whether mutiny answers all of them is not yet verified.
+- No IME or font fallback yet, so CJK input, dead keys, and compose sequences do not work.
 - Split ratios are stored but not applied; splits render at the GTK default and drags are not persisted.
 - No Kitty graphics, no drag-to-detach gestures, no OSC 777 notifications, no IME or font fallback chain.
 - Rendering repaints every cell. The damage-tracking API exists but is unwired.
@@ -205,7 +206,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 63 tests, no display required
+cargo test                    # 70 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

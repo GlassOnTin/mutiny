@@ -27,7 +27,7 @@ jobs:
         run: |
           set -eu
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb zstd
+          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb zstd fish
           rustup default stable
           rustup component add clippy rustfmt
 

@@ -218,6 +218,15 @@ impl AppController {
     }
 
     fn apply_config_to_views(self: &Rc<Self>) {
+        let (bg, fg) = {
+            let cfg = self.config.borrow();
+            (cfg.background, cfg.foreground)
+        };
+        for pid in self.workspace.borrow().pane_ids() {
+            if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid) {
+                eng.set_reported_colors(bg, fg);
+            }
+        }
         let wins: Vec<MutinyWindow> = self.ui_windows.borrow().values().cloned().collect();
         for w in wins {
             w.refresh_from_config();
@@ -421,13 +430,22 @@ impl AppController {
     }
 
     fn spawn_engine(&self, pane_id: PaneId, cwd: Option<PathBuf>) -> io::Result<PaneEngine> {
-        let (cols, rows, scrollback) = {
+        let (cols, rows, scrollback, bg, fg) = {
             let cfg = self.config.borrow();
-            (cfg.initial_cols, cfg.initial_rows, cfg.scrollback_lines)
+            (
+                cfg.initial_cols,
+                cfg.initial_rows,
+                cfg.scrollback_lines,
+                cfg.background,
+                cfg.foreground,
+            )
         };
         let size = GridSize::new(cols, rows, 9, 18);
         let shell = self.shell_override.borrow().clone();
-        PaneEngine::spawn_pty(size, cwd, shell, pane_id.0, scrollback)
+        let mut engine = PaneEngine::spawn_pty(size, cwd, shell, pane_id.0, scrollback)?;
+        // OSC 10/11 queries must answer with the colors actually rendered.
+        engine.set_reported_colors(bg, fg);
+        Ok(engine)
     }
 
     fn active_cwd(&self, win_hint: Option<WindowId>, pane_hint: Option<PaneId>) -> Option<PathBuf> {

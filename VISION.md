@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v9, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, and TOML config are shipped; the growth diagnostic below says which is which. The next rung is answering terminal capability queries (see M1).
+Status: draft v10, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, and terminal capability queries are shipped; the growth diagnostic below says which is which. The next rung is IME and font fallback (see M1).
 
 ## Thesis
 
@@ -166,13 +166,19 @@ Evidence: across three runs the maximum chunk was 176 to 233 us, 4.4% to 5.8% of
 
 Evidence: `tests/shell_integration.rs` spawns a fresh bash with an empty HOME and no shell override, and asserts OSC 133;A on the first prompt, captured output and exit 0 for a successful command, exit 1 for `false`, OSC 7 cwd, and that no dotfile was created. zsh, fish, and nushell were driven in real PTYs in an Arch container and all emit A/B/C/D with correct exit codes. Two shell-specific facts shaped the snippets: fish 4 emits OSC 133 natively, so on 4.x the snippet contributes only OSC 7 to avoid duplicating every marker; and nu has no `char escape`, so ESC is `char -i 27`.
 
-Discovered defect, not yet fixed: fish 4 blocks at startup until the terminal answers its capability queries (primary DA, cursor position report, XTVERSION, OSC 11 background, DCS terminfo). A bare PTY that stays silent leaves fish alive but unresponsive. Whether mutiny answers all of these is unverified and needs checking before fish can be called supported.
+Discovered defect, since fixed: fish 4 blocks at startup until the terminal answers its capability queries. `PaneEngine` now answers XTVERSION, OSC 10/11, and DCS terminfo, and alacritty's existing answers for primary DA, DSR, and the Kitty query are left alone. See the capability-query rung below.
 
 **Shipped rung: TOML config.** `$XDG_CONFIG_HOME/mutiny/config.toml` with a documented key set covering font, colors and the 16-entry palette, geometry, and scrollback depth. Precedence is CLI flag, then file, then built-in default, and overrides are re-applied on every reload so editing the file cannot discard a launch flag. The file is stat'd every 250 ms; font, colors, palette, and padding apply immediately to open panes (cell metrics are recomputed, which resizes the grid and PTY), while geometry and scrollback apply to new panes and windows because alacritty fixes scrollback at construction. Unknown keys are rejected, a malformed file keeps the previous config, bad colors fall back per key, and out-of-range numbers clamp. Nothing here can take the terminal down.
 
 Evidence: `tests/config_reload.rs` covers fresh-install defaults, picking up a newly created file, live font and palette edits, flags surviving a reload while unflagged keys follow the file, malformed-edit recovery, deletion reverting to defaults, and configured geometry and scrollback reaching new panes. `src/config.rs` unit tests cover parsing, precedence, clamping, path resolution, and mtime detection.
 
-**Next rung: answer terminal capability queries.** The shell-integration rung found that fish 4 blocks at startup until the terminal answers primary DA, cursor position report, XTVERSION, OSC 11 background, and DCS terminfo queries. That is a protocol correctness gap in the engine, not a shell problem, and it makes a shell we ship integration for unusable. Answer the queries mutiny can answer honestly and decline the rest, then verify fish starts responsively.
+**Shipped rung: terminal capability queries.** `PaneEngine` now answers the queries alacritty leaves unanswered: XTVERSION (`DCS >| mutiny <version> ST`), OSC 10/11 color queries (reporting the configured foreground and background, scaled to xterm's 16 bits per channel), and DCS terminfo. Primary DA, secondary DA, DSR cursor position and status, and the Kitty keyboard query were already answered by alacritty and are deliberately not answered twice; a test asserts each gets exactly one reply.
+
+Terminfo answers only what mutiny can truthfully claim. `query-os-name` returns `linux` because mutiny is Linux-only; everything else is declined with `DCS 0 + r ST`, which is a valid answer that unblocks the caller. Silence is what blocks it.
+
+Evidence: `tests/terminal_queries.rs` asserts each reply's exact bytes, that queries split across reads are still answered, that ordinary output produces no replies, and that a real fish 4 starts, receives answers, and executes a command. The fish assertion counts replies rather than only checking that fish ran, because some fish versions time out their queries and proceed anyway; disabling the responses makes the test fail with zero replies. CI installs fish so the assertion runs against Arch's fish 4.9 rather than skipping.
+
+**Next rung: IME and font fallback.** `map_gdk_key` falls back to `keyval.to_unicode()` with no `GtkIMContext`, so CJK input, dead keys, and compose sequences do not work, and there is no font fallback chain for CJK, emoji, or box-drawing glyphs. For a terminal claiming first-class desktop citizenship this is a correctness gap, not a nicety.
 
 - Kitty graphics placements in `PaneEngine` plus `GtkSnapshot` texture nodes, and `present-media` for inline agent overlays.
 - Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.
@@ -180,7 +186,7 @@ Evidence: `tests/config_reload.rs` covers fresh-install defaults, picking up a n
 - Text input correctness: `GtkIMContext` for IME and dead keys, and a font fallback chain for CJK, emoji, and box-drawing glyphs.
 - Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: a fresh install reads config, an image renders inline, a CJK or accented compose sequence types correctly, and fish starts responsively in mutiny rather than blocking on unanswered terminal queries.
+Done when: an image renders inline, a CJK or accented compose sequence types correctly, and drag-to-detach works. Config, shell integration, chunked search, and fish startup are already met.
 
 ### M2: persistence and reach *(forward-looking)*
 

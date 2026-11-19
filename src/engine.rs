@@ -14,7 +14,7 @@ use alacritty_terminal::term::{ClipboardType, Config as TermConfig, TermDamage, 
 use alacritty_terminal::tty::{
     self, ChildEvent, EventedPty, EventedReadWrite, Options as PtyOptions, Pty, Shell,
 };
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use serde::{Deserialize, Serialize};
 
 use crate::shell_integration;
@@ -22,6 +22,29 @@ use crate::shell_integration;
 const MAX_COMMAND_RECORDS: usize = 64;
 const MAX_PROMPT_MARKERS: usize = 256;
 const MAX_OSC_LEN: usize = 8192;
+const MAX_QUERY_LEN: usize = 4096;
+
+/// Terminal capability queries alacritty does not answer. Primary DA, secondary
+/// DA, DSR (cursor position and status), and the Kitty keyboard query are
+/// already handled by alacritty and must not be answered twice.
+#[derive(Debug, Default)]
+enum QueryScanState {
+    #[default]
+    Ground,
+    SawEsc,
+    Csi {
+        buf: Vec<u8>,
+    },
+    Dcs {
+        buf: Vec<u8>,
+        saw_esc: bool,
+    },
+}
+
+enum QueryKind {
+    XtVersion,
+    Terminfo(Vec<u8>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridSize {
@@ -263,6 +286,14 @@ pub struct PaneEngine {
     agent_notice: Option<String>,
     command_running: bool,
     osc_state: OscScanState,
+    query_state: QueryScanState,
+    /// Colors reported for OSC 10/11 queries. The controller sets these from
+    /// config so a query answers with what is actually on screen.
+    reported_bg: Rgb,
+    reported_fg: Rgb,
+    /// Count of capability-query replies emitted. Diagnostics and tests use it
+    /// to prove a querying program actually received answers.
+    query_replies_sent: usize,
     active_cmd_start: Option<ActiveCommandStart>,
     commands: VecDeque<CommandRecord>,
     prompt_lines_from_top: VecDeque<i32>,
@@ -304,6 +335,18 @@ impl PaneEngine {
             agent_notice: None,
             command_running: false,
             osc_state: OscScanState::Ground,
+            query_state: QueryScanState::Ground,
+            reported_bg: Rgb {
+                r: 0x16,
+                g: 0x18,
+                b: 0x1d,
+            },
+            reported_fg: Rgb {
+                r: 0xe6,
+                g: 0xe9,
+                b: 0xef,
+            },
+            query_replies_sent: 0,
             active_cmd_start: None,
             commands: VecDeque::new(),
             prompt_lines_from_top: VecDeque::new(),
@@ -385,6 +428,24 @@ impl PaneEngine {
 
     pub fn pty_raw_fd(&self) -> Option<i32> {
         self.pty.as_ref().map(|pty| pty.file().as_raw_fd())
+    }
+
+    /// Bytes queued for the PTY but not yet flushed by `drain_pty`. Exposed for
+    /// tests and diagnostics of the query-response path.
+    pub fn pending_pty_writes(&self) -> &[u8] {
+        &self.pending_pty_writes
+    }
+
+    /// Sets the colors answered for OSC 10/11 queries. Called at spawn and on
+    /// config reload so the answer matches what is rendered.
+    /// Number of capability-query replies emitted since construction.
+    pub fn query_replies_sent(&self) -> usize {
+        self.query_replies_sent
+    }
+
+    pub fn set_reported_colors(&mut self, background: Rgb, foreground: Rgb) {
+        self.reported_bg = background;
+        self.reported_fg = foreground;
     }
 
     pub fn title(&self) -> &str {
@@ -662,6 +723,10 @@ impl PaneEngine {
             self.last_output_at = Some(Instant::now());
         }
         let mut notifications = Vec::new();
+        // Answer capability queries alacritty leaves unanswered. Runs over the
+        // same bytes with its own state, so it survives chunk boundaries and
+        // does not disturb the OSC slicing below.
+        self.scan_queries(bytes);
         let mut chunk_start = 0usize;
 
         for (idx, &b) in bytes.iter().enumerate() {
@@ -720,6 +785,80 @@ impl PaneEngine {
         notifications
     }
 
+    /// Recognizes XTVERSION (`CSI > q`) and DCS terminfo (`DCS + q ... ST`)
+    /// queries. Primary DA, DSR, and the Kitty keyboard query are deliberately
+    /// not matched here: alacritty already answers them, and answering twice
+    /// would confuse the querying program.
+    fn scan_queries(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            let mut completed: Option<QueryKind> = None;
+            match &mut self.query_state {
+                QueryScanState::Ground => {
+                    if b == 0x1b {
+                        self.query_state = QueryScanState::SawEsc;
+                    }
+                }
+                QueryScanState::SawEsc => match b {
+                    b'[' => {
+                        self.query_state = QueryScanState::Csi {
+                            buf: Vec::with_capacity(16),
+                        }
+                    }
+                    b'P' => {
+                        self.query_state = QueryScanState::Dcs {
+                            buf: Vec::with_capacity(64),
+                            saw_esc: false,
+                        }
+                    }
+                    _ => self.query_state = QueryScanState::Ground,
+                },
+                QueryScanState::Csi { buf } => {
+                    if (0x40..=0x7e).contains(&b) {
+                        let params = std::mem::take(buf);
+                        self.query_state = QueryScanState::Ground;
+                        // XTVERSION is CSI > 0 q or CSI > q.
+                        if b == b'q' && params.starts_with(b">") {
+                            completed = Some(QueryKind::XtVersion);
+                        }
+                    } else if buf.len() < MAX_QUERY_LEN {
+                        buf.push(b);
+                    }
+                }
+                QueryScanState::Dcs { buf, saw_esc } => {
+                    if *saw_esc && b == b'\\' {
+                        buf.pop(); // drop the ESC before the backslash
+                        let payload = std::mem::take(buf);
+                        self.query_state = QueryScanState::Ground;
+                        if let Some(rest) = payload.strip_prefix(b"+q") {
+                            completed = Some(QueryKind::Terminfo(rest.to_vec()));
+                        }
+                    } else if b == 0x18 || b == 0x1a {
+                        self.query_state = QueryScanState::Ground;
+                    } else {
+                        *saw_esc = b == 0x1b;
+                        if buf.len() < MAX_QUERY_LEN {
+                            buf.push(b);
+                        }
+                    }
+                }
+            }
+            if let Some(kind) = completed {
+                self.reply_to_query(kind);
+            }
+        }
+    }
+
+    fn reply_to_query(&mut self, kind: QueryKind) {
+        let reply = match kind {
+            QueryKind::XtVersion => {
+                format!("\x1bP>|mutiny {}\x1b\\", env!("CARGO_PKG_VERSION"))
+            }
+            QueryKind::Terminfo(names) => terminfo_reply(&names),
+        };
+        self.pending_pty_writes.extend_from_slice(reply.as_bytes());
+        self.query_replies_sent += 1;
+    }
+
     fn handle_osc_payload(&mut self, payload: &[u8], out: &mut Vec<EngineNotification>) {
         let Ok(text) = std::str::from_utf8(payload) else {
             return;
@@ -739,6 +878,24 @@ impl PaneEngine {
                 if let Some(state) = parse_osc9_progress(rest) {
                     self.progress = state;
                 }
+            }
+            // OSC 10/11 color queries. alacritty does not answer these, and
+            // fish 4 blocks at startup waiting for the background color.
+            "10" | "11" if rest.trim() == "?" => {
+                let rgb = if code == "11" {
+                    self.reported_bg
+                } else {
+                    self.reported_fg
+                };
+                // xterm reports 16 bits per channel; scale 8-bit by 257.
+                let reply = format!(
+                    "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                    u16::from(rgb.r) * 257,
+                    u16::from(rgb.g) * 257,
+                    u16::from(rgb.b) * 257
+                );
+                self.pending_pty_writes.extend_from_slice(reply.as_bytes());
+                self.query_replies_sent += 1;
             }
             _ => {}
         }
@@ -1397,6 +1554,54 @@ fn encode_function_key(n: u8, mod_param: u8) -> Vec<u8> {
         11 => encode_tilde_key(23, mod_param),
         12 => encode_tilde_key(24, mod_param),
         _ => Vec::new(),
+    }
+}
+
+fn hex_encode(text: &str) -> String {
+    text.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(hex: &str) -> Option<String> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Answers a DCS +q terminfo query. Capability names arrive hex-encoded and
+/// semicolon-separated. We answer only what we can truthfully claim; anything
+/// else is declined with `DCS 0 + r ST`, which is a valid answer and unblocks
+/// the querying program rather than leaving it waiting.
+fn terminfo_reply(hex_names: &[u8]) -> String {
+    let Ok(text) = std::str::from_utf8(hex_names) else {
+        return String::from("\x1bP0+r\x1b\\");
+    };
+    let mut supported = Vec::new();
+    for name_hex in text.split(';') {
+        if name_hex.is_empty() {
+            continue;
+        }
+        let Some(name) = hex_decode(name_hex) else {
+            continue;
+        };
+        // mutiny is Linux-only, so this one is a fact rather than a guess.
+        if name == "query-os-name" {
+            supported.push(format!("{name_hex}={}", hex_encode("linux")));
+        }
+    }
+    if supported.is_empty() {
+        String::from("\x1bP0+r\x1b\\")
+    } else {
+        format!("\x1bP1+r{}\x1b\\", supported.join(";"))
     }
 }
 
