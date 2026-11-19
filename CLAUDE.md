@@ -251,7 +251,8 @@ These look closer to done than they are:
 - **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
 - **No in-app settings UI.** The TOML file is the only config surface.
 - **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Processes are never restored, by contract.
-- **No quick terminal or HTTP MCP listener yet (M2).**
+- **No quick terminal yet (M2).**
+- **The HTTP MCP carrier is a slice.** No SSE, session management, or DELETE. Requests are stateless, so every call audits as `http-peer`. All HTTP clients share one `PeerIdentity`, so a session grant under `ask` covers all of them; `paired` or `observe-only` is the honest configuration until per-peer identity exists. Verified over loopback and a named loopback-range address, not against a real Haven client over a tunnel.
 - **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.
 - **Tests skip when prerequisites are absent.** CI installs fish and asserts `fish --version`, and runs under Xvfb with CJK/emoji fonts, so the fish, IME, and graphics render tests execute there. Locally the fish test needs `MUTINY_TEST_FISH` or fish on PATH, and the GTK tests need a display.
 - **The release workflow is unexercised.** `.github/workflows/release.yml` is tag-triggered and gated on CI, but no tag has been pushed.
