@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Pure Rust + GTK4 Linux desktop terminal with pane mobility and IPC parity"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/GlassOnTin/mutiny"
 
 [dependencies]
 alacritty_terminal = "0.26.0"

@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  # Hard gate: the release job cannot start unless every CI job passes on the
+  # tagged commit. Same checks as a push to main, not a reduced subset.
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build and publish Linux artifacts
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install GTK 4.22+, Rust, git, gh
+        run: |
+          set -eu
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed git gtk4 rustup github-cli
+          rustup default stable
+
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the crate version
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag $tag, Cargo.toml version $ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package artifact
+        run: |
+          set -eu
+          name="mutiny-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/mutiny "dist/$name/"
+          cp LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          cat > notes.md <<'NOTES'
+          Linux x86_64 build of mutiny, a pure Rust + gtk4-rs desktop terminal.
+
+          Runtime requirements:
+          - GTK 4.22 or newer (the crate enables the gtk4-rs v4_22 feature)
+          - Wayland or X11
+          - glibc at least as new as the Arch Linux build host
+
+          The binary is dynamically linked against the build host's GTK, so it
+          may not start on distributions with an older GTK or glibc. Building
+          from source is the reliable path on those:
+
+              cargo build --release
+
+          Identifiers are stable regardless of the public product name:
+          dev.mutiny.Terminal, MUTINY_SOCKET, MUTINY_PANE_ID, ui://mutiny/*.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mutiny $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

@@ -1191,8 +1191,8 @@ mod tests {
     #[test]
     fn tracks_osc7_cwd_and_osc9_progress() {
         let mut engine = PaneEngine::new_headless(40, 5);
-        engine.advance_bytes(b"\x1b]7;file://myhost/home/ian/Code/my%20repo\x1b\\");
-        assert_eq!(engine.cwd(), Some(Path::new("/home/ian/Code/my repo")));
+        engine.advance_bytes(b"\x1b]7;file://myhost/home/user/Code/my%20repo\x1b\\");
+        assert_eq!(engine.cwd(), Some(Path::new("/home/user/Code/my repo")));
 
         engine.advance_bytes(b"\x1b]9;4;1;65\x07");
         assert_eq!(engine.progress(), ProgressState::Normal(65));

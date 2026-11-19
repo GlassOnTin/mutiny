@@ -2,44 +2,97 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  # Reusable so the release workflow can gate on the same checks.
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  headless:
+  check:
+    name: fmt, clippy, tests
     runs-on: ubuntu-latest
-    # GTK 4.22 is required by the crate's v4_22 feature. Arch carries it;
-    # the Ubuntu runner's own GTK is too old.
-    container: archlinux:base-devel
+    # The crate needs GTK 4.22+. Ubuntu runners ship an older GTK, so build in
+    # Arch, which carries gtk4 4.24. base-devel does NOT include git, so it is
+    # installed explicitly before checkout.
+    container:
+      image: archlinux:base-devel
     steps:
+      - name: Install GTK 4.22+, Rust, git, Xvfb
+        run: |
+          set -eu
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed git gtk4 rustup xorg-server-xvfb
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - name: Require GTK 4.22 or newer
+        run: |
+          set -eu
+          ver=$(pkg-config --modversion gtk4)
+          echo "gtk4 $ver"
+          if [ "$(printf '%s\n' 4.22 "$ver" | sort -V | head -1)" != "4.22" ]; then
+            echo "::error::gtk4 $ver is older than the required 4.22"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
-
-      - name: Mark checkout safe for git in the container
-        run: git config --global --add safe.directory '*'
-
-      - name: Install GTK4, Rust, and a virtual X server
-        run: pacman -Syu --noconfirm --needed gtk4 rustup xorg-server-xvfb
-
-      - name: Select stable toolchain
-        run: rustup default stable
 
       - name: Format
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      # The suite must pass with no display at all: this is the property that
-      # lets engine, topology, IPC, and MCP work be tested without a desktop.
+      # Must pass with no display at all: this is the property that lets
+      # engine, topology, IPC, and MCP work be tested without a desktop.
       - name: Tests (no display)
-        run: cargo test
+        run: cargo test --locked
         env:
           WAYLAND_DISPLAY: ""
           DISPLAY: ""
 
       # Under Xvfb the GTK-dependent assertions actually run, including the
-      # accelerator-syntax check that a displayless run silently skips.
-      - name: Tests (virtual display, exercises GTK assertions)
-        run: xvfb-run -a cargo test
+      # accelerator-syntax check a displayless run silently skips.
+      - name: Tests (virtual display)
+        run: xvfb-run -a cargo test --locked
 
       - name: Baseline benchmark builds
-        run: cargo bench --no-run
+        run: cargo bench --locked --no-run
+
+  build:
+    name: release build
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install GTK 4.22+, Rust, git
+        run: |
+          set -eu
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed git gtk4 rustup
+          rustup default stable
+
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Smoke test the built CLI
+        run: |
+          set -eu
+          ./target/release/mutiny --version
+          ./target/release/mutiny ctl --help
+          ./target/release/mutiny mcp --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutiny-linux-x86_64
+          path: target/release/mutiny
+          if-no-files-found: error
+          retention-days: 14
