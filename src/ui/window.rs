@@ -185,6 +185,33 @@ impl MutinyWindow {
         content_slot.set_hexpand(true);
         content_slot.set_vexpand(true);
 
+        // Drag-to-detach: dropping a tab on the terminal area detaches that
+        // tab's active pane into its own window, via the existing detach verb.
+        let detach_drop = gtk4::DropTarget::new(glib::Type::U64, gdk::DragAction::MOVE);
+        let ctrl_detach = Rc::downgrade(&controller);
+        let win_for_detach = window_id;
+        detach_drop.connect_drop(move |_, value, _, _| {
+            let Ok(dragged) = value.get::<u64>() else {
+                return false;
+            };
+            let Some(c) = ctrl_detach.upgrade() else {
+                return false;
+            };
+            let pane = c
+                .workspace
+                .borrow()
+                .window(win_for_detach)
+                .and_then(|w| w.tabs.iter().find(|t| t.id == TabId(dragged)))
+                .map(|t| t.active_pane);
+            match pane {
+                // A sole pane in a sole window has nothing to detach from;
+                // detach_split reports that and the drop is a no-op.
+                Some(p) => c.detach_split(Some(p)).is_ok(),
+                None => false,
+            }
+        });
+        content_slot.add_controller(detach_drop);
+
         let root_vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root_vbox.append(&menubar);
         root_vbox.append(&chrome_bar);
@@ -482,6 +509,33 @@ impl MutinyWindow {
                     }
                 }
             });
+            // Drag-to-reorder: the tab carries its id, and dropping it on
+            // another tab moves it to that index. Same model operation the
+            // keyboard verbs use, so behavior cannot diverge.
+            let drag = gtk4::DragSource::new();
+            drag.set_actions(gdk::DragAction::MOVE);
+            let dragged_id = tid.0;
+            drag.connect_prepare(move |_, _, _| {
+                Some(gdk::ContentProvider::for_value(&glib::Value::from(
+                    dragged_id,
+                )))
+            });
+            btn.add_controller(drag);
+
+            let drop = gtk4::DropTarget::new(glib::Type::U64, gdk::DragAction::MOVE);
+            let ctrl_drop = Rc::downgrade(&ctrl);
+            let win_for_drop = self.inner.window_id;
+            drop.connect_drop(move |_, value, _, _| {
+                if let Ok(dragged) = value.get::<u64>()
+                    && let Some(c) = ctrl_drop.upgrade()
+                {
+                    c.reorder_tab(win_for_drop, TabId(dragged), idx);
+                    return true;
+                }
+                false
+            });
+            btn.add_controller(drop);
+
             self.inner.tab_buttons_box.append(&btn);
             self.inner.tab_buttons.borrow_mut().push((tid, btn));
         }
@@ -494,7 +548,8 @@ impl MutinyWindow {
         self.inner.pane_views.borrow_mut().clear();
 
         let mut views_map = HashMap::new();
-        let tree_widget = build_split_widget(&active_tree, &ctrl, &mut views_map);
+        let tree_widget =
+            build_split_widget(&active_tree, &ctrl, &mut views_map, active_tab_id, &[]);
         self.inner.content_slot.append(&tree_widget);
         let focus_view = views_map.get(&active_pane_id).cloned();
         *self.inner.pane_views.borrow_mut() = views_map;
@@ -914,10 +969,12 @@ fn make_action_button(label: &str, action_name: &str, tooltip: &str) -> gtk4::Bu
     btn
 }
 
-fn build_split_widget(
+pub fn build_split_widget(
     node: &SplitNode,
     ctrl: &Rc<AppController>,
     views_out: &mut HashMap<PaneId, TerminalView>,
+    tab_id: TabId,
+    path: &[bool],
 ) -> gtk4::Widget {
     match node {
         SplitNode::Leaf(pane_id) => {
@@ -927,9 +984,9 @@ fn build_split_widget(
         }
         SplitNode::Split {
             axis,
+            ratio,
             first,
             second,
-            ..
         } => {
             let orientation = match axis {
                 SplitAxis::Horizontal => gtk4::Orientation::Horizontal,
@@ -939,14 +996,67 @@ fn build_split_widget(
             paned.set_wide_handle(true);
             paned.set_hexpand(true);
             paned.set_vexpand(true);
-            let child1 = build_split_widget(first, ctrl, views_out);
-            let child2 = build_split_widget(second, ctrl, views_out);
+            let mut path_first = path.to_vec();
+            path_first.push(false);
+            let mut path_second = path.to_vec();
+            path_second.push(true);
+            let child1 = build_split_widget(first, ctrl, views_out, tab_id, &path_first);
+            let child2 = build_split_widget(second, ctrl, views_out, tab_id, &path_second);
             paned.set_start_child(Some(&child1));
             paned.set_end_child(Some(&child2));
             paned.set_resize_start_child(true);
             paned.set_resize_end_child(true);
             paned.set_shrink_start_child(false);
             paned.set_shrink_end_child(false);
+
+            let horizontal = *axis == SplitAxis::Horizontal;
+            let total_of = move |p: &gtk4::Paned| {
+                if horizontal { p.width() } else { p.height() }
+            };
+
+            // Apply the stored ratio once the paned has a real allocation.
+            // `map` fires before size allocation, so a tick callback waits for
+            // a non-zero size and then applies exactly once.
+            let stored = *ratio;
+            let applying = Rc::new(std::cell::Cell::new(false));
+            let applying_tick = Rc::clone(&applying);
+            let total_tick = total_of;
+            let applied = Rc::new(std::cell::Cell::new(false));
+            let applied_tick = Rc::clone(&applied);
+            paned.add_tick_callback(move |p, _| {
+                if applied_tick.get() {
+                    return glib::ControlFlow::Break;
+                }
+                let total = total_tick(p);
+                if total <= 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                applying_tick.set(true);
+                p.set_position((stored * f64::from(total)) as i32);
+                applying_tick.set(false);
+                applied_tick.set(true);
+                glib::ControlFlow::Break
+            });
+
+            // Write user drags back to the tree so the ratio survives rebuilds.
+            let ctrl_weak = Rc::downgrade(ctrl);
+            let path_owned = path.to_vec();
+            let applying_notify = Rc::clone(&applying);
+            let total_notify = total_of;
+            paned.connect_notify_local(Some("position"), move |p, _| {
+                if applying_notify.get() {
+                    return;
+                }
+                let total = total_notify(p);
+                if total <= 0 {
+                    return;
+                }
+                let ratio = f64::from(p.position()) / f64::from(total);
+                if let Some(c) = ctrl_weak.upgrade() {
+                    c.set_split_ratio(tab_id, &path_owned, ratio);
+                }
+            });
+
             paned.upcast::<gtk4::Widget>()
         }
     }

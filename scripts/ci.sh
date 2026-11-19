@@ -11,7 +11,10 @@ echo "== cargo clippy --all-targets -- -D warnings =="
 cargo clippy --all-targets -- -D warnings
 
 echo "== cargo test (no display) =="
-env -u WAYLAND_DISPLAY -u DISPLAY cargo test
+# Empty, not unset: unsetting WAYLAND_DISPLAY makes GTK fall back to the
+# default wayland-0 socket and connect to the user's session anyway. CI sets
+# these empty, so match it exactly.
+WAYLAND_DISPLAY= DISPLAY= GDK_BACKEND=x11 cargo test
 
 echo "== cargo bench --no-run =="
 cargo bench --no-run

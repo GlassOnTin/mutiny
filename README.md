@@ -9,14 +9,14 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 84 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0 and M0.5 are shipped, along with several M1 rungs. The engine, pane mobility, and agent surface are covered by 89 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
 - `alacritty_terminal` 0.26 engine with a PTY per pane, 10 000 lines of scrollback, and line-level search.
 - OSC 133 command journal, OSC 7 working directory, OSC 9;4 progress, OSC 8 hyperlinks, OSC 52 clipboard.
 - Shell integration bundled for bash, zsh, fish, and nushell, injected automatically at spawn. A fresh install gets prompt jumping, command-output capture, and exit-code reporting without editing any dotfile.
-- Binary split trees and tabs. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback.
+- Binary split trees and tabs. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback. Divider positions are stored, applied, and written back on drag; tabs drag to reorder, and dragging a tab onto the terminal area detaches it.
 - `urgent-next` jumps across windows, tabs, and splits to the next pane needing attention (a bell, a failed command, or an agent notice).
 - A ring of the last eight exited panes keeps the final screen and exit code, so a session that fails on startup is still diagnosable.
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
@@ -32,8 +32,8 @@ Not built yet:
 
 - No config editor or in-app settings UI; the TOML file is the only surface.
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
-- Split ratios are stored but not applied; splits render at the GTK default and drags are not persisted.
-- No drag-to-reorder or drag-to-detach gestures, and split ratios are not applied yet.
+- Split ratios persist within the session but not across restarts; that arrives with session restore.
+- Drag gestures work, but their GTK wiring is not covered by tests (the model operations they call are).
 - No OSC 777 desktop notifications.
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Rendering repaints every cell. The damage-tracking API exists but is unwired.
@@ -223,7 +223,7 @@ One limit is worth stating plainly: same-uid processes are mutually trusted unde
 ## Development
 
 ```sh
-cargo test                    # 84 tests, no display required
+cargo test                    # 89 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

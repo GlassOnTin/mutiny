@@ -552,6 +552,27 @@ impl AppController {
         Ok(dst_win)
     }
 
+    /// Writes a divider ratio from a user drag. Deliberately does not rebuild
+    /// the window: rebuilding mid-drag would fight the gesture and lose the
+    /// handle position.
+    pub fn set_split_ratio(&self, tab_id: TabId, path: &[bool], ratio: f64) -> bool {
+        self.workspace
+            .borrow_mut()
+            .set_split_ratio(tab_id, path, ratio)
+    }
+
+    /// Drag-to-reorder: moves a tab within its window and rebuilds the strip.
+    pub fn reorder_tab(self: &Rc<Self>, win_id: WindowId, tab_id: TabId, new_index: usize) {
+        if self
+            .workspace
+            .borrow_mut()
+            .reorder_tab(win_id, tab_id, new_index)
+            .is_ok()
+        {
+            self.sync_ui_window(win_id);
+        }
+    }
+
     pub fn close_pane(self: &Rc<Self>, pane_id: PaneId) {
         let src_win = self.workspace.borrow().locate_pane(pane_id).map(|(w, _)| w);
         let _dropped = self.workspace.borrow_mut().close_pane(pane_id);

@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v12, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, and the Kitty graphics slice are shipped; the growth diagnostic below says which is which. The next rung is split ratios and drag gestures (see M1).
+Status: draft v13, 2026-11-19. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, and split ratios with drag gestures are shipped; the growth diagnostic below says which is which. The next rung is OSC 777 notifications (see M1).
 
 ## Thesis
 
@@ -194,13 +194,22 @@ Scope deliberately excluded: animation frames, file and shared-memory transmissi
 
 **Carried follow-up, now done:** CI asserts `fish --version` so the fish startup test cannot silently skip if the package install fails.
 
-**Next rung: split ratios and drag gestures.** `SplitNode.ratio` is stored but never applied to the `GtkPaned`, and user drags are not written back, so splits always render at GTK's default. Drag-to-reorder and drag-to-detach complete the pane mobility story that is mutiny's headline feature.
+**Shipped rung: split ratios and drag gestures.** `SplitNode.ratio` is now applied to the `GtkPaned` and user drags are written back to the tree, so a divider position survives widget rebuilds, tab switches, detach, and move. Ratios clamp to 0.05..0.95 so a pane can never be dragged out of existence. Application waits for a real allocation via a tick callback, because `map` fires before size allocation and applying there silently left the default 50/50.
 
-- Drag-to-reorder and drag-to-detach over the existing keyboard mobility verbs; split ratios applied and persisted.
+Tab buttons carry a `DragSource` with the tab id and a `DropTarget` for reorder; the content area carries a `DropTarget` that detaches the dragged tab's active pane through the existing `detach_split` verb. Drag therefore invokes the same model operations as the keyboard verbs, so the two cannot diverge.
+
+Evidence: `tests/split_ratios.rs` asserts under Xvfb that a split stored at 0.30 renders at 0.300, that moving the divider writes 0.620 back to the tree, and that a rebuild reapplies the persisted ratio. Headless tests cover path-targeted ratio writes, clamping, persistence across detach/move/further splits, tab reorder with index clamping, and the controller operations the drag handlers call.
+
+Persistence is within the workspace model, which is what survives rebuilds and reparenting. Cross-restart persistence arrives with session restore in M2; there is no config or state file for geometry yet.
+
+The GTK gesture wiring itself is not driven by tests: synthesizing a real drag needs a seat and a compositor. The model operations it invokes are tested, and the ratio write-back is tested by moving the divider programmatically, which is what the handle does.
+
+**Next rung: OSC 777 notifications.** Wire OSC 777 to the desktop notification portal with tab badges, completing the notification path of the presence contract.
+
 - OSC 777 notifications through the desktop portal, with tab badges.
 - Wire the existing damage API (`has_damaged_lines`, `reset_damage`) into the redraw path, or drop the claim from this document.
 
-Done when: drag-to-detach works and split ratios persist. Config, shell integration, chunked search, fish startup, CJK compose, and inline images are already met.
+Done when: an OSC 777 notification reaches the desktop and badges its tab. Config, shell integration, chunked search, fish startup, CJK compose, inline images, split ratios, and drag gestures are already met.
 
 ### M2: persistence and reach *(forward-looking)*
 

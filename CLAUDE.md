@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v12). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, and the Kitty graphics slice are shipped. The next rung is split ratios and drag gestures, then OSC 777 and damage tracking. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v13). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, and split ratios with drag gestures are shipped. The next rung is OSC 777 notifications, then damage tracking. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 84 tests: 52 unit + 7 config + 11 e2e + 1 ime + 5 graphics + 1 shell + 7 queries
+cargo test                               # 89 tests: 55 unit + 7 config + 11 e2e + 1 ime + 5 graphics + 2 ratios + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test detach_split                  # single test, by name substring
 cargo clippy --all-targets -- -D warnings
@@ -92,6 +92,16 @@ Two mechanisms, matching the two sequence families. OSC 10/11 ride the existing 
 OSC 10/11 report `reported_bg` / `reported_fg`, which the controller sets from config at spawn and on reload via `set_reported_colors`, so the answer matches what is rendered. Terminfo answers only `query-os-name` (linux, a fact) and declines everything else with `DCS 0 + r ST`. A decline is a valid answer that unblocks the caller; silence is what blocks it. Do not claim capabilities the engine has not been shown to implement.
 
 `query_replies_sent()` counts replies. The fish startup test asserts it is non-zero, which is what makes the test discriminate: some fish versions time out their queries and proceed anyway, so "fish ran a command" alone passes even with responses disabled.
+
+### Split ratios and drag gestures
+
+`SplitNode.ratio` is applied to the `GtkPaned` and written back on `notify::position`, so a drag survives rebuilds. Use `connect_notify_local`, not `connect_notify`: the latter requires a Send closure and `AppController` is Rc.
+
+Apply the ratio with a tick callback that waits for a non-zero allocation, not `connect_map`. `map` fires before size allocation, so applying there reads total 0 and silently leaves the default 50/50. Guard the write-back handler with an `applying` flag so applying a ratio does not round-trip back into the model.
+
+`build_split_widget` takes a `tab_id` and a path of first(false)/second(true) choices identifying each split. Widgets are rebuilt on every topology change, so a path stays valid for a widget's lifetime.
+
+Drag invokes the same model operations as the keyboard verbs: tab `DragSource`/`DropTarget` call `reorder_tab`, and the content area's `DropTarget` calls `detach_split`. Keep it that way so gesture and keyboard behavior cannot diverge. Ratio persistence is within the workspace model; cross-restart persistence is M2 session restore.
 
 ### Kitty graphics
 
@@ -192,12 +202,12 @@ Selection follows the Linux model: drag sets primary selection, middle-click pas
 
 These look closer to done than they are:
 
-- **Split ratios are stored but not applied, and there are no drag gestures (next rung).** `SplitNode::Split { ratio }` survives tree surgery but `build_split_widget` never calls `set_position`, and user drags are not written back. Splits render at GTK's default.
 - **Kitty graphics is a slice.** No animation frames, file or shared-memory transmission, unicode placeholders, or cursor-movement policies. Placements drift once scrollback is capped, sharing the OSC 133 marker limitation.
 - **Damage tracking is API-only.** `has_damaged_lines` and `reset_damage` have no callers; `render_snapshot` repaints every cell, and now draws textures too.
 - **No in-app settings UI.** The TOML file is the only config surface.
-- **No session restore.** A GUI crash kills every shell; there is no multiplexer daemon by design.
+- **No session restore.** A GUI crash kills every shell; there is no multiplexer daemon by design. Split ratios persist in the model across rebuilds but not across restarts.
+- **Drag gesture wiring is untested.** The model operations and the divider write-back are tested; synthesizing a real drag needs a seat and compositor.
 - **Tests skip when prerequisites are absent.** CI installs fish and asserts `fish --version`, and runs under Xvfb with CJK/emoji fonts, so the fish, IME, and graphics render tests execute there. Locally the fish test needs `MUTINY_TEST_FISH` or fish on PATH, and the GTK tests need a display.
 - **The release workflow is unexercised.** `.github/workflows/release.yml` is tag-triggered and gated on CI, but no tag has been pushed.
 
-CI itself runs green on GitHub at `GlassOnTin/mutiny` (public, AGPL-3.0-or-later): fmt, clippy, the displayless suite, the suite under Xvfb, and a release build in an Arch container, with cargo caching keyed on rustc and GTK versions. `./scripts/ci.sh` runs the same checks locally.
+CI itself runs green on GitHub at `GlassOnTin/mutiny` (public, AGPL-3.0-or-later): fmt, clippy, the displayless suite, the suite under Xvfb, and a release build in an Arch container, with cargo caching keyed on rustc and GTK versions. `./scripts/ci.sh` runs the same checks locally. It sets `WAYLAND_DISPLAY=` and `DISPLAY=` empty rather than unsetting them: unsetting makes GTK fall back to the default `wayland-0` socket and connect to the user's session, which is not displayless.

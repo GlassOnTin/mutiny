@@ -58,6 +58,30 @@ impl SplitNode {
         }
     }
 
+    /// Sets the divider ratio at a path of `first` (false) / `second` (true)
+    /// choices from this node. Clamped so a pane can never be dragged to zero.
+    /// Returns false if the path does not land on a split.
+    pub fn set_ratio_at_path(&mut self, path: &[bool], ratio: f64) -> bool {
+        match self {
+            SplitNode::Leaf(_) => false,
+            SplitNode::Split {
+                first,
+                second,
+                ratio: slot,
+                ..
+            } => {
+                if path.is_empty() {
+                    *slot = ratio.clamp(0.05, 0.95);
+                    true
+                } else if path[0] {
+                    second.set_ratio_at_path(&path[1..], ratio)
+                } else {
+                    first.set_ratio_at_path(&path[1..], ratio)
+                }
+            }
+        }
+    }
+
     pub fn contains(&self, target: PaneId) -> bool {
         match self {
             SplitNode::Leaf(id) => *id == target,
@@ -506,6 +530,41 @@ impl Workspace {
         Ok(dst_win_id)
     }
 
+    /// Writes a divider ratio back to the tree, so a user drag survives widget
+    /// rebuilds, tab switches, and reparenting.
+    pub fn set_split_ratio(&mut self, tab_id: TabId, path: &[bool], ratio: f64) -> bool {
+        for win in &mut self.windows {
+            if let Some(tab) = win.tabs.iter_mut().find(|t| t.id == tab_id) {
+                return tab.root.set_ratio_at_path(path, ratio);
+            }
+        }
+        false
+    }
+
+    /// Moves a tab to a new index within its window, for drag-to-reorder.
+    pub fn reorder_tab(
+        &mut self,
+        win_id: WindowId,
+        tab_id: TabId,
+        new_index: usize,
+    ) -> Result<(), TopologyError> {
+        let win = self
+            .window_mut(win_id)
+            .ok_or(TopologyError::WindowNotFound(win_id))?;
+        let pos = win
+            .tabs
+            .iter()
+            .position(|t| t.id == tab_id)
+            .ok_or(TopologyError::TabNotFound(tab_id))?;
+        let target = new_index.min(win.tabs.len().saturating_sub(1));
+        if pos == target {
+            return Ok(());
+        }
+        let tab = win.tabs.remove(pos);
+        win.tabs.insert(target, tab);
+        Ok(())
+    }
+
     pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<(WindowId, TabId), TopologyError> {
         let Some((win_id, tab_id)) = self.locate_pane(pane_id) else {
             return Err(TopologyError::PaneNotFound(pane_id));
@@ -823,5 +882,129 @@ mod tests {
         assert_eq!(latest.exit_code, Some(127));
         assert_eq!(latest.screen, vec!["fatal-startup-9"]);
         assert!(ws.read_exited(Some(PaneId(1))).is_none());
+    }
+
+    #[test]
+    fn set_ratio_at_path_targets_the_right_split_and_clamps() {
+        let mut ws = Workspace::new();
+        let p1 = ws.reserve_pane_id();
+        let (_w, t1) = ws.insert_window_with_pane(p1, PaneEngine::new_headless(20, 5), true);
+        let p2 = ws.reserve_pane_id();
+        ws.split_pane_with(
+            p1,
+            SplitAxis::Horizontal,
+            p2,
+            PaneEngine::new_headless(20, 5),
+        )
+        .unwrap();
+        let p3 = ws.reserve_pane_id();
+        ws.split_pane_with(p2, SplitAxis::Vertical, p3, PaneEngine::new_headless(20, 5))
+            .unwrap();
+
+        // Root split, then the nested one under `second`.
+        assert!(ws.set_split_ratio(t1, &[], 0.3));
+        assert!(ws.set_split_ratio(t1, &[true], 0.7));
+        let root = &ws.window(_w).unwrap().tabs[0].root;
+        match root {
+            SplitNode::Split { ratio, second, .. } => {
+                assert!((ratio - 0.3).abs() < 1e-9);
+                match second.as_ref() {
+                    SplitNode::Split { ratio: r2, .. } => assert!((r2 - 0.7).abs() < 1e-9),
+                    _ => panic!("expected nested split"),
+                }
+            }
+            _ => panic!("expected root split"),
+        }
+
+        // Clamped so a pane can never be dragged away entirely.
+        ws.set_split_ratio(t1, &[], 0.0);
+        ws.set_split_ratio(t1, &[true], 1.0);
+        match &ws.window(_w).unwrap().tabs[0].root {
+            SplitNode::Split { ratio, second, .. } => {
+                assert!(*ratio >= 0.05);
+                match second.as_ref() {
+                    SplitNode::Split { ratio: r2, .. } => assert!(*r2 <= 0.95),
+                    _ => panic!(),
+                }
+            }
+            _ => panic!(),
+        }
+
+        // A path that lands on a leaf, or a missing tab, is reported false.
+        assert!(!ws.set_split_ratio(t1, &[false], 0.5));
+        assert!(!ws.set_split_ratio(t1, &[true, true, true], 0.5));
+        assert!(!ws.set_split_ratio(TabId(999), &[], 0.5));
+    }
+
+    #[test]
+    fn ratio_survives_detach_move_and_further_splits() {
+        let mut ws = Workspace::new();
+        let p1 = ws.reserve_pane_id();
+        let (w1, t1) = ws.insert_window_with_pane(p1, PaneEngine::new_headless(20, 5), true);
+        let p2 = ws.reserve_pane_id();
+        ws.split_pane_with(
+            p1,
+            SplitAxis::Horizontal,
+            p2,
+            PaneEngine::new_headless(20, 5),
+        )
+        .unwrap();
+        ws.set_split_ratio(t1, &[], 0.25);
+
+        // A further split elsewhere must not disturb the stored ratio.
+        let p3 = ws.reserve_pane_id();
+        ws.split_pane_with(p2, SplitAxis::Vertical, p3, PaneEngine::new_headless(20, 5))
+            .unwrap();
+        let ratio_of = |ws: &Workspace, w: WindowId| match &ws.window(w).unwrap().tabs[0].root {
+            SplitNode::Split { ratio, .. } => *ratio,
+            _ => panic!("expected split"),
+        };
+        assert!((ratio_of(&ws, w1) - 0.25).abs() < 1e-9);
+
+        // Detaching a pane keeps the ratio on the source tree.
+        let (w2, _t2) = ws.detach_split(p3).unwrap();
+        assert!((ratio_of(&ws, w1) - 0.25).abs() < 1e-9);
+
+        // Moving it back likewise.
+        ws.move_pane_to_tab(p3, t1, SplitAxis::Vertical).unwrap();
+        assert!((ratio_of(&ws, w1) - 0.25).abs() < 1e-9);
+        let _ = w2;
+    }
+
+    #[test]
+    fn reorder_tab_moves_and_clamps() {
+        let mut ws = Workspace::new();
+        let p1 = ws.reserve_pane_id();
+        let (w1, t1) = ws.insert_window_with_pane(p1, PaneEngine::new_headless(20, 5), true);
+        let p2 = ws.reserve_pane_id();
+        let t2 = ws
+            .insert_tab_with_pane(w1, p2, PaneEngine::new_headless(20, 5))
+            .unwrap();
+        let p3 = ws.reserve_pane_id();
+        let t3 = ws
+            .insert_tab_with_pane(w1, p3, PaneEngine::new_headless(20, 5))
+            .unwrap();
+
+        let ids = |ws: &Workspace| {
+            ws.window(w1)
+                .unwrap()
+                .tabs
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&ws), vec![t1, t2, t3]);
+
+        ws.reorder_tab(w1, t3, 0).unwrap();
+        assert_eq!(ids(&ws), vec![t3, t1, t2]);
+
+        ws.reorder_tab(w1, t3, 99).unwrap();
+        assert_eq!(ids(&ws), vec![t1, t2, t3], "index clamps to the last slot");
+
+        ws.reorder_tab(w1, t1, 0).unwrap();
+        assert_eq!(ids(&ws), vec![t1, t2, t3], "no-op move is fine");
+
+        assert!(ws.reorder_tab(w1, TabId(999), 0).is_err());
+        assert!(ws.reorder_tab(WindowId(999), t1, 0).is_err());
     }
 }
