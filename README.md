@@ -41,7 +41,7 @@ Not built yet:
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
 - Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
-- The HTTP MCP carrier is a slice: no SSE, no session management, and no per-peer identity, so all HTTP clients share one grant identity. Driven end to end from Haven on a phone over an SSH forward; WireGuard is untested.
+- The HTTP MCP carrier is a slice: no SSE, no session management, and no per-peer identity, so all HTTP clients share one grant identity. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
 
 [VISION.md](VISION.md) is the full product and architecture definition, including a growth diagnostic that says which claims are ahead of the code.
 
@@ -175,6 +175,16 @@ curl -s http://127.0.0.1:18740/mcp \
 What that run showed: no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
 
 Every one of those calls audited against the mutiny process's own pid, which is the shared-identity gap above observed from a real remote client rather than inferred.
+
+The same run was repeated over WireGuard, with the listener bound to the workstation's own tunnel address rather than loopback:
+
+```sh
+mutiny --http-bind 10.1.0.4:18740 --agent-consent paired
+```
+
+The phone, a peer on the same gateway-hosted WG server, reached `http://10.1.0.4:18740/mcp` directly with no SSH forward involved. Unpaired and wrong-token requests got `401`, the paired token got `200`, all 18 tools and all 6 resources listed (4 static plus one snapshot per live pane), a command sent from the phone executed on the desktop, and `spawn_pane` added a second pane. The audit again showed `carrier=paired` and never `operator`.
+
+A split tunnel is enough: routing only the tunnel subnet to the WG interface leaves the default route alone, so nothing else on the workstation changes.
 
 ## Configuration
 
