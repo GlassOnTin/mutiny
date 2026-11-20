@@ -9,14 +9,14 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 151 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 152 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
 - `alacritty_terminal` 0.26 engine with a PTY per pane, 10 000 lines of scrollback, and line-level search.
 - OSC 133 command journal, OSC 7 working directory, OSC 9;4 progress, OSC 8 hyperlinks, OSC 52 clipboard.
 - Shell integration bundled for bash, zsh, fish, and nushell, injected automatically at spawn. A fresh install gets prompt jumping, command-output capture, and exit-code reporting without editing any dotfile.
-- Binary split trees and tabs. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback. Divider positions are stored, applied, and written back on drag; tabs drag to reorder, and dragging a tab onto the terminal area detaches it.
+- Binary split trees and tabs. The tab strip wraps to multiple rows within the window width and scrolls past a height cap, so opening many tabs never stretches the window. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback. Divider positions are stored, applied, and written back on drag; tabs drag to reorder, and dragging a tab onto the terminal area detaches it.
 - `urgent-next` jumps across windows, tabs, and splits to the next pane needing attention (a bell, a failed command, or an agent notice).
 - A ring of the last eight exited panes keeps the final screen and exit code, so a session that fails on startup is still diagnosable.
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
@@ -242,6 +242,7 @@ initial_rows = 30              # clamped 5..200
 window_width = 980             # new windows, clamped 320..7680
 window_height = 640            # clamped 200..4320
 padding_px = 6.0               # clamped 0..64
+tab_strip_max_height_px = 96   # clamped 32..600; past this the tab strip scrolls
 
 [terminal]
 scrollback_lines = 10000       # capped at 1000000
@@ -346,7 +347,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 151 tests, no display required
+cargo test                    # 152 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

@@ -73,6 +73,9 @@ pub struct GeometryConfig {
     pub window_width: i32,
     pub window_height: i32,
     pub padding_px: f32,
+    /// Height cap for the wrapping tab strip. Past this it scrolls vertically,
+    /// so many tabs cannot squeeze the terminal out of the window.
+    pub tab_strip_max_height_px: i32,
 }
 
 impl Default for GeometryConfig {
@@ -83,6 +86,7 @@ impl Default for GeometryConfig {
             window_width: 980,
             window_height: 640,
             padding_px: 6.0,
+            tab_strip_max_height_px: 96,
         }
     }
 }
@@ -191,6 +195,7 @@ pub struct ResolvedConfig {
     pub window_width: i32,
     pub window_height: i32,
     pub padding_px: f32,
+    pub tab_strip_max_height_px: i32,
     pub scrollback_lines: usize,
     pub sessions: crate::mux::MuxOptions,
     pub session_hosts: Vec<String>,
@@ -326,6 +331,7 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
         window_width: config.geometry.window_width.clamp(320, 7680),
         window_height: config.geometry.window_height.clamp(200, 4320),
         padding_px: config.geometry.padding_px.clamp(0.0, 64.0),
+        tab_strip_max_height_px: config.geometry.tab_strip_max_height_px.clamp(32, 600),
         scrollback_lines: config.terminal.scrollback_lines.min(1_000_000),
         sessions: crate::mux::MuxOptions {
             tmux_program: config.sessions.tmux_program.clone(),

@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 151 tests: 91 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 152 tests: 91 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 tabstrip + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -272,6 +272,16 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### The tab strip wraps; it must never size the window
+
+`tab_buttons_box` is a `gtk4::FlowBox`, not a horizontal `Box`. A Box's minimum width is the SUM of its children, so seventeen tabs pushed the toplevel's minimum from 618 to 2146 px and stretched the window. A FlowBox's minimum is its widest single child, so it wraps inside the available width instead. Selection is `None` because the buttons carry the active class themselves.
+
+Wrapping trades width for height, so the FlowBox sits in a `ScrolledWindow` with horizontal scrolling off and `max_content_height` from `geometry.tab_strip_max_height_px`. Without that cap thirty-seven tabs allocated 436 px of strip and squeezed the terminal. `propagate_natural_width` stays false (a true value would reintroduce the width bug); `propagate_natural_height` is true so the strip claims up to the cap rather than collapsing.
+
+`scroll_active_tab_into_view` runs on a tick callback, like the split-ratio restore, because allocations are not ready during `rebuild_from_model`. Use `compute_bounds`, not the deprecated `WidgetExt::allocation`.
+
+`tests/tab_strip.rs` asserts the minimum width grows by at most one tab and then PLATEAUS as more tabs are added, that rows increase, that the visible strip respects the cap while its content overflows, and that clicking a wrapped tab still focuses it. The plateau assertion is the discriminating one: a sum-of-children layout cannot pass it.
 
 ### Rendering
 

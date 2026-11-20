@@ -23,7 +23,13 @@ struct MutinyWindowInner {
     window_id: WindowId,
     gtk_window: gtk4::ApplicationWindow,
     menubar: gtk4::PopoverMenuBar,
-    tab_buttons_box: gtk4::Box,
+    /// A FlowBox, not a horizontal Box: a Box's minimum width is the sum of
+    /// its children, so enough tabs stretched the whole window. A FlowBox's
+    /// minimum is its widest child, so it wraps within the window instead.
+    tab_buttons_box: gtk4::FlowBox,
+    /// Caps the wrapped strip's height so many tabs scroll rather than
+    /// squeezing the terminal. Horizontal scrolling is off: we wrap instead.
+    tab_scroller: gtk4::ScrolledWindow,
     agent_badge_btn: gtk4::Button,
     consent_bar: gtk4::Box,
     consent_label: gtk4::Label,
@@ -69,9 +75,27 @@ impl MutinyWindow {
         chrome_bar.set_margin_top(3);
         chrome_bar.set_margin_bottom(3);
 
-        let tab_buttons_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        // Wrapping tab strip. Selection is ours (the buttons carry the active
+        // class), so FlowBox's own selection is off. Wrapping is driven by the
+        // available width, not a per-row count, hence the high cap.
+        let tab_buttons_box = gtk4::FlowBox::new();
+        tab_buttons_box.set_selection_mode(gtk4::SelectionMode::None);
+        tab_buttons_box.set_homogeneous(false);
+        tab_buttons_box.set_min_children_per_line(1);
+        tab_buttons_box.set_max_children_per_line(64);
+        tab_buttons_box.set_row_spacing(4);
+        tab_buttons_box.set_column_spacing(4);
         tab_buttons_box.set_hexpand(true);
-        chrome_bar.append(&tab_buttons_box);
+        tab_buttons_box.set_valign(gtk4::Align::Start);
+        let tab_scroller = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .propagate_natural_width(false)
+            .propagate_natural_height(true)
+            .hexpand(true)
+            .child(&tab_buttons_box)
+            .build();
+        chrome_bar.append(&tab_scroller);
 
         let agent_badge_btn = make_action_button(
             "Agent: idle",
@@ -230,6 +254,7 @@ impl MutinyWindow {
                 gtk_window: gtk_window.clone(),
                 menubar,
                 tab_buttons_box,
+                tab_scroller,
                 agent_badge_btn,
                 consent_bar,
                 consent_label,
@@ -464,6 +489,128 @@ impl MutinyWindow {
         self.inner.gtk_window.close();
     }
 
+    /// Keeps the active tab visible when the wrapped strip scrolls. Allocations
+    /// are not ready during the rebuild, so this waits on a tick like the split
+    /// ratio restore does, then runs once.
+    fn scroll_active_tab_into_view(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let active = ctrl
+            .workspace
+            .borrow()
+            .window(self.inner.window_id)
+            .map(|w| w.active_tab);
+        let Some(active) = active else { return };
+        let button = self
+            .inner
+            .tab_buttons
+            .borrow()
+            .iter()
+            .find(|(tid, _)| *tid == active)
+            .map(|(_, btn)| btn.clone());
+        let Some(button) = button else { return };
+        let scroller = self.inner.tab_scroller.clone();
+        let flowbox = self.inner.tab_buttons_box.clone();
+        scroller.add_tick_callback(move |scroller, _| {
+            let Some(child) = button.parent() else {
+                return glib::ControlFlow::Break;
+            };
+            let Some(bounds) = child.compute_bounds(&flowbox) else {
+                return glib::ControlFlow::Continue;
+            };
+            if bounds.height() <= 0.0 {
+                return glib::ControlFlow::Continue;
+            }
+            let adj = scroller.vadjustment();
+            let top = adj.value();
+            let visible = adj.page_size();
+            let y = f64::from(bounds.y());
+            let bottom = y + f64::from(bounds.height());
+            if y < top {
+                adj.set_value(y);
+            } else if visible > 0.0 && bottom > top + visible {
+                adj.set_value((bottom - visible).max(0.0));
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// The toplevel's minimum horizontal size. This is what forces a window to
+    /// grow: GTK will not allocate below it, so a tab strip whose minimum is the
+    /// sum of its tabs stretches the window instead of adapting.
+    pub fn window_minimum_width(&self) -> i32 {
+        self.inner
+            .gtk_window
+            .measure(gtk4::Orientation::Horizontal, -1)
+            .0
+    }
+
+    /// The toplevel's minimum vertical size. Wrapping trades width for height,
+    /// so this must not grow without bound either.
+    pub fn window_minimum_height(&self) -> i32 {
+        self.inner
+            .gtk_window
+            .measure(gtk4::Orientation::Vertical, -1)
+            .0
+    }
+
+    /// Visible height of the strip, i.e. the scrolled viewport, not the full
+    /// wrapped content height inside it.
+    pub fn tab_strip_height(&self) -> i32 {
+        self.inner.tab_scroller.height()
+    }
+
+    /// Full wrapped content height, which may exceed the visible viewport.
+    pub fn tab_strip_content_height(&self) -> i32 {
+        self.inner.tab_buttons_box.height()
+    }
+
+    /// Distinct rows the tab strip occupies. One row means the tabs are laid
+    /// out in a single line; more than one means they wrapped.
+    pub fn tab_strip_row_count(&self) -> usize {
+        let mut rows: Vec<i32> = Vec::new();
+        let mut child = self.inner.tab_buttons_box.first_child();
+        while let Some(widget) = child {
+            let y = widget
+                .compute_bounds(&self.inner.tab_buttons_box)
+                .map(|b| b.y().round() as i32)
+                .unwrap_or(0);
+            if !rows.contains(&y) {
+                rows.push(y);
+            }
+            child = widget.next_sibling();
+        }
+        rows.len()
+    }
+
+    /// The button for a tab, so a test can drive the real clicked signal rather
+    /// than the model behind it.
+    pub fn tab_button(&self, tid: TabId) -> Option<gtk4::Button> {
+        self.inner
+            .tab_buttons
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == tid)
+            .map(|(_, btn)| btn.clone())
+    }
+
+    /// Minimum width of the widest single tab. The strip's own minimum should
+    /// be about this, not this times the tab count.
+    pub fn widest_tab_minimum_width(&self) -> i32 {
+        self.inner
+            .tab_buttons
+            .borrow()
+            .iter()
+            .map(|(_, btn)| btn.measure(gtk4::Orientation::Horizontal, -1).0)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn tab_strip_width(&self) -> i32 {
+        self.inner.tab_buttons_box.width()
+    }
+
     /// Test/inspection accessors for the open session picker: row count and the
     /// selected session name. `None` when no picker is open.
     pub fn session_picker_rows(&self) -> Option<usize> {
@@ -501,6 +648,17 @@ impl MutinyWindow {
         for view in views {
             view.refresh_font();
         }
+        self.apply_tab_strip_height_cap();
+    }
+
+    /// Applies the configured height cap to the wrapping strip.
+    fn apply_tab_strip_height_cap(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let cap = ctrl.config_ref().tab_strip_max_height_px;
+        self.inner.tab_scroller.set_max_content_height(cap);
+        self.inner.tab_scroller.set_min_content_height(0);
     }
 
     pub fn rebuild_from_model(&self) {
@@ -584,6 +742,8 @@ impl MutinyWindow {
             self.inner.tab_buttons.borrow_mut().push((tid, btn));
         }
 
+        self.apply_tab_strip_height_cap();
+        self.scroll_active_tab_into_view();
         self.sync_banners(&ctrl);
 
         while let Some(child) = self.inner.content_slot.first_child() {
