@@ -310,9 +310,10 @@ pub struct PaneEngine {
     pty: Option<Pty>,
     size: GridSize,
     title: String,
-    /// Pinned label for a pane attached to an external multiplexer. Survives
-    /// OSC title resets, which would otherwise leave the tab reading "shell".
-    mux_label: Option<String>,
+    /// The external multiplexer session this pane is attached to. Survives OSC
+    /// title resets, which would otherwise leave the tab reading "shell", and
+    /// carries the name/host pair the Haven-style labels need.
+    mux_session: Option<crate::mux::MuxSessionRef>,
     cwd: Option<PathBuf>,
     progress: ProgressState,
     attention: Option<AttentionReason>,
@@ -393,7 +394,7 @@ impl PaneEngine {
             pty: None,
             size,
             title: String::from("shell"),
-            mux_label: None,
+            mux_session: None,
             cwd: None,
             progress: ProgressState::Hidden,
             attention: None,
@@ -591,12 +592,20 @@ impl PaneEngine {
     /// external multiplexer would otherwise read "shell", because tmux does not
     /// set the outer terminal title unless `set-titles` is on, and
     /// `Event::ResetTitle` clears whatever we set at spawn.
-    pub fn set_mux_label(&mut self, label: Option<String>) {
-        self.mux_label = label;
+    pub fn set_mux_session(&mut self, session: Option<crate::mux::MuxSessionRef>) {
+        self.mux_session = session;
     }
 
+    pub fn mux_session(&self) -> Option<&crate::mux::MuxSessionRef> {
+        self.mux_session.as_ref()
+    }
+
+    /// Title is the session name when attached, else the OSC-derived title.
     pub fn title(&self) -> &str {
-        self.mux_label.as_deref().unwrap_or(&self.title)
+        self.mux_session
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .unwrap_or(&self.title)
     }
 
     pub fn cwd(&self) -> Option<&Path> {

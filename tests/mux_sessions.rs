@@ -507,15 +507,18 @@ fn an_attached_pane_is_labelled_with_its_session() {
         )
         .expect("open session");
     pump(&ctrl, 800);
-    let title = ctrl
-        .workspace
-        .borrow()
-        .pane(pane)
-        .expect("pane")
-        .title()
-        .to_string();
-    assert!(
-        title.contains("labelled") && title.contains("tmux"),
-        "expected a pinned multiplexer label, got {title:?}"
+    let ws = ctrl.workspace.borrow();
+    let eng = ws.pane(pane).expect("pane");
+    // Haven sibling convention: title is the session name, subtitle the host.
+    assert_eq!(eng.title(), "labelled", "title must be the session name");
+    let session = eng.mux_session().expect("session ref pinned");
+    assert_eq!(session.kind, MuxKind::Tmux);
+    assert_eq!(session.name, "labelled");
+    assert_eq!(session.host, None);
+    assert_eq!(
+        session.subtitle(),
+        mutiny::mux::local_hostname(),
+        "a local session's subtitle is this hostname"
     );
+    assert!(!session.subtitle().is_empty());
 }

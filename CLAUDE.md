@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 158 tests: 95 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 tabstrip + 1 appicon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 161 tests: 95 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 1 picker + 1 tabstrip + 1 appicon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -272,6 +272,20 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### Menu IA: four archetypes, one home per action
+
+`MenuCategory` is Session / Edit / Pane / View. Session is session-context lifecycle, Edit is the focused pane's CONTENT (clipboard, find, command navigation), Pane is STRUCTURE and focus, View is chrome and introspection. The old File("Shell")/Pane("Panes")/View split overlapped, and Help held one item.
+
+`tests/menu_ia.rs` carries a golden slug/chord/home table. Slugs and chords are contract: agents call `run_action` by slug and humans have muscle memory, so the IA change must not move them. Category is presentation and is not on the wire (`ActionCatalogItem` has no category field).
+
+The Sessions submenu is a `gio::Menu` returned by `build_menubar_model()` alongside the root, registered with `AppController::register_sessions_menu`. Both the app menubar and each window's own `PopoverMenuBar` register theirs, and `refresh_session_pickers` fills them all when the inventory generation moves. Items use the parameterised `win.open-session-target` action, which is deliberately NOT in `ACTIONS`: its target is a session, not a keybind-able verb. Targets are kind/host/name tab-separated (`session_target` / `parse_session_target`) so names with spaces or punctuation survive.
+
+### Labels: title is the session name, subtitle is the host
+
+Haven's convention. `PaneEngine::mux_session` holds a `MuxSessionRef { kind, name, host }`; `title()` returns the session name when attached, and `MuxSessionRef::subtitle()` returns the SSH host or `mux::local_hostname()`. Tabs and picker rows are two-line, title prominent, subtitle dim and smaller, title ellipsised. No session index: it is redundant once sessions are named.
+
+`tab_buttons` stores the button AND its two labels. `refresh_tab_strip_labels` must update those labels, never call `btn.set_label`, which would replace the two-line child with a plain string and silently undo the structure. `tab_labels()` reads the title label for the same reason.
 
 ### App icon and desktop identity
 

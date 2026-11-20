@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 158 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 161 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -212,6 +212,25 @@ The phone, a peer on the same gateway-hosted WG server, reached `http://10.1.0.4
 
 A split tunnel is enough: routing only the tunnel subnet to the WG interface leaves the default route alone, so nothing else on the workstation changes.
 
+## Menus and labels
+
+Four menus, each an archetype with no overlap. Every action lives in exactly one:
+
+| Menu | Covers | Actions |
+| --- | --- | --- |
+| **Session** | the lifecycle of a session context | New Window, New Tab, Open Session (submenu) |
+| **Edit** | the focused pane's content | Copy, Paste, Search, Previous/Next Command |
+| **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
+| **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Keybind Cheatsheet |
+
+The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View" held session attaching, and "Panes" mixed structure with content navigation. Help existed for one item, which now sits in View. Action slugs and keybinds are unchanged; `tests/menu_ia.rs` holds a golden list so a rename or rebound chord fails a test.
+
+**Open Session** is a submenu listing discovered sessions inline, not a pop-up. `Ctrl+Shift+S` still opens the full picker, which is also the last item in that submenu.
+
+Labels follow the Haven convention: **title is the session name, subtitle is the host** (this machine's hostname for local sessions, the SSH host for remote ones). Tabs and the picker both use two lines, title prominent and subtitle dimmer, with the title ellipsised so wrapped tabs stay readable. Session numbers are gone: once sessions are named, an index is redundant noise.
+
+The toolbar is glyph-only with tooltips (`+ → ↓ ↗ ⌘ ?`), measured at 157 px against 505 px for the labelled version. The full verb names live in the menus.
+
 ## App icon and launcher
 
 Mutiny ships a Jolly Roger skull whose eye sockets are square terminal cells and whose mouth is a cursor bar. Flat white on deep navy (`#1A1A2E`), matching the Haven sibling icon's palette and weight, with no gradients or strokes so it stays legible at 16 px.
@@ -365,7 +384,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 158 tests, no display required
+cargo test                    # 161 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

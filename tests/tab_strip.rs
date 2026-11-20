@@ -47,6 +47,28 @@ fn many_tabs_wrap_without_stretching_the_window() {
     window.rebuild_from_model();
     settle(&ctrl, 20);
 
+    // Toolbar compaction: glyph-only buttons, measured against the same
+    // buttons with the words they used to carry.
+    let compact = window.toolbar_width();
+    let labelled = {
+        let probe = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        for text in ["+ Tab", "Split →", "Split ↓", "Detach ↗", "⌘ Palette", "?"] {
+            probe.append(&gtk4::Button::with_label(text));
+        }
+        let win = gtk4::Window::new();
+        win.set_child(Some(&probe));
+        win.present();
+        while gtk4::glib::MainContext::default().iteration(false) {}
+        let w = probe.measure(gtk4::Orientation::Horizontal, -1).0;
+        win.close();
+        w
+    };
+    eprintln!("toolbar: labelled {labelled}px -> compact {compact}px");
+    assert!(
+        compact < labelled,
+        "the compact toolbar must be narrower: {compact} vs {labelled}"
+    );
+
     let baseline_min = window.window_minimum_width();
     let baseline_rows = window.tab_strip_row_count();
     assert_eq!(baseline_rows, 1, "one tab is one row");
@@ -151,9 +173,14 @@ fn many_tabs_wrap_without_stretching_the_window() {
         "the active tab must still be marked after a rebuild"
     );
     let labels = window.tab_labels();
+    assert_eq!(labels.len(), 37, "every tab must still be labelled");
     assert!(
-        labels.iter().any(|l| l.starts_with("37:")),
-        "every tab must still be labelled and numbered: {labels:?}"
+        !labels.iter().any(|l| l.starts_with("37:")),
+        "session numbers are dropped as redundant noise: {labels:?}"
+    );
+    assert!(
+        labels.iter().all(|l| !l.is_empty()),
+        "no tab may be unlabelled: {labels:?}"
     );
 
     // Removing tabs must not leave the window stretched either.

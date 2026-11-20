@@ -132,6 +132,10 @@ pub struct AppController {
     cache_gen: Cell<u64>,
     pending_session_reply: RefCell<Option<UnixStream>>,
     discovery_deadline: Cell<Option<Instant>>,
+    /// Every live Sessions submenu (the app menubar and each window's own), so
+    /// discovery results fill them all.
+    sessions_menus: RefCell<Vec<gtk4::gio::Menu>>,
+    sessions_menu_gen: Cell<u64>,
     /// Mode the agent carrier assigns to every connection it accepts. Pinned
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
@@ -211,6 +215,8 @@ impl AppController {
             cache_gen: Cell::new(0),
             pending_session_reply: RefCell::new(None),
             discovery_deadline: Cell::new(None),
+            sessions_menus: RefCell::new(Vec::new()),
+            sessions_menu_gen: Cell::new(u64::MAX),
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
@@ -661,12 +667,12 @@ impl AppController {
                 self.split_pane_with_command(pane, SplitAxis::Vertical, cwd, Some(command))?
             }
         };
-        let label = match host {
-            Some(host) => format!("{}: {name}@{host}", kind.label()),
-            None => format!("{}: {name}", kind.label()),
-        };
         if let Some(engine) = self.workspace.borrow_mut().pane_mut(ids.2) {
-            engine.set_mux_label(Some(mux::sanitize_text(&label, 64)));
+            engine.set_mux_session(Some(mux::MuxSessionRef {
+                kind,
+                name: mux::sanitize_text(name, 64),
+                host: host.map(|h| mux::sanitize_text(h, 64)),
+            }));
         }
         self.sync_ui_window(ids.0);
         Ok(ids)
@@ -689,6 +695,12 @@ impl AppController {
             targets.push(Some(host));
         }
         targets
+    }
+
+    /// Registers a Sessions submenu to be filled from discovery results.
+    pub fn register_sessions_menu(&self, menu: gtk4::gio::Menu) {
+        crate::action::populate_sessions_menu(&menu, &self.session_inventory());
+        self.sessions_menus.borrow_mut().push(menu);
     }
 
     pub fn session_inventory(&self) -> MuxInventory {
@@ -2221,6 +2233,14 @@ impl AppController {
     /// when nothing changed.
     pub fn refresh_session_pickers(&self) {
         let generation = self.cache_gen.get();
+        if self.sessions_menu_gen.get() != generation {
+            self.sessions_menu_gen.set(generation);
+            let inventory = self.session_inventory();
+            let menus: Vec<gtk4::gio::Menu> = self.sessions_menus.borrow().clone();
+            for menu in menus {
+                crate::action::populate_sessions_menu(&menu, &inventory);
+            }
+        }
         let wins: Vec<MutinyWindow> = self.ui_windows.borrow().values().cloned().collect();
         for w in wins {
             w.refresh_session_picker(generation);

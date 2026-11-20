@@ -1,4 +1,5 @@
 use gtk4::gio;
+use gtk4::glib;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -57,30 +58,41 @@ impl ActionId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Four non-overlapping archetypes. Every action has exactly one home:
+///
+/// - `Session`: the lifecycle of a session context. New window, new tab, and
+///   attaching to a multiplexer session.
+/// - `Edit`: operations on the focused pane's CONTENT. Clipboard, find, and
+///   moving between commands in that content.
+/// - `Pane`: the STRUCTURE and focus of panes. Split, detach, close, focus,
+///   and jumping to a pane that needs attention.
+/// - `View`: chrome and introspection. Menu bar, palette, agent audit,
+///   cheatsheet.
+///
+/// The old Shell/Panes/View split overlapped: "Shell" held pane closing,
+/// "View" held session attaching, and "Panes" mixed structure with content
+/// navigation. Help existed for one item, which now lives in View.
 pub enum MenuCategory {
-    File,
+    Session,
     Edit,
     Pane,
     View,
-    Help,
 }
 
 impl MenuCategory {
     pub const ORDERED: &'static [MenuCategory] = &[
-        MenuCategory::File,
+        MenuCategory::Session,
         MenuCategory::Edit,
         MenuCategory::Pane,
         MenuCategory::View,
-        MenuCategory::Help,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
-            MenuCategory::File => "_Shell",
+            MenuCategory::Session => "_Session",
             MenuCategory::Edit => "_Edit",
-            MenuCategory::Pane => "_Panes",
+            MenuCategory::Pane => "_Pane",
             MenuCategory::View => "_View",
-            MenuCategory::Help => "_Help",
         }
     }
 }
@@ -109,7 +121,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::NewWindow,
         slug: "new-window",
         title: "New Window",
-        category: MenuCategory::File,
+        category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>n"),
         human_chord: "Ctrl+Shift+N",
@@ -120,7 +132,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::NewTab,
         slug: "new-tab",
         title: "New Tab",
-        category: MenuCategory::File,
+        category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>t"),
         human_chord: "Ctrl+Shift+T",
@@ -131,7 +143,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::ClosePane,
         slug: "close-pane",
         title: "Close Active Pane",
-        category: MenuCategory::File,
+        category: MenuCategory::Pane,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>w"),
         human_chord: "Ctrl+Shift+W",
@@ -230,7 +242,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::JumpPrevPrompt,
         slug: "jump-prev-prompt",
         title: "Jump to Previous Prompt (OSC 133)",
-        category: MenuCategory::Pane,
+        category: MenuCategory::Edit,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>Up"),
         human_chord: "Ctrl+Shift+Up",
@@ -241,7 +253,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::JumpNextPrompt,
         slug: "jump-next-prompt",
         title: "Jump to Next Prompt (OSC 133)",
-        category: MenuCategory::Pane,
+        category: MenuCategory::Edit,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>Down"),
         human_chord: "Ctrl+Shift+Down",
@@ -285,7 +297,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::SessionPicker,
         slug: "session-picker",
         title: "Open Multiplexer Session",
-        category: MenuCategory::View,
+        category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>s"),
         human_chord: "Ctrl+Shift+S",
@@ -307,7 +319,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::KeybindCheatsheet,
         slug: "keybind-cheatsheet",
         title: "Keybind Cheatsheet",
-        category: MenuCategory::Help,
+        category: MenuCategory::View,
         consent_tier: ConsentTier::Observe,
         default_accel: Some("<Control><Shift>question"),
         human_chord: "Ctrl+Shift+?",
@@ -348,16 +360,86 @@ pub fn filter_palette(query: &str) -> Vec<&'static ActionSpec> {
         .collect()
 }
 
-pub fn build_menubar_model() -> gio::Menu {
+/// Builds the menu bar and returns the dynamic Sessions submenu alongside it,
+/// so the controller can fill in discovered sessions without rebuilding the
+/// whole bar.
+pub fn build_menubar_model() -> (gio::Menu, gio::Menu) {
     let root = gio::Menu::new();
+    let sessions = gio::Menu::new();
     for &cat in MenuCategory::ORDERED {
         let submenu = gio::Menu::new();
-        for action in ACTIONS.iter().filter(|a| a.category == cat) {
+        for action in ACTIONS
+            .iter()
+            .filter(|a| a.category == cat && a.id != ActionId::SessionPicker)
+        {
             submenu.append(Some(action.title), Some(&action.gtk_detailed_name()));
+        }
+        if cat == MenuCategory::Session {
+            // The session list is a submenu, not a pop-up: Ian wants to see and
+            // pick a session inline. The full picker stays reachable from here
+            // and from Ctrl+Shift+S.
+            submenu.append_submenu(Some("Open Session"), &sessions);
         }
         root.append_submenu(Some(cat.label()), &submenu);
     }
-    root
+    (root, sessions)
+}
+
+/// Action name for opening a specific discovered session. Parameterised, so it
+/// lives outside the keybind-able `ACTIONS` table: the target is a session, not
+/// a verb.
+pub const OPEN_SESSION_TARGET: &str = "win.open-session-target";
+
+/// Encodes a session as the action target: kind, host, name, tab-separated so a
+/// name containing spaces or punctuation survives.
+pub fn session_target(kind: crate::mux::MuxKind, host: Option<&str>, name: &str) -> String {
+    format!("{}\t{}\t{}", kind.label(), host.unwrap_or(""), name)
+}
+
+pub fn parse_session_target(target: &str) -> Option<(crate::mux::MuxKind, Option<String>, String)> {
+    let mut parts = target.splitn(3, '\t');
+    let kind = match parts.next()? {
+        "tmux" => crate::mux::MuxKind::Tmux,
+        "zellij" => crate::mux::MuxKind::Zellij,
+        _ => return None,
+    };
+    let host = parts.next().filter(|h| !h.is_empty()).map(str::to_owned);
+    let name = parts.next()?.to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    Some((kind, host, name))
+}
+
+/// Fills the Sessions submenu from a discovery snapshot. Live sessions first,
+/// exited last, capped so a huge inventory cannot make the menu unusable.
+pub fn populate_sessions_menu(menu: &gio::Menu, inventory: &crate::mux::MuxInventory) {
+    menu.remove_all();
+    let listed = inventory.sorted_for_display();
+    for session in listed.iter().take(24) {
+        let label = match &session.host {
+            Some(host) => format!("{} ({host})", session.name),
+            None => session.name.clone(),
+        };
+        let label = if session.exited {
+            format!("{label} (exited)")
+        } else {
+            label
+        };
+        let item = gio::MenuItem::new(Some(&label), None);
+        let target = session_target(session.kind, session.host.as_deref(), &session.name);
+        item.set_action_and_target_value(
+            Some(OPEN_SESSION_TARGET),
+            Some(&glib::Variant::from(target)),
+        );
+        menu.append_item(&item);
+    }
+    if listed.is_empty() {
+        // No action, so GTK renders it insensitive rather than clickable.
+        menu.append_item(&gio::MenuItem::new(Some("No sessions found"), None));
+    }
+    let picker = gio::MenuItem::new(Some("Browse All Sessions…"), Some("win.session-picker"));
+    menu.append_item(&picker);
 }
 
 pub fn build_context_menu_model() -> gio::Menu {

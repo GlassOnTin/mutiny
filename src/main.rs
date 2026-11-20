@@ -714,7 +714,9 @@ fn run_gui_app(
 
     app.connect_startup(move |gtk_app| {
         ctrl_startup.attach_gtk_app(gtk_app);
-        gtk_app.set_menubar(Some(&build_menubar_model()));
+        let (menu_model, sessions_menu) = build_menubar_model();
+        gtk_app.set_menubar(Some(&menu_model));
+        ctrl_startup.register_sessions_menu(sessions_menu);
 
         // App icon. The name matches the application id and the installed
         // hicolor icon, so the window, the taskbar, and the launcher all agree.

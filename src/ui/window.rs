@@ -30,6 +30,7 @@ struct MutinyWindowInner {
     /// Caps the wrapped strip's height so many tabs scroll rather than
     /// squeezing the terminal. Horizontal scrolling is off: we wrap instead.
     tab_scroller: gtk4::ScrolledWindow,
+    toolbar_box: gtk4::Box,
     agent_badge_btn: gtk4::Button,
     consent_bar: gtk4::Box,
     consent_label: gtk4::Label,
@@ -41,7 +42,9 @@ struct MutinyWindowInner {
     search_status: gtk4::Label,
     content_slot: gtk4::Box,
     pane_views: RefCell<HashMap<PaneId, TerminalView>>,
-    tab_buttons: RefCell<Vec<(TabId, gtk4::Button)>>,
+    /// Button plus its two labels, so a refresh updates the labels rather than
+    /// calling `set_label`, which would replace the two-line child.
+    tab_buttons: RefCell<Vec<(TabId, gtk4::Button, gtk4::Label, gtk4::Label)>>,
     controller: Weak<AppController>,
     closing_programmatically: Cell<bool>,
     session_picker: RefCell<Option<Rc<SessionPicker>>>,
@@ -70,7 +73,9 @@ impl MutinyWindow {
             .handle_menubar_accel(false)
             .build();
 
-        let menubar = gtk4::PopoverMenuBar::from_model(Some(&build_menubar_model()));
+        let (menu_model, sessions_menu) = build_menubar_model();
+        let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
+        controller.register_sessions_menu(sessions_menu);
 
         let chrome_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         chrome_bar.set_margin_start(6);
@@ -109,36 +114,32 @@ impl MutinyWindow {
         chrome_bar.append(&agent_badge_btn);
 
         // Persistent SSD-safe controls: never hidden when CSD is disabled.
-        chrome_bar.append(&make_action_button(
-            "+ Tab",
-            "win.new-tab",
-            "New Tab (Ctrl+Shift+T)",
-        ));
-        chrome_bar.append(&make_action_button(
-            "Split →",
-            "win.split-right",
-            "Split Right (Ctrl+Shift+R)",
-        ));
-        chrome_bar.append(&make_action_button(
-            "Split ↓",
-            "win.split-down",
-            "Split Down (Ctrl+Shift+E)",
-        ));
-        chrome_bar.append(&make_action_button(
-            "Detach ↗",
-            "win.detach-split",
-            "Detach Split to Window (Ctrl+Shift+D)",
-        ));
-        chrome_bar.append(&make_action_button(
-            "⌘ Palette",
-            "win.command-palette",
-            "Command Palette (Ctrl+Shift+P)",
-        ));
-        chrome_bar.append(&make_action_button(
-            "?",
-            "win.keybind-cheatsheet",
-            "Keybind Cheatsheet (Ctrl+Shift+?)",
-        ));
+        // Glyph-only with tooltips: the words cost more horizontal space than
+        // the tab strip could afford once sessions wrap. Meaning lives in the
+        // tooltip and in the Session/Pane menus, which name each verb in full.
+        let toolbar_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        for (glyph, action, tip) in [
+            ("+", "win.new-tab", "New Tab (Ctrl+Shift+T)"),
+            ("→", "win.split-right", "Split Right (Ctrl+Shift+R)"),
+            ("↓", "win.split-down", "Split Down (Ctrl+Shift+E)"),
+            (
+                "↗",
+                "win.detach-split",
+                "Detach Split to Window (Ctrl+Shift+D)",
+            ),
+            ("⌘", "win.command-palette", "Command Palette (Ctrl+Shift+P)"),
+            (
+                "?",
+                "win.keybind-cheatsheet",
+                "Keybind Cheatsheet (Ctrl+Shift+?)",
+            ),
+        ] {
+            ensure_compact_toolbar_css();
+            let btn = make_action_button(glyph, action, tip);
+            btn.add_css_class("compact-toolbar");
+            toolbar_box.append(&btn);
+        }
+        chrome_bar.append(&toolbar_box);
 
         // Non-injectable Consent Bar for Tier-2 agent actions in `ask` mode
         let consent_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -258,6 +259,7 @@ impl MutinyWindow {
                 menubar,
                 tab_buttons_box,
                 tab_scroller,
+                toolbar_box,
                 agent_badge_btn,
                 consent_bar,
                 consent_label,
@@ -469,6 +471,33 @@ impl MutinyWindow {
             });
             self.inner.gtk_window.add_action(&action);
         }
+
+        // Parameterised action for the Sessions submenu: the target names a
+        // discovered session, so it is not a keybind-able verb in ACTIONS.
+        let open = gio::SimpleAction::new("open-session-target", Some(glib::VariantTy::STRING));
+        let ctrl_weak = Rc::downgrade(controller);
+        open.connect_activate(move |_, param| {
+            let Some(target) = param.and_then(|p| p.get::<String>()) else {
+                return;
+            };
+            let Some((kind, host, name)) = crate::action::parse_session_target(&target) else {
+                eprintln!("malformed session target: {target:?}");
+                return;
+            };
+            if let Some(ctrl) = ctrl_weak.upgrade()
+                && let Err(err) = ctrl.open_session(
+                    kind,
+                    &name,
+                    host.as_deref(),
+                    SessionMode::Tab,
+                    Some(win_id),
+                    None,
+                )
+            {
+                eprintln!("failed to open session: {err}");
+            }
+        });
+        self.inner.gtk_window.add_action(&open);
     }
 
     pub fn present(&self) {
@@ -510,8 +539,8 @@ impl MutinyWindow {
             .tab_buttons
             .borrow()
             .iter()
-            .find(|(tid, _)| *tid == active)
-            .map(|(_, btn)| btn.clone());
+            .find(|(tid, _, _, _)| *tid == active)
+            .map(|(_, btn, _, _)| btn.clone());
         let Some(button) = button else { return };
         let scroller = self.inner.tab_scroller.clone();
         let flowbox = self.inner.tab_buttons_box.clone();
@@ -537,6 +566,11 @@ impl MutinyWindow {
             }
             glib::ControlFlow::Break
         });
+    }
+
+    /// Width of the toolbar control cluster, for measuring the compaction.
+    pub fn toolbar_width(&self) -> i32 {
+        self.inner.toolbar_box.width()
     }
 
     /// The icon name this window advertises to the shell and taskbar.
@@ -599,8 +633,8 @@ impl MutinyWindow {
             .tab_buttons
             .borrow()
             .iter()
-            .find(|(id, _)| *id == tid)
-            .map(|(_, btn)| btn.clone())
+            .find(|(id, _, _, _)| *id == tid)
+            .map(|(_, btn, _, _)| btn.clone())
     }
 
     /// Minimum width of the widest single tab. The strip's own minimum should
@@ -610,7 +644,7 @@ impl MutinyWindow {
             .tab_buttons
             .borrow()
             .iter()
-            .map(|(_, btn)| btn.measure(gtk4::Orientation::Horizontal, -1).0)
+            .map(|(_, btn, _, _)| btn.measure(gtk4::Orientation::Horizontal, -1).0)
             .max()
             .unwrap_or(0)
     }
@@ -638,7 +672,7 @@ impl MutinyWindow {
             .tab_buttons
             .borrow()
             .iter()
-            .map(|(_, btn)| btn.label().map(|s| s.to_string()).unwrap_or_default())
+            .map(|(_, _, title, _)| title.text().to_string())
             .collect()
     }
 
@@ -684,7 +718,10 @@ impl MutinyWindow {
             };
             let title = ws
                 .pane(tab.active_pane)
-                .map(|e| format!("Mutiny: {}", e.title()))
+                .map(|e| match e.mux_session() {
+                    Some(s) => format!("Mutiny: {} ({})", s.name, s.subtitle()),
+                    None => format!("Mutiny: {}", e.title()),
+                })
                 .unwrap_or_else(|| String::from("Mutiny"));
             (
                 wm.menubar_visible,
@@ -704,8 +741,24 @@ impl MutinyWindow {
         self.inner.tab_buttons.borrow_mut().clear();
 
         let tab_ids_and_labels = self.compute_tab_labels(&ctrl, active_tab_id);
-        for (idx, (tid, label, first_pane)) in tab_ids_and_labels.into_iter().enumerate() {
-            let btn = gtk4::Button::with_label(&format!("{}: {}", idx + 1, label));
+        for (idx, (tid, label, subtitle, first_pane)) in tab_ids_and_labels.into_iter().enumerate()
+        {
+            let btn = gtk4::Button::new();
+            let lines = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let title_label = gtk4::Label::new(Some(&label));
+            title_label.set_xalign(0.0);
+            title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            title_label.set_max_width_chars(24);
+            let sub_label = gtk4::Label::new(Some(&subtitle));
+            sub_label.set_xalign(0.0);
+            sub_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            sub_label.set_max_width_chars(24);
+            sub_label.add_css_class("dim-label");
+            sub_label.add_css_class("tab-subtitle");
+            lines.append(&title_label);
+            lines.append(&sub_label);
+            btn.set_child(Some(&lines));
+            btn.set_tooltip_text(Some(&format!("{label} ({subtitle})")));
             btn.set_can_focus(false);
             if tid == active_tab_id {
                 btn.add_css_class("suggested-action");
@@ -747,7 +800,10 @@ impl MutinyWindow {
             btn.add_controller(drop);
 
             self.inner.tab_buttons_box.append(&btn);
-            self.inner.tab_buttons.borrow_mut().push((tid, btn));
+            self.inner
+                .tab_buttons
+                .borrow_mut()
+                .push((tid, btn, title_label, sub_label));
         }
 
         self.apply_tab_strip_height_cap();
@@ -783,20 +839,25 @@ impl MutinyWindow {
             if let Some(ap) = wm.active_pane().and_then(|p| ws.pane(p)) {
                 self.inner
                     .gtk_window
-                    .set_title(Some(&format!("Mutiny: {}", ap.title())));
+                    .set_title(Some(&match ap.mux_session() {
+                        Some(s) => format!("Mutiny: {} ({})", s.name, s.subtitle()),
+                        None => format!("Mutiny: {}", ap.title()),
+                    }));
             }
             wm.active_tab
         };
 
-        let labels: HashMap<TabId, String> = self
+        let labels: HashMap<TabId, (String, String)> = self
             .compute_tab_labels(&ctrl, active_tab_id)
             .into_iter()
-            .map(|(tid, lbl, _)| (tid, lbl))
+            .map(|(tid, lbl, sub, _)| (tid, (lbl, sub)))
             .collect();
 
-        for (idx, (tid, btn)) in self.inner.tab_buttons.borrow().iter().enumerate() {
-            if let Some(lbl) = labels.get(tid) {
-                btn.set_label(&format!("{}: {}", idx + 1, lbl));
+        for (tid, btn, title_label, sub_label) in self.inner.tab_buttons.borrow().iter() {
+            if let Some((lbl, sub)) = labels.get(tid) {
+                title_label.set_text(lbl);
+                sub_label.set_text(sub);
+                btn.set_tooltip_text(Some(&format!("{lbl} ({sub})")));
             }
         }
 
@@ -847,7 +908,7 @@ impl MutinyWindow {
         &self,
         ctrl: &Rc<AppController>,
         _active_tab: TabId,
-    ) -> Vec<(TabId, String, PaneId)> {
+    ) -> Vec<(TabId, String, String, PaneId)> {
         let ws = ctrl.workspace.borrow();
         let Some(wm) = ws.window(self.inner.window_id) else {
             return Vec::new();
@@ -858,10 +919,17 @@ impl MutinyWindow {
             .map(|tab| {
                 let leaves = tab.root.leaves();
                 let pane_count = leaves.len();
-                let title = ws
-                    .pane(tab.active_pane)
+                let active = ws.pane(tab.active_pane);
+                let title = active
                     .map(|e| e.title().to_owned())
                     .unwrap_or_else(|| String::from("shell"));
+                // Haven sibling convention: title is the session name,
+                // subtitle is the host. Local sessions show this hostname so
+                // both shapes read the same.
+                let subtitle = active
+                    .and_then(|e| e.mux_session())
+                    .map(|s| s.subtitle())
+                    .unwrap_or_else(crate::mux::local_hostname);
 
                 let mut status_badges = Vec::new();
                 let mut any_running = false;
@@ -894,16 +962,19 @@ impl MutinyWindow {
                     status_badges.push(format!("{pane_count}p"));
                 }
 
+                // No leading index: once sessions are named the number is
+                // redundant noise. Attention badges stay on the title line,
+                // where they are glanceable.
                 let label = if status_badges.is_empty() {
-                    truncate_label(&title, 22)
+                    truncate_label(&title, 24)
                 } else {
                     format!(
                         "{} [{}]",
-                        truncate_label(&title, 18),
+                        truncate_label(&title, 20),
                         status_badges.join(" ")
                     )
                 };
-                (tab.id, label, tab.active_pane)
+                (tab.id, label, subtitle, tab.active_pane)
             })
             .collect()
     }
@@ -1419,23 +1490,26 @@ fn rebuild_session_rows(picker: &Rc<SessionPicker>, inventory: &MuxInventory, qu
         if !terms.iter().all(|t| hay.contains(t)) {
             continue;
         }
-        let mut detail = format!(
+        // Title is the session name, subtitle is the host, matching the tab
+        // labels and the Haven convention. Multiplexer detail moves to the
+        // trailing column so the two-line shape stays consistent.
+        let subtitle = session
+            .host
+            .clone()
+            .unwrap_or_else(crate::mux::local_hostname);
+        let mut meta = format!(
             "{} · {} window{}",
             session.kind.label(),
             session.windows,
             if session.windows == 1 { "" } else { "s" }
         );
         if session.attached > 0 {
-            detail.push_str(&format!(" · attached ×{}", session.attached));
+            meta.push_str(&format!(" · attached ×{}", session.attached));
         }
         if session.exited {
-            detail.push_str(" · EXITED (attach to resurrect)");
+            meta.push_str(" · exited");
         }
-        let right = session
-            .host
-            .clone()
-            .unwrap_or_else(|| String::from("local"));
-        widgets.push(session_row(&session.name, &detail, &right, true));
+        widgets.push(session_row(&session.name, &subtitle, &meta, true));
         entries.push(Some(session.clone()));
     }
 
@@ -1549,6 +1623,31 @@ fn attach_escape_to_close(dialog: &gtk4::Window) {
         glib::Propagation::Proceed
     });
     dialog.add_controller(key_escape);
+}
+
+/// Tight padding for the glyph-only toolbar buttons. Installed once per
+/// display; GTK deduplicates providers by pointer, so a guard keeps it cheap.
+fn ensure_compact_toolbar_css() {
+    use std::cell::Cell;
+    thread_local! { static INSTALLED: Cell<bool> = const { Cell::new(false) }; }
+    if INSTALLED.get() {
+        return;
+    }
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(
+        "button.compact-toolbar { padding-left: 6px; padding-right: 6px; \
+         padding-top: 2px; padding-bottom: 2px; min-width: 0; } \
+         label.tab-subtitle { font-size: 0.82em; }",
+    );
+    gtk4::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    INSTALLED.set(true);
 }
 
 fn make_action_button(label: &str, action_name: &str, tooltip: &str) -> gtk4::Button {

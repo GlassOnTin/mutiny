@@ -53,6 +53,39 @@ impl MuxKind {
     }
 }
 
+/// The session a pane is attached to, for labels. Title is the session name,
+/// subtitle is the host: the Haven sibling convention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MuxSessionRef {
+    pub kind: MuxKind,
+    pub name: String,
+    /// `None` means this machine.
+    pub host: Option<String>,
+}
+
+impl MuxSessionRef {
+    /// Subtitle text: the SSH host for a remote session, else this hostname.
+    pub fn subtitle(&self) -> String {
+        self.host.clone().unwrap_or_else(local_hostname)
+    }
+}
+
+/// This machine's hostname, resolved once. Used as the subtitle for local
+/// sessions so a tab reads the same shape whether local or remote.
+pub fn local_hostname() -> String {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc != 0 {
+            return String::from("localhost");
+        }
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).into_owned()
+    })
+    .clone()
+}
+
 /// Where to open a session. Reuses `spawn_pane`'s vocabulary so an agent learns
 /// one set of words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
