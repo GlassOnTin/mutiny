@@ -136,6 +136,9 @@ pub struct AppController {
     /// discovery results fill them all.
     sessions_menus: RefCell<Vec<gtk4::gio::Menu>>,
     sessions_menu_gen: Cell<u64>,
+    /// Last agent-active state pushed to the window icons, so the icon is only
+    /// touched on a transition.
+    agent_icon_active: Cell<bool>,
     /// Mode the agent carrier assigns to every connection it accepts. Pinned
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
@@ -217,6 +220,7 @@ impl AppController {
             discovery_deadline: Cell::new(None),
             sessions_menus: RefCell::new(Vec::new()),
             sessions_menu_gen: Cell::new(u64::MAX),
+            agent_icon_active: Cell::new(false),
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
@@ -695,6 +699,45 @@ impl AppController {
             targets.push(Some(host));
         }
         targets
+    }
+
+    /// Expires the agent freshness window immediately. The window is 15 s in
+    /// production, which is too long for a test to wait out.
+    pub fn clear_recent_agent_for_test(&self) {
+        *self.recent_agent.borrow_mut() = None;
+    }
+
+    /// True while an external agent is driving the terminal. Derived from the
+    /// same signal as the in-window agent badge, so the icon and the badge can
+    /// never disagree: a non-Operator carrier call within the last 15 seconds.
+    /// That window is also the debounce, so a brief act cannot flicker.
+    pub fn agent_active(&self) -> bool {
+        self.active_agent_badge().is_some()
+    }
+
+    /// Pushes the agent-active icon state to the default and every window, but
+    /// only on a transition.
+    fn refresh_agent_icon(&self) {
+        // poll_once also runs headlessly, where GTK is not initialised and any
+        // GTK call panics. No application means no windows to iconify.
+        if self.gtk_app.borrow().is_none() {
+            return;
+        }
+        let active = self.agent_active();
+        if self.agent_icon_active.get() == active {
+            return;
+        }
+        self.agent_icon_active.set(active);
+        let name = if active {
+            crate::desktop::AGENT_ICON_NAME
+        } else {
+            crate::desktop::APP_ID
+        };
+        gtk4::Window::set_default_icon_name(name);
+        let wins: Vec<MutinyWindow> = self.ui_windows.borrow().values().cloned().collect();
+        for w in wins {
+            w.set_agent_active(active);
+        }
     }
 
     /// Registers a Sessions submenu to be filled from discovery results.
@@ -1356,6 +1399,9 @@ impl AppController {
             return;
         };
         let ui_win = MutinyWindow::new(&app, win_id, Rc::clone(self));
+        // A window opened while an agent is already driving must show the
+        // active icon at once, not wait for the next transition.
+        ui_win.set_agent_active(self.agent_active());
         self.ui_windows.borrow_mut().insert(win_id, ui_win.clone());
         ui_win.present();
     }
@@ -1458,6 +1504,7 @@ impl AppController {
         self.satisfy_pending_waits();
         self.advance_searches();
         self.advance_discoveries();
+        self.refresh_agent_icon();
         self.expire_pending_consents();
 
         for pid in panes_exited {

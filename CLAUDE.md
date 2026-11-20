@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 161 tests: 95 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 1 picker + 1 tabstrip + 1 appicon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 163 tests: 96 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -294,6 +294,8 @@ Haven's convention. `PaneEngine::mux_session` holds a `MuxSessionRef { kind, nam
 `APP_ID` is the single source for the application id, icon name, desktop basename, and `StartupWMClass`. **X11 `WM_CLASS` comes from the program name, not the application id**, so `glib::set_prgname` must be called with `APP_ID` before windows exist; otherwise `WM_CLASS` is "mutiny", the launcher does not match the running window, and the taskbar grows a second iconless entry. Verified with `xprop`: `WM_CLASS` is `dev.mutiny.Terminal` and `_NET_WM_ICON` carries the 16 px render.
 
 The icon is set both globally (`Window::set_default_icon_name`) and per window (`.icon_name(...)`), because the global default is not observable through the per-window getter and X11 reads the window property.
+
+Two icon states are embedded: idle (`APP_ID`) and agent-active (`AGENT_ICON_NAME`). `agent_active()` is `active_agent_badge().is_some()`, deliberately the SAME signal as the badge so they cannot disagree; the badge's 15 s freshness window is also the debounce. `refresh_agent_icon` runs in `poll_once` but only touches GTK on a transition, and `ensure_ui_window` applies the current state to a new window immediately so it does not start idle mid-session. The active variant shares the idle geometry exactly, changing only fills, which a unit test asserts.
 
 Icon assets are generated, not hand-drawn per size: edit `assets/icon/dev.mutiny.Terminal.svg` and re-render. Keep to plain shapes and flat fills, which is both the Haven design language and what every SVG renderer agrees on.
 

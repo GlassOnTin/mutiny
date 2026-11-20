@@ -573,6 +573,18 @@ impl MutinyWindow {
         self.inner.toolbar_box.width()
     }
 
+    /// Switches the window/taskbar icon between idle and agent-active. Only
+    /// called when the state actually changes, so a busy agent does not churn
+    /// GTK properties every tick.
+    pub fn set_agent_active(&self, active: bool) {
+        let name = if active {
+            crate::desktop::AGENT_ICON_NAME
+        } else {
+            crate::desktop::APP_ID
+        };
+        self.inner.gtk_window.set_icon_name(Some(name));
+    }
+
     /// The icon name this window advertises to the shell and taskbar.
     pub fn icon_name(&self) -> Option<String> {
         self.inner.gtk_window.icon_name().map(|s| s.to_string())

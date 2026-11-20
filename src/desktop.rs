@@ -17,11 +17,17 @@ use std::path::{Path, PathBuf};
 /// name, and the desktop file's basename, so the three cannot drift.
 pub const APP_ID: &str = "dev.mutiny.Terminal";
 
+/// Runtime overlay icon shown while an agent is driving the terminal. Same
+/// geometry as the idle icon; the plate turns blue and the eyes glow red. The
+/// installed `.desktop` keeps `APP_ID`, so the launcher never looks active.
+pub const AGENT_ICON_NAME: &str = "dev.mutiny.Terminal.Agent";
+
 /// Raster sizes shipped in the hicolor theme. 16 is the one that matters most:
 /// it is what a taskbar and a window titlebar actually use.
 pub const ICON_SIZES: [u32; 7] = [16, 32, 48, 64, 128, 256, 512];
 
 pub const ICON_SVG: &[u8] = include_bytes!("../assets/icon/dev.mutiny.Terminal.svg");
+pub const AGENT_ICON_SVG: &[u8] = include_bytes!("../assets/icon/dev.mutiny.Terminal.Agent.svg");
 
 const PNG_16: &[u8] = include_bytes!("../assets/icon/hicolor/16x16/apps/dev.mutiny.Terminal.png");
 const PNG_32: &[u8] = include_bytes!("../assets/icon/hicolor/32x32/apps/dev.mutiny.Terminal.png");
@@ -33,6 +39,34 @@ const PNG_256: &[u8] =
     include_bytes!("../assets/icon/hicolor/256x256/apps/dev.mutiny.Terminal.png");
 const PNG_512: &[u8] =
     include_bytes!("../assets/icon/hicolor/512x512/apps/dev.mutiny.Terminal.png");
+
+const AGENT_16: &[u8] =
+    include_bytes!("../assets/icon/hicolor/16x16/apps/dev.mutiny.Terminal.Agent.png");
+const AGENT_32: &[u8] =
+    include_bytes!("../assets/icon/hicolor/32x32/apps/dev.mutiny.Terminal.Agent.png");
+const AGENT_48: &[u8] =
+    include_bytes!("../assets/icon/hicolor/48x48/apps/dev.mutiny.Terminal.Agent.png");
+const AGENT_64: &[u8] =
+    include_bytes!("../assets/icon/hicolor/64x64/apps/dev.mutiny.Terminal.Agent.png");
+const AGENT_128: &[u8] =
+    include_bytes!("../assets/icon/hicolor/128x128/apps/dev.mutiny.Terminal.Agent.png");
+const AGENT_256: &[u8] =
+    include_bytes!("../assets/icon/hicolor/256x256/apps/dev.mutiny.Terminal.Agent.png");
+const AGENT_512: &[u8] =
+    include_bytes!("../assets/icon/hicolor/512x512/apps/dev.mutiny.Terminal.Agent.png");
+
+fn agent_png_for(size: u32) -> Option<&'static [u8]> {
+    match size {
+        16 => Some(AGENT_16),
+        32 => Some(AGENT_32),
+        48 => Some(AGENT_48),
+        64 => Some(AGENT_64),
+        128 => Some(AGENT_128),
+        256 => Some(AGENT_256),
+        512 => Some(AGENT_512),
+        _ => None,
+    }
+}
 
 fn png_for(size: u32) -> Option<&'static [u8]> {
     match size {
@@ -70,19 +104,27 @@ fn cache_home() -> PathBuf {
 
 /// Relative hicolor path for a raster size.
 pub fn hicolor_png_rel(size: u32) -> PathBuf {
+    hicolor_png_rel_named(size, APP_ID)
+}
+
+pub fn hicolor_png_rel_named(size: u32, name: &str) -> PathBuf {
     PathBuf::from("icons")
         .join("hicolor")
         .join(format!("{size}x{size}"))
         .join("apps")
-        .join(format!("{APP_ID}.png"))
+        .join(format!("{name}.png"))
 }
 
 pub fn hicolor_svg_rel() -> PathBuf {
+    hicolor_svg_rel_named(APP_ID)
+}
+
+pub fn hicolor_svg_rel_named(name: &str) -> PathBuf {
     PathBuf::from("icons")
         .join("hicolor")
         .join("scalable")
         .join("apps")
-        .join(format!("{APP_ID}.svg"))
+        .join(format!("{name}.svg"))
 }
 
 pub fn desktop_rel() -> PathBuf {
@@ -136,9 +178,23 @@ pub fn write_icons(root: &Path) -> io::Result<Vec<PathBuf>> {
             written.push(path);
         }
     }
-    let svg = root.join(hicolor_svg_rel());
-    if write_if_changed(&svg, ICON_SVG)? {
-        written.push(svg);
+    for size in ICON_SIZES {
+        let Some(bytes) = agent_png_for(size) else {
+            continue;
+        };
+        let path = root.join(hicolor_png_rel_named(size, AGENT_ICON_NAME));
+        if write_if_changed(&path, bytes)? {
+            written.push(path);
+        }
+    }
+    for (rel, bytes) in [
+        (hicolor_svg_rel(), ICON_SVG),
+        (hicolor_svg_rel_named(AGENT_ICON_NAME), AGENT_ICON_SVG),
+    ] {
+        let path = root.join(rel);
+        if write_if_changed(&path, bytes)? {
+            written.push(path);
+        }
     }
     Ok(written)
 }
@@ -203,6 +259,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_variant_covers_every_size_and_changes_only_the_state_colours() {
+        for size in ICON_SIZES {
+            let bytes = agent_png_for(size).unwrap_or_else(|| panic!("no agent PNG for {size}"));
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "size {size}");
+            let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+            let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+            assert_eq!((w, h), (size, size));
+            // The two states must be different images, not the same bytes.
+            assert_ne!(bytes, png_for(size).unwrap(), "size {size} is identical");
+        }
+        let idle = std::str::from_utf8(ICON_SVG).unwrap();
+        let active = std::str::from_utf8(AGENT_ICON_SVG).unwrap();
+        assert!(idle.contains("#1A1A2E"), "idle plate is Haven navy");
+        assert!(!idle.contains("#F85149"), "idle eyes are not red");
+        assert!(active.contains("#0969DA"), "active plate is blue");
+        assert!(active.contains("#F85149"), "active eyes glow red");
+        assert!(
+            !active.contains("#1A1A2E"),
+            "no navy left in the active state"
+        );
+        // Geometry is shared: the same shapes, only fills differ.
+        let shapes = |s: &str| {
+            s.lines()
+                .filter(|l| {
+                    l.trim_start().starts_with("<rect") || l.trim_start().starts_with("<path")
+                })
+                .map(|l| l.split("fill=").next().unwrap().trim().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shapes(idle), shapes(active), "geometry must not change");
+    }
+
+    #[test]
     fn desktop_entry_has_the_required_fields() {
         let entry = desktop_entry(Path::new("/usr/bin/mutiny"));
         for line in [
@@ -228,8 +317,8 @@ mod tests {
         let written = write_icons(&dir).expect("write icons");
         assert_eq!(
             written.len(),
-            ICON_SIZES.len() + 1,
-            "7 rasters plus the SVG"
+            ICON_SIZES.len() * 2 + 2,
+            "7 rasters and an SVG for each of the two states"
         );
         for size in ICON_SIZES {
             assert!(dir.join(hicolor_png_rel(size)).is_file(), "size {size}");

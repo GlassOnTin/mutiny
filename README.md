@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 161 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 163 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -235,7 +235,7 @@ The toolbar is glyph-only with tooltips (`+ → ↓ ↗ ⌘ ?`), measured at 157
 
 Mutiny ships a Jolly Roger skull whose eye sockets are square terminal cells and whose mouth is a cursor bar. Flat white on deep navy (`#1A1A2E`), matching the Haven sibling icon's palette and weight, with no gradients or strokes so it stays legible at 16 px.
 
-The SVG and seven PNG renders (16 to 512) live in `assets/icon/` and are embedded in the binary, so a plain `cargo run` shows the icon without installing anything: the assets are staged into `$XDG_CACHE_HOME/mutiny/icons` and added to the GTK icon theme search path.
+The SVG and seven PNG renders (16 to 512) for each of the two states live in `assets/icon/` and are embedded in the binary, so a plain `cargo run` shows the icon without installing anything: the assets are staged into `$XDG_CACHE_HOME/mutiny/icons` and added to the GTK icon theme search path.
 
 To get a launcher entry and make the icon available to other apps:
 
@@ -244,6 +244,8 @@ mutiny install-desktop
 ```
 
 That writes the hicolor icons and `~/.local/share/applications/dev.mutiny.Terminal.desktop`, pointing `Exec` at the binary you ran it from. It is idempotent: unchanged files are left alone so icon caches are not invalidated. Run it from your release build if that is what you launch.
+
+**Agent-active state.** While an external agent is driving the terminal, the icon switches to a blue plate with the skull's eyes glowing red, so agent control is glanceable in a taskbar. It reverts to the idle skull when the agent goes quiet. The trigger is the same signal as the in-window agent badge (a non-Operator carrier call within the last 15 seconds), so the icon and the badge can never disagree, and that window is the debounce: a brief act holds the state rather than flickering. Blue and red are the GitHub Primer hues Haven uses. The installed `.desktop` keeps the idle icon, so the launcher never looks like an agent is running.
 
 The application id, icon name, desktop basename, and `StartupWMClass` are all `dev.mutiny.Terminal`. The program name is set to that id too, because X11 `WM_CLASS` derives from the program name rather than the application id; without it the taskbar would show a second, iconless entry.
 
@@ -384,7 +386,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 161 tests, no display required
+cargo test                    # 163 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
