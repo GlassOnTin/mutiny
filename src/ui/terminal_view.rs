@@ -31,6 +31,10 @@ mod imp {
         pub pane_id: Cell<Option<PaneId>>,
         pub controller: RefCell<Weak<AppController>>,
         pub font_desc: RefCell<Option<pango::FontDescription>>,
+        /// Test-only: record where each glyph was drawn, so a test can prove
+        /// text lands on the grid. Off in normal use.
+        pub record_glyphs: Cell<bool>,
+        pub glyph_positions: RefCell<Vec<(usize, usize, f32)>>,
         pub cell_w: Cell<f32>,
         pub cell_h: Cell<f32>,
         pub drag_origin_px: Cell<(f64, f64)>,
@@ -515,6 +519,10 @@ impl TerminalView {
         let sel_range = term.selection.as_ref().and_then(|s| s.to_range(term));
         let preedit = self.imp().preedit.borrow().clone();
 
+        if self.imp().record_glyphs.get() {
+            self.imp().glyph_positions.borrow_mut().clear();
+        }
+
         let key = RenderCacheKey {
             cols,
             rows,
@@ -621,65 +629,78 @@ impl TerminalView {
                         }
                     }
 
-                    // Pass 2: styled text runs rendered as GskTextNode via Pango Layout
+                    // Pass 2: styled text, one glyph cluster per cell, each
+                    // placed at its OWN grid origin.
+                    //
+                    // Drawing a run as a single Pango layout used the font's
+                    // natural advance (8.83 px for Monospace 11) while the grid
+                    // and the cursor use the cell width (ceil -> 9 px). A run
+                    // therefore ended short of its grid span and the cursor
+                    // appeared to drift past the end of the text, by about
+                    // 0.17 px per column. Per-cell placement is exact for any
+                    // font, including fallbacks whose advance differs.
                     let mut col = 0usize;
-                    let mut run_text = String::new();
+                    let mut current: Option<RunStyle> = None;
+                    let mut current_underline = false;
+                    let mut cluster = String::new();
+                    let recording = self.imp().record_glyphs.get();
                     while col < cols {
                         let cell = &grid_row[Column(col)];
                         if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
                             col += 1;
                             continue;
                         }
-                        if cell.c == ' ' && !cell.flags.contains(CellFlags::UNDERLINE) {
+                        let underline = cell.flags.contains(CellFlags::UNDERLINE);
+                        if cell.c == ' ' && !underline {
                             col += 1;
                             continue;
                         }
 
-                        let start_col = col;
                         let style = RunStyle::from_cell(cell, &cfg);
-                        run_text.clear();
-                        run_text.push(cell.c);
-                        let underline = cell.flags.contains(CellFlags::UNDERLINE);
-                        col += 1;
-
-                        while col < cols {
-                            let next = &grid_row[Column(col)];
-                            if next.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
-                                col += 1;
-                                continue;
+                        let fg_rgba = rgb_to_gdk(style.fg, 1.0);
+                        if current.as_ref() != Some(&style) || underline != current_underline {
+                            let mut desc = base_font.clone();
+                            if style.bold {
+                                desc.set_weight(pango::Weight::Bold);
                             }
-                            if RunStyle::from_cell(next, &cfg) != style
-                                || next.flags.contains(CellFlags::UNDERLINE) != underline
-                            {
-                                break;
+                            if style.italic {
+                                desc.set_style(pango::Style::Italic);
                             }
-                            run_text.push(next.c);
-                            col += 1;
+                            layout.set_font_description(Some(&desc));
+                            current = Some(style);
+                            current_underline = underline;
                         }
 
-                        let mut desc = base_font.clone();
-                        if style.bold {
-                            desc.set_weight(pango::Weight::Bold);
+                        // Combining marks belong to this cell's cluster, so they
+                        // render on the base glyph instead of being dropped.
+                        cluster.clear();
+                        cluster.push(cell.c);
+                        if let Some(marks) = cell.zerowidth() {
+                            for mark in marks {
+                                cluster.push(*mark);
+                            }
                         }
-                        if style.italic {
-                            desc.set_style(pango::Style::Italic);
-                        }
-                        layout.set_font_description(Some(&desc));
-                        layout.set_text(&run_text);
+                        layout.set_text(&cluster);
 
-                        let x = padding + (start_col as f32) * cw;
+                        let x = padding + (col as f32) * cw;
                         sub.save();
                         sub.translate(&graphene::Point::new(x, y));
-                        sub.append_layout(&layout, &rgb_to_gdk(style.fg, 1.0));
+                        sub.append_layout(&layout, &fg_rgba);
                         sub.restore();
 
                         if underline {
-                            let span_w = ((col - start_col) as f32) * cw;
                             sub.append_color(
-                                &rgb_to_gdk(style.fg, 0.85),
-                                &graphene::Rect::new(x, y + ch - 1.5, span_w, 1.0),
+                                &rgb_to_gdk(current.as_ref().unwrap().fg, 0.85),
+                                &graphene::Rect::new(x, y + ch - 1.5, cw, 1.0),
                             );
                         }
+                        if recording {
+                            self.imp()
+                                .glyph_positions
+                                .borrow_mut()
+                                .push((row_idx, col, x));
+                        }
+                        col += 1;
                     }
 
                     cache[row_idx] = sub.to_node();
@@ -782,6 +803,25 @@ impl TerminalView {
 
     /// Rows rebuilt by the most recent `render_snapshot`. Zero means the frame
     /// reused every cached row node.
+    /// Test-only: record the (row, column, x) of every glyph drawn in the next
+    /// frame, so a test can assert text lands exactly on the cell grid.
+    pub fn record_glyph_positions(&self, on: bool) {
+        self.imp().record_glyphs.set(on);
+        self.imp().glyph_positions.borrow_mut().clear();
+    }
+
+    pub fn glyph_positions(&self) -> Vec<(usize, usize, f32)> {
+        self.imp().glyph_positions.borrow().clone()
+    }
+
+    pub fn cell_width(&self) -> f32 {
+        self.imp().cell_w.get()
+    }
+
+    pub fn cell_height(&self) -> f32 {
+        self.imp().cell_h.get()
+    }
+
     pub fn rows_rebuilt_last_frame(&self) -> usize {
         self.imp().rows_rebuilt.get()
     }

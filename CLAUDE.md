@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 157 tests: 95 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 tabstrip + 1 appicon + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 158 tests: 95 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 tabstrip + 1 appicon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -292,6 +292,16 @@ Wrapping trades width for height, so the FlowBox sits in a `ScrolledWindow` with
 `scroll_active_tab_into_view` runs on a tick callback, like the split-ratio restore, because allocations are not ready during `rebuild_from_model`. Use `compute_bounds`, not the deprecated `WidgetExt::allocation`.
 
 `tests/tab_strip.rs` asserts the minimum width grows by at most one tab and then PLATEAUS as more tabs are added, that rows increase, that the visible strip respects the cap while its content overflows, and that clicking a wrapped tab still focuses it. The plateau assertion is the discriminating one: a sum-of-children layout cannot pass it.
+
+### Text is placed per cell, not per run
+
+The cursor is drawn at `grid.cursor.point * cell_size`, which was always correct. The bug was the TEXT: a style run drawn as one Pango layout uses the font's natural advance (8.83 px for Monospace 11) while the grid uses `ceil(approximate_char_width)` = 9 px. The shortfall accumulated per column, so a line ended about 0.17 px per column short of its grid span and the cursor looked like it drifted past the end.
+
+The text pass therefore draws one glyph cluster per cell at `padding + col * cw`, including the cell's `zerowidth()` combining marks (which the run path dropped). This is exact for any font, including fallbacks whose advance differs. Do not "optimise" it back into runs without also forcing the advance per cluster.
+
+Cost, measured: full repaint 646.9 -> 1741.6 us, idle frame 4.9 -> 25.3 us. See benches/BASELINE.md. A per-glyph layout cache keyed on (cluster, style) is the mitigation if it ever matters.
+
+`record_glyph_positions(true)` makes the next frame log (row, col, x) for every glyph, which is how `tests/cursor_grid.rs` proves the grid invariant. It is off in normal use.
 
 ### Rendering
 

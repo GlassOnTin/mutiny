@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 157 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 158 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -27,7 +27,8 @@ Working today:
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
-- Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 131x cheaper than a full repaint, measured under Xvfb.
+- Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 69x cheaper than a full repaint, measured under Xvfb.
+- Text is placed one glyph cluster per cell, so the drawn cursor sits exactly on the emulator's grid cursor instead of drifting past the end of the line.
 - Session restore: layout, split ratios, working directories, and scrollback survive a restart. See [Session restore](#session-restore).
 - A session picker (`Ctrl+Shift+S`) lists tmux and zellij sessions, local and over SSH, and opens one in a new tab or window. See [Multiplexer sessions](#multiplexer-sessions).
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
@@ -364,7 +365,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 157 tests, no display required
+cargo test                    # 158 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
