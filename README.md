@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 152 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 157 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -116,6 +116,7 @@ One binary, three entry points:
 
 ```sh
 mutiny                          # GUI, binds both control sockets
+mutiny install-desktop          # app icon + launcher into ~/.local/share
 mutiny ctl list                 # human and script CLI, JSON output
 mutiny mcp --consent ask        # stdio JSON-RPC 2.0 MCP server for an agent
 ```
@@ -209,6 +210,22 @@ mutiny --http-bind 10.1.0.4:18740 --agent-consent paired
 The phone, a peer on the same gateway-hosted WG server, reached `http://10.1.0.4:18740/mcp` directly with no SSH forward involved. Unpaired and wrong-token requests got `401`, the paired token got `200`, all 18 tools and all 6 resources listed (4 static plus one snapshot per live pane), a command sent from the phone executed on the desktop, and `spawn_pane` added a second pane. The audit again showed `carrier=paired` and never `operator`.
 
 A split tunnel is enough: routing only the tunnel subnet to the WG interface leaves the default route alone, so nothing else on the workstation changes.
+
+## App icon and launcher
+
+Mutiny ships a Jolly Roger skull whose eye sockets are square terminal cells and whose mouth is a cursor bar. Flat white on deep navy (`#1A1A2E`), matching the Haven sibling icon's palette and weight, with no gradients or strokes so it stays legible at 16 px.
+
+The SVG and seven PNG renders (16 to 512) live in `assets/icon/` and are embedded in the binary, so a plain `cargo run` shows the icon without installing anything: the assets are staged into `$XDG_CACHE_HOME/mutiny/icons` and added to the GTK icon theme search path.
+
+To get a launcher entry and make the icon available to other apps:
+
+```sh
+mutiny install-desktop
+```
+
+That writes the hicolor icons and `~/.local/share/applications/dev.mutiny.Terminal.desktop`, pointing `Exec` at the binary you ran it from. It is idempotent: unchanged files are left alone so icon caches are not invalidated. Run it from your release build if that is what you launch.
+
+The application id, icon name, desktop basename, and `StartupWMClass` are all `dev.mutiny.Terminal`. The program name is set to that id too, because X11 `WM_CLASS` derives from the program name rather than the application id; without it the taskbar would show a second, iconless entry.
 
 ## Configuration
 
@@ -347,7 +364,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 152 tests, no display required
+cargo test                    # 157 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

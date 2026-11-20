@@ -110,6 +110,8 @@ impl From<McpConsentArg> for ConsentMode {
 
 #[derive(Debug, Subcommand)]
 enum TopCommand {
+    /// Install the app icon and desktop entry into your user data dir
+    InstallDesktop,
     /// Control a running Mutiny instance over its Unix domain socket
     Ctl {
         #[command(subcommand)]
@@ -303,6 +305,25 @@ fn main() -> ExitCode {
     let operator_path = explicit_socket.clone().unwrap_or_else(default_socket_path);
 
     match cli.command {
+        Some(TopCommand::InstallDesktop) => match mutiny::desktop::install() {
+            Ok(report) => {
+                for path in &report.icons {
+                    println!("icon: {}", path.display());
+                }
+                match &report.desktop {
+                    Some(path) => println!("desktop entry: {}", path.display()),
+                    None => println!("desktop entry: already up to date"),
+                }
+                if report.icons.is_empty() && report.desktop.is_none() {
+                    println!("everything already installed and unchanged");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("mutiny install-desktop failed: {err}");
+                ExitCode::from(1)
+            }
+        },
         Some(TopCommand::Ctl { verb }) => run_ctl(&operator_path, verb),
         Some(TopCommand::Mcp {
             consent,
@@ -686,9 +707,28 @@ fn run_gui_app(
     }
 
     let ctrl_startup = Rc::clone(&controller);
+    // X11 WM_CLASS comes from the program name, not the application id. Without
+    // this it is "mutiny", which would not match the desktop file's
+    // StartupWMClass and would give the taskbar a second, iconless entry.
+    gtk4::glib::set_prgname(Some(mutiny::desktop::APP_ID));
+
     app.connect_startup(move |gtk_app| {
         ctrl_startup.attach_gtk_app(gtk_app);
         gtk_app.set_menubar(Some(&build_menubar_model()));
+
+        // App icon. The name matches the application id and the installed
+        // hicolor icon, so the window, the taskbar, and the launcher all agree.
+        // The embedded assets are also exposed as a private search path, so a
+        // plain `cargo run` shows the icon without installing anything.
+        gtk4::Window::set_default_icon_name(mutiny::desktop::APP_ID);
+        match mutiny::desktop::ensure_icon_search_path() {
+            Ok(path) => {
+                if let Some(display) = gtk4::gdk::Display::default() {
+                    gtk4::IconTheme::for_display(&display).add_search_path(&path);
+                }
+            }
+            Err(err) => eprintln!("warning: could not stage the app icon: {err}"),
+        }
 
         for spec in ACTIONS {
             if let Some(accel) = spec.default_accel {

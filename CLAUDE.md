@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 152 tests: 91 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 tabstrip + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 157 tests: 95 unit + 7 config + 11 e2e + 7 http + 10 mux + 1 picker + 1 tabstrip + 1 appicon + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -272,6 +272,16 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### App icon and desktop identity
+
+`src/desktop.rs` embeds the SVG and seven PNGs with `include_bytes!`, the same self-contained approach as the shell-integration snippets. `ensure_icon_search_path` stages them into `$XDG_CACHE_HOME/mutiny/icons` in hicolor layout and the GUI adds that to the GTK icon theme, so a source checkout shows its icon with no install step. `mutiny install-desktop` writes the same bytes into the user's data home plus the `.desktop` entry, and is idempotent (contents compared before writing, so icon caches are not churned).
+
+`APP_ID` is the single source for the application id, icon name, desktop basename, and `StartupWMClass`. **X11 `WM_CLASS` comes from the program name, not the application id**, so `glib::set_prgname` must be called with `APP_ID` before windows exist; otherwise `WM_CLASS` is "mutiny", the launcher does not match the running window, and the taskbar grows a second iconless entry. Verified with `xprop`: `WM_CLASS` is `dev.mutiny.Terminal` and `_NET_WM_ICON` carries the 16 px render.
+
+The icon is set both globally (`Window::set_default_icon_name`) and per window (`.icon_name(...)`), because the global default is not observable through the per-window getter and X11 reads the window property.
+
+Icon assets are generated, not hand-drawn per size: edit `assets/icon/dev.mutiny.Terminal.svg` and re-render. Keep to plain shapes and flat fills, which is both the Haven design language and what every SVG renderer agrees on.
 
 ### The tab strip wraps; it must never size the window
 

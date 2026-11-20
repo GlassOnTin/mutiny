@@ -61,6 +61,9 @@ impl MutinyWindow {
         let gtk_window = gtk4::ApplicationWindow::builder()
             .application(app)
             .title("Mutiny")
+            // Set per window as well as via the global default: on X11 this is
+            // what the taskbar reads, and it keeps the intent explicit.
+            .icon_name(crate::desktop::APP_ID)
             .default_width(win_w)
             .default_height(win_h)
             .show_menubar(false)
@@ -534,6 +537,11 @@ impl MutinyWindow {
             }
             glib::ControlFlow::Break
         });
+    }
+
+    /// The icon name this window advertises to the shell and taskbar.
+    pub fn icon_name(&self) -> Option<String> {
+        self.inner.gtk_window.icon_name().map(|s| s.to_string())
     }
 
     /// The toplevel's minimum horizontal size. This is what forces a window to
