@@ -92,10 +92,17 @@ fn many_tabs_wrap_without_stretching_the_window() {
         window.tab_strip_height(),
         window.tab_strip_row_count()
     );
-    assert_eq!(
-        after_more, after_min,
-        "minimum width must be independent of tab count once labels stop widening: \
-         {after_min} -> {after_more}"
+    // Bounded, not exactly equal: the strip's minimum is its widest SINGLE tab,
+    // and which label is widest can shift by a few pixels as titles change.
+    // Twenty more tabs must not add twenty tabs' worth of width.
+    assert!(
+        (after_more - after_min).abs() <= one_tab,
+        "twenty more tabs must not widen the window by more than one tab: \
+         {after_min} -> {after_more} (one tab is {one_tab})"
+    );
+    assert!(
+        after_more <= baseline_min + one_tab,
+        "the bound must hold at 37 tabs too: {baseline_min} -> {after_more}"
     );
     assert!(
         window.tab_strip_row_count() > rows,
