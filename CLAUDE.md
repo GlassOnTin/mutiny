@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 174 tests: 97 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 restoregui + 3 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 3 session + 1 shell + 7 queries
+cargo test                               # 176 tests: 97 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 restoregui + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -114,7 +114,9 @@ Five IPC verbs had shorter ctl names than their wire names. They now carry `#[co
 
 ### Session restore
 
-**`attach_gtk_app` must materialise any model window that has no view.** `ensure_ui_window` returns early when no application is attached, so a restore that runs before startup populates the model but creates no widgets, leaving an application with nothing to show, which GTK then exits. This was a real bug: session restore had never worked in the GUI, and the headless tests could not see it because they never attach an application. Restore now runs in `connect_activate`, and `attach_gtk_app` also creates views for existing model windows so the ordering is safe either way. `tests/restore_gui.rs` restores BEFORE attaching on purpose to guard it.
+**`attach_gtk_app` must materialise any model window that has no view.** `ensure_ui_window` returns early when no application is attached, so a restore that runs before startup populates the model but creates no widgets, leaving an application with nothing to show, which GTK then exits. This was a real bug: session restore had never worked in the GUI, and the headless tests could not see it because they never attach an application. Restore now runs in `connect_activate`, and `attach_gtk_app` also creates views for existing model windows so the ordering is safe either way.
+
+**The exit save must not run on an empty workspace.** `handle_window_closed` removes the window from the model before quitting, so the save after `app.run` captured nothing and wiped the bundle. Closing the last window is how people actually quit, so that path lost the layout every time. `save_before_last_window_goes` captures it while the last window still exists, and the exit save is skipped when the workspace is empty. `tests/restore_gui.rs` restores BEFORE attaching on purpose to guard it.
 
 
 

@@ -333,3 +333,46 @@ fn every_ipc_verb_name_is_accepted_by_the_cli() {
         );
     }
 }
+
+/// The natural quit path: closing the last WINDOW, not `ctl quit`. The exit save
+/// runs after the model has been emptied, so this path used to wipe the bundle
+/// and restore had nothing to reopen. It is how people actually quit.
+#[test]
+fn closing_the_last_window_preserves_the_layout_for_next_launch() {
+    if !display_available() {
+        eprintln!("skipping: no DISPLAY (CI runs this under Xvfb)");
+        return;
+    }
+    let mut h = Harness::new("lastwin");
+    h.launch(&["--no-restore"]);
+    assert!(h.ctl(&["spawn-tab"]).is_some());
+    assert!(h.ctl(&["spawn-tab"]).is_some());
+    let built = h.layout();
+    assert_eq!(built[0].1.len(), 3, "three tabs: {built:?}");
+
+    // Close the only window. The app should save, then exit.
+    assert!(
+        h.ctl(&["close-window"]).is_some(),
+        "close-window must reply"
+    );
+    h.wait_exit();
+
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.session_file()).unwrap()).unwrap();
+    assert_eq!(
+        saved["windows"].as_array().unwrap().len(),
+        1,
+        "closing the last window must not wipe the bundle: {saved}"
+    );
+    assert_eq!(saved["panes"].as_array().unwrap().len(), 3);
+
+    // And the next launch really reopens it.
+    h.launch(&[]);
+    assert_eq!(
+        h.layout(),
+        built,
+        "the layout must come back after a natural quit"
+    );
+    h.ctl(&["quit"]);
+    h.wait_exit();
+}

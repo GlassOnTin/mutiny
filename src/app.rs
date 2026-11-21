@@ -1252,6 +1252,7 @@ impl AppController {
     }
 
     pub fn close_pane(self: &Rc<Self>, pane_id: PaneId) {
+        self.save_before_last_window_goes();
         let src_win = self.workspace.borrow().locate_pane(pane_id).map(|(w, _)| w);
         let _dropped = self.workspace.borrow_mut().close_pane(pane_id);
         if let Some(win_id) = src_win {
@@ -1294,7 +1295,20 @@ impl AppController {
         true
     }
 
+    /// Saves the layout before a mutation that could empty the workspace.
+    ///
+    /// The exit save in `main` runs after the last window has been removed from
+    /// the model, so on a normal quit it captured an EMPTY workspace and wiped
+    /// the bundle. Closing the last window is how people actually quit, so that
+    /// path silently lost the layout every time.
+    fn save_before_last_window_goes(&self) {
+        if self.workspace.borrow().windows().len() == 1 {
+            let _ = self.save_session();
+        }
+    }
+
     pub fn handle_window_closed(&self, win_id: WindowId) {
+        self.save_before_last_window_goes();
         self.ui_windows.borrow_mut().remove(&win_id);
         let _dropped = self.workspace.borrow_mut().close_window(win_id);
         self.quit_if_empty();

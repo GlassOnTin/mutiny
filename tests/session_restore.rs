@@ -421,3 +421,65 @@ fn saved_session_list_reopens_in_order_and_reattaches() {
     second.shutdown_ipc();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Closing the last window is how people actually quit. The exit save runs
+/// after the model has been emptied, so it used to wipe the bundle. The layout
+/// must be captured before the workspace goes empty.
+#[test]
+fn closing_the_last_window_does_not_wipe_the_saved_layout() {
+    let dir = std::env::temp_dir().join(format!("mutiny-lastwin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_file = dir.join("session.json");
+    let ctrl = AppController::with_config(
+        Some((String::from("/bin/sh"), Vec::new())),
+        dir.join("audit.jsonl"),
+        dir.join("config.toml"),
+        Overrides::default(),
+    );
+    ctrl.set_session_path(session_file.clone());
+    let (w, _t, _p) = ctrl.create_window(None).expect("window");
+    ctrl.create_tab(Some(w), None).expect("tab");
+    ctrl.create_tab(Some(w), None).expect("tab");
+
+    // Closing the window empties the model, exactly as a WM close does.
+    ctrl.handle_window_closed(w);
+    assert!(
+        ctrl.workspace.borrow().windows().is_empty(),
+        "model is now empty"
+    );
+
+    let state = mutiny::session::load(&session_file)
+        .expect("load")
+        .expect("a bundle must exist");
+    assert_eq!(state.windows.len(), 1, "the layout must survive the close");
+    assert_eq!(
+        state.windows[0].tabs.len(),
+        3,
+        "all three tabs must be saved"
+    );
+    assert_eq!(state.panes.len(), 3);
+
+    // Closing the last PANE must preserve it too, not just closing the window.
+    let ctrl2 = AppController::with_config(
+        Some((String::from("/bin/sh"), Vec::new())),
+        dir.join("audit2.jsonl"),
+        dir.join("config.toml"),
+        Overrides::default(),
+    );
+    let file2 = dir.join("session2.json");
+    ctrl2.set_session_path(file2.clone());
+    let (_w2, _t2, p) = ctrl2.create_window(None).expect("window");
+    ctrl2.close_pane(p);
+    assert!(ctrl2.workspace.borrow().windows().is_empty());
+    let state2 = mutiny::session::load(&file2)
+        .expect("load")
+        .expect("bundle");
+    assert_eq!(
+        state2.panes.len(),
+        1,
+        "closing the last pane must still save"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

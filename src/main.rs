@@ -803,7 +803,12 @@ fn run_gui_app(
     }
     // Save on clean exit. A crash loses changes since the last save, which is
     // the accepted consequence of having no multiplexer daemon.
-    if let Err(err) = controller.save_session() {
+    // Only save a non-empty workspace. An empty one means the last window was
+    // just closed, and `save_before_last_window_goes` already captured the
+    // layout at that moment; saving again here would wipe it.
+    if !controller.workspace.borrow().windows().is_empty()
+        && let Err(err) = controller.save_session()
+    {
         eprintln!("warning: session not saved: {err}");
     }
     controller.shutdown_ipc();
