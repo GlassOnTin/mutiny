@@ -133,6 +133,7 @@ enum CtlVerb {
     /// List every registered ActionSpec verb, shortcut, consent tier, and slug
     Actions,
     /// Inspect redacted agent/IPC audit history
+    #[command(alias = "audit-log")]
     Audit {
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -158,6 +159,7 @@ enum CtlVerb {
         max_matches: usize,
     },
     /// Trigger any ActionSpec verb by slug (e.g. `detach-split`, `urgent-next`)
+    #[command(alias = "run-action")]
     Run {
         slug: String,
         #[arg(long)]
@@ -238,9 +240,22 @@ enum CtlVerb {
         #[arg(long)]
         pane: Option<u64>,
     },
+    /// Close a whole tab (defaults to the active tab)
+    CloseTab {
+        #[arg(long)]
+        window: Option<u64>,
+        #[arg(long)]
+        tab: Option<u64>,
+    },
+    /// Close a whole window and every pane in it
+    CloseWindow {
+        #[arg(long)]
+        window: Option<u64>,
+    },
     /// Save the session and quit Mutiny
     Quit,
     /// List tmux and zellij sessions. Omit --host for this machine only
+    #[command(alias = "list-sessions")]
     Sessions {
         #[arg(long)]
         host: Option<String>,
@@ -280,11 +295,13 @@ enum CtlVerb {
         pane: Option<u64>,
     },
     /// Read the visible viewport text of a pane
+    #[command(alias = "screen-text")]
     Screen {
         #[arg(long)]
         pane: Option<u64>,
     },
     /// Block until the next OSC 133 prompt arrives on the target pane
+    #[command(alias = "wait-prompt")]
     Wait {
         #[arg(long)]
         pane: Option<u64>,
@@ -479,6 +496,13 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::SaveSession => IpcRequest::SaveSession,
         CtlVerb::ClosePane { pane } => IpcRequest::ClosePane {
             pane: pane.map(PaneId),
+        },
+        CtlVerb::CloseTab { window, tab } => IpcRequest::CloseTab {
+            window: window.map(WindowId),
+            tab: tab.map(TabId),
+        },
+        CtlVerb::CloseWindow { window } => IpcRequest::CloseWindow {
+            window: window.map(WindowId),
         },
         CtlVerb::Quit => IpcRequest::Quit,
         CtlVerb::Sessions { host, refresh } => IpcRequest::ListSessions { host, refresh },

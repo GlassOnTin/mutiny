@@ -64,6 +64,8 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::OpenSession { .. } => Some(McpSurface::Tool("open_session")),
         IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
         IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
+        IpcRequest::CloseTab { .. } => Some(McpSurface::Tool("close_tab")),
+        IpcRequest::CloseWindow { .. } => Some(McpSurface::Tool("close_window")),
         IpcRequest::Quit => Some(McpSurface::Tool("quit")),
     }
 }
@@ -573,6 +575,22 @@ impl McpBridge {
                 },
                 Duration::from_secs(15),
             ),
+            "close_tab" => (
+                IpcRequest::CloseTab {
+                    window: opt_win("window"),
+                    tab: args
+                        .get("tab")
+                        .and_then(Value::as_u64)
+                        .map(crate::topology::TabId),
+                },
+                Duration::from_secs(15),
+            ),
+            "close_window" => (
+                IpcRequest::CloseWindow {
+                    window: opt_win("window"),
+                },
+                Duration::from_secs(15),
+            ),
             "quit" => (IpcRequest::Quit, Duration::from_secs(15)),
             "list_sessions" => {
                 let host = args.get("host").and_then(Value::as_str).map(str::to_owned);
@@ -874,6 +892,22 @@ pub fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": { "pane": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "close_tab",
+            "description": "Tier-2 Act: close a whole tab, defaulting to the active tab of the active window. Closing the last tab closes its window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "window": { "type": "integer" }, "tab": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "close_window",
+            "description": "Tier-2 Act: close a whole window and every pane in it, defaulting to the active window. Multiplexer clients die with their panes; the servers do not.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "window": { "type": "integer" } }
             }
         },
         {

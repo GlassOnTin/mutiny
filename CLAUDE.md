@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 171 tests: 97 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 restoregui + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 3 session + 1 shell + 7 queries
+cargo test                               # 174 tests: 97 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 restoregui + 3 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 3 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -102,6 +102,16 @@ alacritty's `Pty::drop` sends SIGHUP and then blocks in `child.wait()`. A shell 
 
 Do not remove that Drop or replace it with a plain SIGHUP. Exit-code capture is unaffected because `drain_pty` observes `ChildExited` before the engine is dropped.
 
+### The binary smoke test is the guard for the real startup path
+
+`tests/binary_smoke.rs` spawns the actual binary (`env!("CARGO_BIN_EXE_mutiny")`), drives it through `ctl`, and checks launch, spawn, close, save, quit, and relaunch-with-restore. Every other GUI test constructs widgets directly, which bypasses startup ordering entirely: session restore was fully covered headlessly and still broken in the GUI. This test reproduces that bug when both halves of its fix are reverted, which is the point of having it.
+
+It skips when `DISPLAY` is empty (the displayless CI job) and uses a fake tmux fixture, so it is deterministic and never touches real sessions. A `Guard` kills the child on drop, and readiness is the control socket answering `ctl list`, not a sleep.
+
+### CLI naming: both spellings work
+
+Five IPC verbs had shorter ctl names than their wire names. They now carry `#[command(alias = ...)]` so the wire name also resolves, without breaking the short name. `every_ipc_verb_name_is_accepted_by_the_cli` walks every verb name and asserts `ctl <name> --help` succeeds, so a new verb cannot drift again.
+
 ### Session restore
 
 **`attach_gtk_app` must materialise any model window that has no view.** `ensure_ui_window` returns early when no application is attached, so a restore that runs before startup populates the model but creates no widgets, leaving an application with nothing to show, which GTK then exits. This was a real bug: session restore had never worked in the GUI, and the headless tests could not see it because they never attach an application. Restore now runs in `connect_activate`, and `attach_gtk_app` also creates views for existing model windows so the ordering is safe either way. `tests/restore_gui.rs` restores BEFORE attaching on purpose to guard it.
@@ -112,7 +122,7 @@ Do not remove that Drop or replace it with a plain SIGHUP. Exit-code capture is 
 
 Mutiny-owned shells are never restored. That is the no-daemon contract, not a missing feature: a restore spawns fresh shells in saved cwds and replays scrollback. Do not add process resurrection for them without revisiting the crash-semantics contract in VISION.
 
-Three verbs fill gaps the CLI surface had: `save-session` (snapshot the layout now, rather than only on clean exit), `close-pane` (the symmetric counterpart to the spawn verbs, previously reachable only through `run close-pane`), and `quit` (save then quit, deferring the quit to an idle callback so the reply is written first). All are Act.
+Five verbs fill gaps the CLI surface had: `save-session` (snapshot now, not only on clean exit), `close-pane`, `close-tab`, `close-window` (the counterparts to the spawn verbs, previously reachable only through `run close-pane`), and `quit` (save then quit, deferring the quit to an idle callback so the reply is written first). All are Act. `close_tab` closes the tab's panes so the existing cascade applies rather than duplicating teardown logic.
 
 `SessionPane.mux` is the exception and not a violation: a pane attached to tmux or zellij saves its `MuxSessionRef` and RE-ATTACHES on restore, because the multiplexer owns those processes. Two rules follow. Do not replay saved scrollback into an attaching pane, since the multiplexer owns and redraws that screen. And a remote session's saved cwd is a path on that host, so it must not become a local cwd. The field is `#[serde(default)]`, so bundles written before it still load and `SESSION_VERSION` stays 1.
 

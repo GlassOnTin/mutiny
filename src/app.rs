@@ -1260,6 +1260,40 @@ impl AppController {
         self.quit_if_empty();
     }
 
+    /// Closes a whole tab by closing its panes, so the same cascade applies:
+    /// the last pane removes the tab, and the last tab removes the window.
+    pub fn close_tab(self: &Rc<Self>, win_id: WindowId, tab_id: TabId) -> bool {
+        let panes: Vec<PaneId> = {
+            let ws = self.workspace.borrow();
+            let Some(wm) = ws.window(win_id) else {
+                return false;
+            };
+            let Some(tab) = wm.tabs.iter().find(|t| t.id == tab_id) else {
+                return false;
+            };
+            tab.root.leaves()
+        };
+        if panes.is_empty() {
+            return false;
+        }
+        for pid in panes {
+            self.close_pane(pid);
+        }
+        true
+    }
+
+    /// Closes a whole window and every pane in it.
+    pub fn close_window(self: &Rc<Self>, win_id: WindowId) -> bool {
+        if self.workspace.borrow().window(win_id).is_none() {
+            return false;
+        }
+        if let Some(ui) = self.ui_windows.borrow().get(&win_id).cloned() {
+            ui.close_programmatically();
+        }
+        self.handle_window_closed(win_id);
+        true
+    }
+
     pub fn handle_window_closed(&self, win_id: WindowId) {
         self.ui_windows.borrow_mut().remove(&win_id);
         let _dropped = self.workspace.borrow_mut().close_window(win_id);
@@ -1861,6 +1895,34 @@ impl AppController {
                 Ok(()) => Some(IpcResponse::empty_ok()),
                 Err(err) => Some(IpcResponse::err(format!("could not save session: {err}"))),
             },
+            IpcRequest::CloseTab { window, tab } => {
+                let ws = self.workspace.borrow();
+                let win = window.or_else(|| ws.active_window_id());
+                let Some(win) = win else {
+                    return Some(IpcResponse::err("no active window"));
+                };
+                let tab = tab.or_else(|| ws.window(win).map(|w| w.active_tab));
+                drop(ws);
+                let Some(tab) = tab else {
+                    return Some(IpcResponse::err("no active tab"));
+                };
+                if self.close_tab(win, tab) {
+                    Some(IpcResponse::empty_ok())
+                } else {
+                    Some(IpcResponse::err(format!("no such tab {}", tab.0)))
+                }
+            }
+            IpcRequest::CloseWindow { window } => {
+                let win = window.or_else(|| self.workspace.borrow().active_window_id());
+                let Some(win) = win else {
+                    return Some(IpcResponse::err("no active window"));
+                };
+                if self.close_window(win) {
+                    Some(IpcResponse::empty_ok())
+                } else {
+                    Some(IpcResponse::err(format!("no such window {}", win.0)))
+                }
+            }
             IpcRequest::ClosePane { pane } => {
                 let pid = pane.or_else(|| self.workspace.borrow().active_pane_id());
                 let Some(pid) = pid else {

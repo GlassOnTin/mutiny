@@ -161,6 +161,15 @@ pub enum IpcRequest {
     ClosePane {
         pane: Option<PaneId>,
     },
+    /// Closes a whole tab. Defaults to the active tab of the active window.
+    CloseTab {
+        window: Option<WindowId>,
+        tab: Option<TabId>,
+    },
+    /// Closes a whole window and every pane in it. Defaults to the active one.
+    CloseWindow {
+        window: Option<WindowId>,
+    },
     /// Saves the session and quits. Act-tier: it ends every mutiny-owned shell.
     Quit,
     /// Lists tmux/zellij sessions. `host: None` means THIS machine only, which
@@ -257,6 +266,8 @@ impl IpcRequest {
             IpcRequest::OpenSession { .. } => ConsentTier::Act,
             IpcRequest::SaveSession => ConsentTier::Act,
             IpcRequest::ClosePane { .. } => ConsentTier::Act,
+            IpcRequest::CloseTab { .. } => ConsentTier::Act,
+            IpcRequest::CloseWindow { .. } => ConsentTier::Act,
             IpcRequest::Quit => ConsentTier::Act,
 
             IpcRequest::SpawnWindow { .. }
@@ -280,6 +291,8 @@ impl IpcRequest {
             IpcRequest::OpenSession { .. } => "open-session",
             IpcRequest::SaveSession => "save-session",
             IpcRequest::ClosePane { .. } => "close-pane",
+            IpcRequest::CloseTab { .. } => "close-tab",
+            IpcRequest::CloseWindow { .. } => "close-window",
             IpcRequest::Quit => "quit",
             IpcRequest::Actions => "actions",
             IpcRequest::AuditLog { .. } => "audit-log",
@@ -334,6 +347,8 @@ impl IpcRequest {
                 format!("host={host:?} refresh={refresh}")
             }
             IpcRequest::ClosePane { pane } => format!("pane={pane:?}"),
+            IpcRequest::CloseTab { window, tab } => format!("window={window:?} tab={tab:?}"),
+            IpcRequest::CloseWindow { window } => format!("window={window:?}"),
             IpcRequest::OpenSession {
                 kind,
                 name,
@@ -925,6 +940,11 @@ pub fn verb_samples() -> Vec<IpcRequest> {
         },
         IpcRequest::SaveSession,
         IpcRequest::ClosePane { pane: None },
+        IpcRequest::CloseTab {
+            window: None,
+            tab: None,
+        },
+        IpcRequest::CloseWindow { window: None },
         IpcRequest::Quit,
     ]
 }
@@ -961,6 +981,8 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::OpenSession { .. } => 23,
         IpcRequest::SaveSession => 24,
         IpcRequest::ClosePane { .. } => 25,
+        IpcRequest::CloseTab { .. } => 27,
+        IpcRequest::CloseWindow { .. } => 28,
         IpcRequest::Quit => 26,
     }
 }

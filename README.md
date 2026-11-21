@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 171 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 174 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -120,6 +120,8 @@ mutiny                          # GUI, binds both control sockets
 mutiny install-desktop          # app icon + launcher into ~/.local/share
 mutiny ctl save-session         # snapshot the current layout and session list now
 mutiny ctl quit                 # save, then quit
+mutiny ctl close-tab            # close a tab (--window/--tab to target)
+mutiny ctl close-window         # close a window and its panes
 mutiny ctl list                 # human and script CLI, JSON output
 mutiny mcp --consent ask        # stdio JSON-RPC 2.0 MCP server for an agent
 ```
@@ -325,7 +327,9 @@ One limit worth knowing: a pane running tmux gets no shell integration, because 
 
 On clean exit mutiny writes `$XDG_STATE_HOME/mutiny/session.json`, and on launch it restores that bundle unless you pass `--no-restore`. A restored session reproduces the window/tab/split layout with its divider ratios, each pane's working directory and grid size, and its scrollback.
 
-`mutiny ctl save-session` snapshots on demand; `mutiny ctl quit` saves and exits. Closing a pane is `mutiny ctl close-pane`, the counterpart to `spawn-tab` and `split`.
+`mutiny ctl save-session` snapshots on demand; `mutiny ctl quit` saves and exits. Closing is symmetric with opening: `close-pane`, `close-tab`, and `close-window`, each defaulting to the active target. Closing the last pane of a tab closes the tab, and the last tab closes its window.
+
+Every IPC verb name also works as a `ctl` subcommand. Five verbs had a shorter CLI name than their wire name (`audit` vs `audit-log`, `run` vs `run-action`, `sessions` vs `list-sessions`, `screen` vs `screen-text`, `wait` vs `wait-prompt`); both spellings now work, so reading the IPC surface and typing it at the CLI no longer diverges.
 
 The bundle carries the **opened session list with its window and tab ordering**, split trees and ratios, working directories, and scrollback. Reopening reproduces the arrangement exactly.
 
@@ -395,7 +399,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 171 tests, no display required
+cargo test                    # 174 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
