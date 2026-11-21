@@ -28,6 +28,7 @@ pub enum ActionId {
     CommandPalette,
     AgentAudit,
     SessionPicker,
+    NewSession,
     KeybindCheatsheet,
     JumpPrevPrompt,
     JumpNextPrompt,
@@ -51,6 +52,7 @@ impl ActionId {
         ActionId::CommandPalette,
         ActionId::AgentAudit,
         ActionId::SessionPicker,
+        ActionId::NewSession,
         ActionId::KeybindCheatsheet,
         ActionId::JumpPrevPrompt,
         ActionId::JumpNextPrompt,
@@ -294,6 +296,17 @@ pub const ACTIONS: &[ActionSpec] = &[
         summary: "Search and run any terminal action",
     },
     ActionSpec {
+        id: ActionId::NewSession,
+        slug: "new-session",
+        title: "New Session",
+        category: MenuCategory::Session,
+        consent_tier: ConsentTier::Act,
+        default_accel: None,
+        human_chord: "",
+        in_context_menu: false,
+        summary: "Create a new tmux or zellij session, or a plain shell, with a name you choose",
+    },
+    ActionSpec {
         id: ActionId::SessionPicker,
         slug: "session-picker",
         title: "Open Multiplexer Session",
@@ -409,6 +422,38 @@ pub fn parse_session_target(target: &str) -> Option<(crate::mux::MuxKind, Option
         return None;
     }
     Some((kind, host, name))
+}
+
+/// Tab-targeted context-menu actions. Parameterised by TabId, so they live
+/// outside `ACTIONS`: the target is a tab, not a keybind-able verb.
+pub const CLOSE_TAB_TARGET: &str = "win.close-tab-target";
+pub const DETACH_TAB_TARGET: &str = "win.detach-tab-target";
+pub const RENAME_TAB_TARGET: &str = "win.rename-session-tab";
+pub const COPY_NAME_TAB_TARGET: &str = "win.copy-session-name-tab";
+
+/// The right-click menu for one tab. Rename and Copy Name only appear when the
+/// tab is attached to a multiplexer session, because there is nothing to rename
+/// or copy otherwise. Killing a session is deliberately absent: the menu closes
+/// the tab, never the session.
+pub fn build_tab_menu_model(attached: bool, tab: u64) -> gio::Menu {
+    let menu = gio::Menu::new();
+    // A parameterised action needs its target ON THE ITEM, not just the action
+    // name: without it GTK renders the item insensitive and it cannot fire.
+    let targeted = |label: &str, action: &str| {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some(action), Some(&glib::Variant::from(tab)));
+        menu.append_item(&item);
+    };
+    if attached {
+        targeted("Rename Session…", RENAME_TAB_TARGET);
+    }
+    targeted("Close Tab", CLOSE_TAB_TARGET);
+    targeted("Detach to Window", DETACH_TAB_TARGET);
+    if attached {
+        targeted("Copy Session Name", COPY_NAME_TAB_TARGET);
+    }
+    menu.append(Some("New Session…"), Some("win.new-session"));
+    menu
 }
 
 /// Fills the Sessions submenu from a discovery snapshot. Live sessions first,

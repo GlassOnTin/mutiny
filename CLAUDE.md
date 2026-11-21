@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 176 tests: 97 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 restoregui + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 187 tests: 101 unit + 7 config + 11 e2e + 7 http + 14 mux + 5 menuia + 4 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -292,6 +292,18 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### Session management: create, rename, and the tab menu
+
+`create_argv` is separate from `attach_argv` on purpose. Attach passes tmux `-A` and zellij `attach --create`, both of which ATTACH on a name collision; create must fail instead, so it uses `new-session -s NAME` without `-A` and zellij's global `--session NAME`. Reusing the attach argv for creation is the bug this split prevents.
+
+`rename_session` runs the multiplexer's own command as a one-shot child, polled by `advance_mux_commands` with the same nonblocking drain and kill-then-reap rules as discovery. The pane refs are updated only AFTER the command exits successfully, so a failed rename never leaves mutiny claiming a name the multiplexer rejected. `apply_rename` updates every pane matching (kind, host, old name), not just the one that was right-clicked.
+
+`ActionId::NewTab` honours `preferred_mux`; the IPC `SpawnTab` verb deliberately does not, because agents and scripts ask for a shell explicitly.
+
+**A parameterised gio action needs its target on the MENU ITEM**, not just the action name. `menu.append(label, action)` on an action that takes a parameter renders the item insensitive and it never fires. `build_tab_menu_model(attached, tab)` uses `MenuItem::set_action_and_target_value`. A screenshot cannot distinguish "rendered but dead" from working, which is why `tests/tab_actions.rs` drives the real actions with `activate_action` instead of trusting the picture.
+
+Tab buttons carry no tooltip: the two-line label already shows name and host, and a tooltip window stacks over the right-click menu and hides items.
 
 ### Mouse reporting: the program owns the mouse when it asks
 

@@ -63,6 +63,8 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::ListSessions { .. } => Some(McpSurface::Tool("list_sessions")),
         IpcRequest::OpenSession { .. } => Some(McpSurface::Tool("open_session")),
         IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
+        IpcRequest::NewSession { .. } => Some(McpSurface::Tool("new_session")),
+        IpcRequest::RenameSession { .. } => Some(McpSurface::Tool("rename_session")),
         IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
         IpcRequest::CloseTab { .. } => Some(McpSurface::Tool("close_tab")),
         IpcRequest::CloseWindow { .. } => Some(McpSurface::Tool("close_window")),
@@ -569,6 +571,57 @@ impl McpBridge {
                 )
             }
             "save_session" => (IpcRequest::SaveSession, Duration::from_secs(15)),
+            "new_session" => {
+                let kind = match args.get("kind").and_then(Value::as_str) {
+                    None | Some("tmux") => Some(crate::mux::MuxKind::Tmux),
+                    Some("zellij") => Some(crate::mux::MuxKind::Zellij),
+                    Some("none") => None,
+                    Some(other) => {
+                        return Err((
+                            -32602,
+                            format!("unknown kind {other:?}: tmux, zellij, or none"),
+                        ));
+                    }
+                };
+                let mode_text = args.get("mode").and_then(Value::as_str).unwrap_or("tab");
+                let mode = crate::mux::SessionMode::parse(mode_text)
+                    .ok_or_else(|| (-32602, format!("unknown mode {mode_text:?}")))?;
+                (
+                    IpcRequest::NewSession {
+                        kind,
+                        name: args.get("name").and_then(Value::as_str).map(str::to_owned),
+                        mode,
+                        window: opt_win("window"),
+                    },
+                    Duration::from_secs(30),
+                )
+            }
+            "rename_session" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`name` is required")))?
+                    .to_owned();
+                let new_name = args
+                    .get("new_name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`new_name` is required")))?
+                    .to_owned();
+                let kind = match args.get("kind").and_then(Value::as_str).unwrap_or("tmux") {
+                    "tmux" => crate::mux::MuxKind::Tmux,
+                    "zellij" => crate::mux::MuxKind::Zellij,
+                    other => return Err((-32602, format!("unknown kind {other:?}"))),
+                };
+                (
+                    IpcRequest::RenameSession {
+                        kind,
+                        name,
+                        new_name,
+                        host: args.get("host").and_then(Value::as_str).map(str::to_owned),
+                    },
+                    Duration::from_secs(30),
+                )
+            }
             "close_pane" => (
                 IpcRequest::ClosePane {
                     pane: opt_pane("pane"),
@@ -878,6 +931,33 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "slug": { "type": "string" },
                     "window": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "new_session",
+            "description": "Tier-2 Act: create a NEW multiplexer session and open a pane on it. kind defaults to tmux; \"none\" opens a plain shell. Omit name to auto-name the smallest free mutiny-N. Fails if the name already exists, rather than attaching to it (use open_session for that).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["tmux", "zellij", "none"] },
+                    "name": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["window", "tab", "split-right", "split-down"] },
+                    "window": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "rename_session",
+            "description": "Tier-2 Act: rename a multiplexer session using its own command (tmux rename-session, zellij action rename-session), then update every Mutiny pane attached to it so labels and the saved layout follow. Returns once the command is launched; a remote rename applies when it completes.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name", "new_name"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "new_name": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["tmux", "zellij"] },
+                    "host": { "type": "string" }
                 }
             }
         },

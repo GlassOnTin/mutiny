@@ -498,6 +498,66 @@ impl MutinyWindow {
             }
         });
         self.inner.gtk_window.add_action(&open);
+
+        // Tab-targeted context-menu actions. The target is a TabId, so these
+        // are parameterised rather than entries in the keybind-able table.
+        for name in [
+            crate::action::CLOSE_TAB_TARGET,
+            crate::action::DETACH_TAB_TARGET,
+            crate::action::RENAME_TAB_TARGET,
+            crate::action::COPY_NAME_TAB_TARGET,
+        ] {
+            let slug = name.trim_start_matches("win.");
+            let action = gio::SimpleAction::new(slug, Some(glib::VariantTy::UINT64));
+            let ctrl_weak = Rc::downgrade(controller);
+            let this = self.clone();
+            let which = slug.to_owned();
+            action.connect_activate(move |_, param| {
+                let Some(id) = param.and_then(|p| p.get::<u64>()) else {
+                    return;
+                };
+                let tab = TabId(id);
+                let Some(ctrl) = ctrl_weak.upgrade() else {
+                    return;
+                };
+                match which.as_str() {
+                    "close-tab-target" => {
+                        ctrl.close_tab(win_id, tab);
+                    }
+                    "detach-tab-target" => {
+                        let pane = ctrl
+                            .workspace
+                            .borrow()
+                            .window(win_id)
+                            .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                            .map(|t| t.active_pane);
+                        if let Some(pane) = pane {
+                            let _ = ctrl.detach_split(Some(pane));
+                        }
+                    }
+                    "rename-session-tab" => this.show_rename_dialog(tab),
+                    "copy-session-name-tab" => {
+                        let name = ctrl
+                            .workspace
+                            .borrow()
+                            .window(win_id)
+                            .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                            .and_then(|t| {
+                                ctrl.workspace
+                                    .borrow()
+                                    .pane(t.active_pane)
+                                    .and_then(|e| e.mux_session())
+                                    .map(|s| s.name.clone())
+                            });
+                        if let (Some(name), Some(display)) = (name, gdk::Display::default()) {
+                            display.clipboard().set_text(&name);
+                        }
+                    }
+                    _ => {}
+                }
+            });
+            self.inner.gtk_window.add_action(&action);
+        }
     }
 
     pub fn present(&self) {
@@ -583,6 +643,11 @@ impl MutinyWindow {
             crate::desktop::APP_ID
         };
         self.inner.gtk_window.set_icon_name(Some(name));
+    }
+
+    /// The underlying GTK window, for tests that drive real gio actions.
+    pub fn gtk_window(&self) -> gtk4::ApplicationWindow {
+        self.inner.gtk_window.clone()
     }
 
     /// The icon name this window advertises to the shell and taskbar.
@@ -770,7 +835,8 @@ impl MutinyWindow {
             lines.append(&title_label);
             lines.append(&sub_label);
             btn.set_child(Some(&lines));
-            btn.set_tooltip_text(Some(&format!("{label} ({subtitle})")));
+            // No tooltip: the two-line label already shows name and host, and a
+            // tooltip window stacks over the right-click menu and hides items.
             btn.set_can_focus(false);
             if tid == active_tab_id {
                 btn.add_css_class("suggested-action");
@@ -810,6 +876,37 @@ impl MutinyWindow {
                 false
             });
             btn.add_controller(drop);
+
+            // Right-click opens a per-tab menu. The tab DragSource is
+            // primary-button only, so a secondary GestureClick does not fight
+            // it, and connect_clicked fires on primary release only.
+            let attached = ctrl
+                .workspace
+                .borrow()
+                .pane(first_pane)
+                .is_some_and(|e| e.mux_session().is_some());
+            let click = gtk4::GestureClick::new();
+            click.set_button(gdk::BUTTON_SECONDARY);
+            let btn_for_menu = btn.clone();
+            let ctrl_menu = Rc::downgrade(&ctrl);
+            click.connect_pressed(move |_, _, x, y| {
+                let Some(c) = ctrl_menu.upgrade() else {
+                    return;
+                };
+                // Focus the tab first, so the parameterless New Session action
+                // and any active-pane verb target the tab that was clicked.
+                let _ = c.workspace.borrow_mut().focus_pane(first_pane);
+                let model = crate::action::build_tab_menu_model(attached, tid.0);
+                let popover = gtk4::PopoverMenu::from_model(Some(&model));
+                popover.set_parent(&btn_for_menu);
+                popover.set_has_arrow(false);
+                popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                // Tab buttons are rebuilt on every topology change, so the
+                // popover must not outlive this one.
+                popover.connect_closed(|p| p.unparent());
+                popover.popup();
+            });
+            btn.add_controller(click);
 
             self.inner.tab_buttons_box.append(&btn);
             self.inner
@@ -865,11 +962,10 @@ impl MutinyWindow {
             .map(|(tid, lbl, sub, _)| (tid, (lbl, sub)))
             .collect();
 
-        for (tid, btn, title_label, sub_label) in self.inner.tab_buttons.borrow().iter() {
+        for (tid, _btn, title_label, sub_label) in self.inner.tab_buttons.borrow().iter() {
             if let Some((lbl, sub)) = labels.get(tid) {
                 title_label.set_text(lbl);
                 sub_label.set_text(sub);
-                btn.set_tooltip_text(Some(&format!("{lbl} ({sub})")));
             }
         }
 
@@ -989,6 +1085,175 @@ impl MutinyWindow {
                 (tab.id, label, subtitle, tab.active_pane)
             })
             .collect()
+    }
+
+    /// A small modal that asks for one line of text. Shared by Rename and New
+    /// Session so both get the same Escape/Enter/close-before-dispatch behaviour
+    /// as the other dialogs.
+    fn name_prompt(
+        &self,
+        title: &str,
+        label: &str,
+        initial: &str,
+        extra: Option<gtk4::Box>,
+        on_ok: impl Fn(&str) + 'static,
+    ) {
+        let on_ok = Rc::new(on_ok);
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title(title)
+            .default_width(420)
+            .build();
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        for m in ["top", "bottom", "start", "end"] {
+            match m {
+                "top" => vbox.set_margin_top(12),
+                "bottom" => vbox.set_margin_bottom(12),
+                "start" => vbox.set_margin_start(12),
+                _ => vbox.set_margin_end(12),
+            }
+        }
+        let prompt = gtk4::Label::new(Some(label));
+        prompt.set_xalign(0.0);
+        vbox.append(&prompt);
+        let entry = gtk4::Entry::new();
+        entry.set_text(initial);
+        entry.set_activates_default(true);
+        vbox.append(&entry);
+        if let Some(extra) = extra {
+            vbox.append(&extra);
+        }
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let ok = gtk4::Button::with_label("OK");
+        ok.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&ok);
+        vbox.append(&buttons);
+        dialog.set_child(Some(&vbox));
+        dialog.set_default_widget(Some(&ok));
+
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| dialog.close());
+        }
+        {
+            let dialog = dialog.clone();
+            let entry_for_ok = entry.clone();
+            let on_ok = Rc::clone(&on_ok);
+            ok.connect_clicked(move |_| {
+                let text = entry_for_ok.text().to_string();
+                // Close before dispatch, like every other dialog here, so a
+                // topology rebuild finds no live modal.
+                dialog.close();
+                if !text.trim().is_empty() {
+                    on_ok(&text);
+                }
+            });
+        }
+        {
+            let dialog = dialog.clone();
+            let entry_for_enter = entry.clone();
+            entry.connect_activate(move |_| {
+                let text = entry_for_enter.text().to_string();
+                dialog.close();
+                if !text.trim().is_empty() {
+                    on_ok(&text);
+                }
+            });
+        }
+        attach_escape_to_close(&dialog);
+        dialog.present();
+        entry.grab_focus();
+        entry.select_region(0, -1);
+    }
+
+    /// Rename the multiplexer session this tab is attached to, using the
+    /// multiplexer's own command. Not a mutiny-side label override.
+    pub fn show_rename_dialog(&self, tab: TabId) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let session = {
+            let ws = ctrl.workspace.borrow();
+            ws.window(self.inner.window_id)
+                .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                .and_then(|t| ws.pane(t.active_pane))
+                .and_then(|e| e.mux_session())
+                .cloned()
+        };
+        let Some(session) = session else {
+            return;
+        };
+        let old = session.name.clone();
+        let prompt = format!("New name for {} session:", session.kind.label());
+        let ctrl_ok = Rc::downgrade(&ctrl);
+        let initial = old.clone();
+        self.name_prompt("Rename Session", &prompt, &initial, None, move |new| {
+            if let Some(c) = ctrl_ok.upgrade()
+                && let Err(err) = c.rename_session(session.kind, &old, new, session.host.as_deref())
+            {
+                eprintln!("failed to rename session: {err}");
+            }
+        });
+    }
+
+    /// Create a new session, with the multiplexer preselected from config and
+    /// overridable here, including "none" for a plain shell.
+    pub fn show_new_session_dialog(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let preferred = ctrl.config_ref().preferred_mux;
+        let suggested = ctrl.suggested_session_name();
+
+        let extra = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let tmux_btn = gtk4::ToggleButton::with_label("tmux");
+        let zellij_btn = gtk4::ToggleButton::with_label("zellij");
+        let none_btn = gtk4::ToggleButton::with_label("none");
+        zellij_btn.set_group(Some(&tmux_btn));
+        none_btn.set_group(Some(&tmux_btn));
+        match preferred {
+            Some(MuxKind::Tmux) => tmux_btn.set_active(true),
+            Some(MuxKind::Zellij) => zellij_btn.set_active(true),
+            None => none_btn.set_active(true),
+        }
+        for b in [&tmux_btn, &zellij_btn, &none_btn] {
+            extra.append(b);
+        }
+        let in_window = gtk4::CheckButton::with_label("open in a new window");
+        extra.append(&in_window);
+
+        let ctrl_ok = Rc::downgrade(&ctrl);
+        let win_id = self.inner.window_id;
+        self.name_prompt(
+            "New Session",
+            "Session name (ignored for none):",
+            &suggested,
+            Some(extra),
+            move |name| {
+                let kind = if tmux_btn.is_active() {
+                    Some(MuxKind::Tmux)
+                } else if zellij_btn.is_active() {
+                    Some(MuxKind::Zellij)
+                } else {
+                    None
+                };
+                let mode = if in_window.is_active() {
+                    SessionMode::Window
+                } else {
+                    SessionMode::Tab
+                };
+                if let Some(c) = ctrl_ok.upgrade()
+                    && let Err(err) = c.new_session(kind, Some(name.to_owned()), mode, Some(win_id))
+                {
+                    eprintln!("failed to create session: {err}");
+                }
+            },
+        );
     }
 
     pub fn show_command_palette(&self) {

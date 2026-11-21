@@ -233,6 +233,29 @@ enum CtlVerb {
         pane: Option<u64>,
         message: Option<String>,
     },
+    /// Create a NEW multiplexer session and open a pane on it
+    NewSession {
+        /// tmux (default), zellij, or none for a plain shell
+        #[arg(long, default_value = "tmux")]
+        kind: String,
+        /// Omit to auto-name the smallest free mutiny-N
+        #[arg(long)]
+        name: Option<String>,
+        /// window, tab (default), split-right, split-down
+        #[arg(long, default_value = "tab")]
+        mode: String,
+        #[arg(long)]
+        window: Option<u64>,
+    },
+    /// Rename a multiplexer session and update the panes attached to it
+    RenameSession {
+        name: String,
+        new_name: String,
+        #[arg(long, default_value = "tmux")]
+        kind: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Write the current layout and session list to the state file now
     SaveSession,
     /// Close a pane (defaults to the active one)
@@ -493,6 +516,53 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             pane: pane.map(PaneId),
             message,
         },
+        CtlVerb::NewSession {
+            kind,
+            name,
+            mode,
+            window,
+        } => {
+            let kind = match kind.as_str() {
+                "tmux" => Some(mutiny::mux::MuxKind::Tmux),
+                "zellij" => Some(mutiny::mux::MuxKind::Zellij),
+                "none" => None,
+                other => {
+                    eprintln!("unknown kind {other:?}: expected tmux, zellij, or none");
+                    return ExitCode::from(2);
+                }
+            };
+            let Some(mode) = mutiny::mux::SessionMode::parse(&mode) else {
+                eprintln!("unknown mode: expected window, tab, split-right, or split-down");
+                return ExitCode::from(2);
+            };
+            IpcRequest::NewSession {
+                kind,
+                name,
+                mode,
+                window: window.map(WindowId),
+            }
+        }
+        CtlVerb::RenameSession {
+            name,
+            new_name,
+            kind,
+            host,
+        } => {
+            let kind = match kind.as_str() {
+                "tmux" => mutiny::mux::MuxKind::Tmux,
+                "zellij" => mutiny::mux::MuxKind::Zellij,
+                other => {
+                    eprintln!("unknown kind {other:?}: expected tmux or zellij");
+                    return ExitCode::from(2);
+                }
+            };
+            IpcRequest::RenameSession {
+                kind,
+                name,
+                new_name,
+                host,
+            }
+        }
         CtlVerb::SaveSession => IpcRequest::SaveSession,
         CtlVerb::ClosePane { pane } => IpcRequest::ClosePane {
             pane: pane.map(PaneId),

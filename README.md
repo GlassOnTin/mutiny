@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 176 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 187 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -229,6 +229,12 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 
 The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View" held session attaching, and "Panes" mixed structure with content navigation. Help existed for one item, which now sits in View. Action slugs and keybinds are unchanged; `tests/menu_ia.rs` holds a golden list so a rename or rebound chord fails a test.
 
+**New Tab follows `preferred`.** With `tmux` or `zellij` it creates a new session named with the smallest free `mutiny-N`; with `none` it opens a plain shell, which is the old behaviour. The `spawn-tab` IPC verb deliberately stays a plain shell, so agents and scripts are unaffected.
+
+**New Session** (Session menu, tab menu, or palette) asks for a name and lets you pick tmux, zellij, or none per session, overriding the config default. Creating fails if the name is taken rather than attaching to it; use Open Session for that.
+
+**Right-click a tab** for Rename Session, Close Tab, Detach to Window, Copy Session Name, and New Session. Rename runs the multiplexer's own command (`tmux rename-session`, `zellij action rename-session`) and updates every Mutiny pane attached to that session, so labels, window titles, and the saved layout all follow. Rename and Copy Name appear only on attached tabs. The menu never kills a session: closing a tab kills only its client.
+
 **Open Session** is a submenu listing discovered sessions inline, not a pop-up. It is filled at startup and re-listed every `refresh_interval_s` seconds, so it is populated before you open it and reflects sessions that came and went. A refresh keeps the sessions it already knows until each host's new result replaces them, so the list never flashes empty. `Ctrl+Shift+S` still opens the full picker, which is also the last item in that submenu.
 
 Labels follow the Haven convention: **title is the session name, subtitle is the host** (this machine's hostname for local sessions, the SSH host for remote ones). Tabs and the picker both use two lines, title prominent and subtitle dimmer, with the title ellipsised so wrapped tabs stay readable. Session numbers are gone: once sessions are named, an index is redundant noise.
@@ -303,6 +309,7 @@ create_if_missing = true       # attach-or-create
 ignore_size = false            # true adds tmux -f ignore-size, so this client cannot resize other viewers
 show_exited = true             # show zellij's resurrectable EXITED sessions, badged
 refresh_interval_s = 15        # re-list sessions so the submenu stays current; 0 disables
+preferred = "tmux"             # what New Tab uses: tmux, zellij, or none for a plain shell
 ```
 
 Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are computed, not configurable.
@@ -399,7 +406,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 176 tests, no display required
+cargo test                    # 187 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

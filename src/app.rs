@@ -73,6 +73,34 @@ pub enum ConsentResolution {
     Deny,
 }
 
+/// Which session to open, grouped so the shared open path stays readable.
+struct SessionRequest<'a> {
+    kind: MuxKind,
+    name: &'a str,
+    host: Option<&'a str>,
+}
+
+/// A one-shot multiplexer command and what to do when it succeeds.
+struct PendingMuxCommand {
+    child: std::process::Child,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    deadline: Instant,
+    killed: bool,
+    effect: MuxEffect,
+}
+
+/// Applied only after the command exits successfully, so a failed rename does
+/// not leave mutiny claiming a name the multiplexer never accepted.
+enum MuxEffect {
+    Rename {
+        kind: MuxKind,
+        host: Option<String>,
+        old: String,
+        new: String,
+    },
+}
+
 /// A finished discovery job: which target, its sessions or an error, and how
 /// long it took.
 type DiscoveryOutcome = (
@@ -140,6 +168,9 @@ pub struct AppController {
     /// touched on a transition.
     agent_icon_active: Cell<bool>,
     last_discovery_started: Cell<Option<Instant>>,
+    /// In-flight one-shot multiplexer commands (rename). Same tick-polled shape
+    /// as discovery: a rename may go over ssh, so it must not block the loop.
+    mux_commands: RefCell<Vec<PendingMuxCommand>>,
     /// Mode the agent carrier assigns to every connection it accepts. Pinned
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
@@ -223,6 +254,7 @@ impl AppController {
             sessions_menu_gen: Cell::new(u64::MAX),
             agent_icon_active: Cell::new(false),
             last_discovery_started: Cell::new(None),
+            mux_commands: RefCell::new(Vec::new()),
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
@@ -693,10 +725,255 @@ impl AppController {
                 "session name must not be empty",
             ));
         }
+        self.attach_or_create(
+            SessionRequest { kind, name, host },
+            mode,
+            window,
+            pane,
+            false,
+        )
+    }
+
+    /// Creates a NEW session and opens a pane on it. Unlike `open_session` this
+    /// must fail on a name collision rather than attaching to whatever already
+    /// has that name, so it uses the create argv (no tmux `-A`).
+    pub fn new_session(
+        self: &Rc<Self>,
+        kind: Option<MuxKind>,
+        name: Option<String>,
+        mode: mux::SessionMode,
+        window: Option<WindowId>,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
+        let Some(kind) = kind else {
+            // No multiplexer: a plain shell, which is what `preferred = "none"`
+            // and the dialog's "none" choice mean.
+            let cwd = self.active_cwd(window, None);
+            return match mode {
+                mux::SessionMode::Window => self.create_window(cwd),
+                mux::SessionMode::Tab => self.create_tab(window, cwd),
+                mux::SessionMode::SplitRight => self.split_pane(None, SplitAxis::Horizontal, cwd),
+                mux::SessionMode::SplitDown => self.split_pane(None, SplitAxis::Vertical, cwd),
+            };
+        };
+        let name = match name {
+            Some(n) if !n.trim().is_empty() => n,
+            _ => self.suggested_session_name(),
+        };
+        self.attach_or_create(
+            SessionRequest {
+                kind,
+                name: &name,
+                host: None,
+            },
+            mode,
+            window,
+            None,
+            true,
+        )
+    }
+
+    /// Renames a multiplexer session using its own command, then updates every
+    /// pane attached to it. Returns once the command is launched; the rename is
+    /// applied when it exits, because a remote rename can take seconds.
+    pub fn rename_session(
+        &self,
+        kind: MuxKind,
+        old: &str,
+        new: &str,
+        host: Option<&str>,
+    ) -> io::Result<()> {
+        if new.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the new session name must not be empty",
+            ));
+        }
+        if old == new {
+            return Ok(());
+        }
         let opts = self.config.borrow().sessions.clone();
-        let command = match host {
-            None => mux::attach_argv(kind, name, &opts),
-            Some(host) => mux::remote_attach_argv(host, kind, name, &opts)
+        let (program, argv) = mux::rename_command(kind, old, new, host, &opts)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let child = Command::new(&program)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("could not run {program} to rename: {e}"))
+            })?;
+        if let Some(out) = child.stdout.as_ref() {
+            set_nonblocking(out.as_raw_fd());
+        }
+        if let Some(err) = child.stderr.as_ref() {
+            set_nonblocking(err.as_raw_fd());
+        }
+        let timeout = Duration::from_millis(self.config.borrow().discovery_timeout_ms);
+        self.mux_commands.borrow_mut().push(PendingMuxCommand {
+            child,
+            out: Vec::new(),
+            err: Vec::new(),
+            deadline: Instant::now() + timeout,
+            killed: false,
+            effect: MuxEffect::Rename {
+                kind,
+                host: host.map(str::to_owned),
+                old: old.to_owned(),
+                new: new.to_owned(),
+            },
+        });
+        Ok(())
+    }
+
+    /// Polls one-shot commands. Same nonblocking drain and kill-then-reap rules
+    /// as discovery: `Child::drop` does neither.
+    fn advance_mux_commands(self: &Rc<Self>) {
+        if self.mux_commands.borrow().is_empty() {
+            return;
+        }
+        let mut budget = DISCOVERY_BYTES_PER_TICK;
+        let mut done: Vec<(MuxEffect, bool, String)> = Vec::new();
+        {
+            let mut jobs = self.mux_commands.borrow_mut();
+            let mut i = 0;
+            while i < jobs.len() {
+                let job = &mut jobs[i];
+                if let Some(out) = job.child.stdout.as_mut() {
+                    drain_bounded(out, &mut job.out, &mut budget);
+                }
+                if let Some(err) = job.child.stderr.as_mut() {
+                    drain_bounded(err, &mut job.err, &mut budget);
+                }
+                if !job.killed && Instant::now() >= job.deadline {
+                    let _ = job.child.kill();
+                    job.killed = true;
+                }
+                match job.child.try_wait() {
+                    Ok(Some(status)) => {
+                        let ok = !job.killed && status.success();
+                        let detail = if job.killed {
+                            String::from("timed out")
+                        } else {
+                            String::from_utf8_lossy(&job.err).trim().to_owned()
+                        };
+                        done.push((
+                            std::mem::replace(
+                                &mut job.effect,
+                                MuxEffect::Rename {
+                                    kind: MuxKind::Tmux,
+                                    host: None,
+                                    old: String::new(),
+                                    new: String::new(),
+                                },
+                            ),
+                            ok,
+                            detail,
+                        ));
+                        jobs.remove(i);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        done.push((
+                            std::mem::replace(
+                                &mut job.effect,
+                                MuxEffect::Rename {
+                                    kind: MuxKind::Tmux,
+                                    host: None,
+                                    old: String::new(),
+                                    new: String::new(),
+                                },
+                            ),
+                            false,
+                            e.to_string(),
+                        ));
+                        jobs.remove(i);
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        let mut changed = false;
+        for (effect, ok, detail) in done {
+            match effect {
+                MuxEffect::Rename {
+                    kind,
+                    host,
+                    old,
+                    new,
+                } => {
+                    if ok {
+                        self.apply_rename(kind, host.as_deref(), &old, &new);
+                        changed = true;
+                    } else if !new.is_empty() {
+                        eprintln!("warning: rename {old:?} to {new:?} failed: {detail}");
+                    }
+                }
+            }
+        }
+        if changed {
+            self.refresh_all_window_chromes();
+            let targets = self.discovery_targets_all();
+            self.begin_discovery(targets, true, None);
+        }
+    }
+
+    /// Updates every pane attached to the renamed session, so labels, window
+    /// titles, and the saved bundle all follow the multiplexer's new name.
+    fn apply_rename(&self, kind: MuxKind, host: Option<&str>, old: &str, new: &str) {
+        let mut ws = self.workspace.borrow_mut();
+        for pid in ws.pane_ids() {
+            if let Some(eng) = ws.pane_mut(pid) {
+                let matches = eng
+                    .mux_session()
+                    .is_some_and(|s| s.kind == kind && s.host.as_deref() == host && s.name == old);
+                if matches {
+                    eng.set_mux_session(Some(mux::MuxSessionRef {
+                        kind,
+                        name: mux::sanitize_text(new, 64),
+                        host: host.map(|h| mux::sanitize_text(h, 64)),
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Smallest free `mutiny-N` from the last discovery pass.
+    pub fn suggested_session_name(&self) -> String {
+        let taken: Vec<String> = self
+            .session_cache
+            .borrow()
+            .sessions
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        mux::free_session_name(&taken)
+    }
+
+    fn attach_or_create(
+        self: &Rc<Self>,
+        request: SessionRequest<'_>,
+        mode: mux::SessionMode,
+        window: Option<WindowId>,
+        pane: Option<PaneId>,
+        create: bool,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
+        let SessionRequest { kind, name, host } = request;
+        if name.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session name must not be empty",
+            ));
+        }
+        let opts = self.config.borrow().sessions.clone();
+        let command = match (host, create) {
+            (None, false) => mux::attach_argv(kind, name, &opts),
+            (None, true) => mux::create_argv(kind, name, &opts),
+            (Some(host), false) => mux::remote_attach_argv(host, kind, name, &opts)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+            (Some(host), true) => mux::remote_create_argv(host, kind, name, &opts)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         };
         // A remote session's path is a path on that host, so it must never
@@ -1339,7 +1616,19 @@ impl AppController {
                 let _ = self.create_window(None);
             }
             ActionId::NewTab => {
-                let _ = self.create_tab(active_win, None);
+                // New Tab follows the preferred multiplexer. `none` keeps the
+                // plain-shell behaviour. The IPC SpawnTab verb deliberately
+                // stays plain: agents and scripts ask for a shell explicitly.
+                let preferred = self.config.borrow().preferred_mux;
+                match preferred {
+                    Some(kind) => {
+                        let _ =
+                            self.new_session(Some(kind), None, mux::SessionMode::Tab, active_win);
+                    }
+                    None => {
+                        let _ = self.create_tab(active_win, None);
+                    }
+                }
             }
             ActionId::ClosePane => {
                 if let Some(pid) = active_pane {
@@ -1435,6 +1724,13 @@ impl AppController {
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
                 {
                     ui_win.show_command_palette();
+                }
+            }
+            ActionId::NewSession => {
+                if let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.show_new_session_dialog();
                 }
             }
             ActionId::SessionPicker => {
@@ -1622,6 +1918,7 @@ impl AppController {
         self.satisfy_pending_waits();
         self.advance_searches();
         self.advance_discoveries();
+        self.advance_mux_commands();
         self.refresh_agent_icon();
         self.refresh_sessions_periodically();
         self.expire_pending_consents();
@@ -1905,6 +2202,24 @@ impl AppController {
                 });
                 None
             }
+            IpcRequest::NewSession {
+                kind,
+                name,
+                mode,
+                window,
+            } => match self.new_session(kind, name, mode, window) {
+                Ok((w, t, p)) => Some(ids_ok(Some(w), Some(t), Some(p))),
+                Err(err) => Some(IpcResponse::err(err.to_string())),
+            },
+            IpcRequest::RenameSession {
+                kind,
+                name,
+                new_name,
+                host,
+            } => match self.rename_session(kind, &name, &new_name, host.as_deref()) {
+                Ok(()) => Some(IpcResponse::empty_ok()),
+                Err(err) => Some(IpcResponse::err(err.to_string())),
+            },
             IpcRequest::SaveSession => match self.save_session() {
                 Ok(()) => Some(IpcResponse::empty_ok()),
                 Err(err) => Some(IpcResponse::err(format!("could not save session: {err}"))),

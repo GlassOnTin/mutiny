@@ -412,6 +412,129 @@ pub fn inner_attach_argv(kind: MuxKind, name: &str, opts: &MuxOptions) -> Vec<St
     }
 }
 
+/// Inner argv for CREATING a new session, which must not silently attach to an
+/// existing one. `inner_attach_argv` passes tmux `-A` and zellij
+/// `attach --create`, both of which attach on a name collision; that is right
+/// for opening a known session and wrong for making a new one.
+///
+/// tmux `new-session -s NAME` without `-A` fails if the name exists. zellij's
+/// global `--session NAME` is documented as "name of a new session".
+pub fn inner_create_argv(kind: MuxKind, name: &str, opts: &MuxOptions) -> Vec<String> {
+    match kind {
+        MuxKind::Tmux => {
+            let mut argv = tmux_socket_args(opts);
+            argv.push(String::from("new-session"));
+            if opts.ignore_size {
+                argv.push(String::from("-f"));
+                argv.push(String::from("ignore-size"));
+            }
+            argv.push(String::from("-s"));
+            argv.push(tmux_escape_name(name));
+            argv
+        }
+        MuxKind::Zellij => vec![String::from("--session"), name.to_owned()],
+    }
+}
+
+/// Local create: exec the multiplexer directly, no shell.
+pub fn create_argv(kind: MuxKind, name: &str, opts: &MuxOptions) -> (String, Vec<String>) {
+    (
+        local_program(kind, opts),
+        inner_create_argv(kind, name, opts),
+    )
+}
+
+/// Inner argv for RENAMING a session, using the multiplexer's own command.
+/// tmux re-parses a trailing `;` in both names, so both are escaped.
+pub fn inner_rename_argv(kind: MuxKind, old: &str, new: &str, opts: &MuxOptions) -> Vec<String> {
+    match kind {
+        MuxKind::Tmux => {
+            let mut argv = tmux_socket_args(opts);
+            argv.push(String::from("rename-session"));
+            argv.push(String::from("-t"));
+            argv.push(tmux_escape_name(old));
+            argv.push(tmux_escape_name(new));
+            argv
+        }
+        // zellij has no top-level rename; the action is targeted from outside
+        // the session with the global --session flag.
+        MuxKind::Zellij => vec![
+            String::from("--session"),
+            old.to_owned(),
+            String::from("action"),
+            String::from("rename-session"),
+            new.to_owned(),
+        ],
+    }
+}
+
+/// Rename runs as a one-shot command, not in a pane, so it needs no tty and
+/// must never prompt.
+pub fn rename_command(
+    kind: MuxKind,
+    old: &str,
+    new: &str,
+    host: Option<&str>,
+    opts: &MuxOptions,
+) -> Result<(String, Vec<String>), String> {
+    if new.trim().is_empty() {
+        return Err(String::from("the new session name must not be empty"));
+    }
+    let inner = inner_rename_argv(kind, old, new, opts);
+    match host {
+        None => Ok((local_program(kind, opts), inner)),
+        Some(host) => {
+            validate_host(host)?;
+            let argv = vec![
+                String::from("-n"),
+                String::from("-o"),
+                String::from("BatchMode=yes"),
+                String::from("-o"),
+                format!("ConnectTimeout={}", opts.connect_timeout_s),
+                String::from("--"),
+                host.to_owned(),
+                remote_command(&local_program(kind, opts), &inner, None),
+            ];
+            Ok((opts.ssh_program.clone(), argv))
+        }
+    }
+}
+
+/// Remote create, with the same tty and TERM treatment as a remote attach.
+pub fn remote_create_argv(
+    host: &str,
+    kind: MuxKind,
+    name: &str,
+    opts: &MuxOptions,
+) -> Result<(String, Vec<String>), String> {
+    validate_host(host)?;
+    let inner = inner_create_argv(kind, name, opts);
+    let argv = vec![
+        String::from("-t"),
+        String::from("-e"),
+        String::from("none"),
+        String::from("-o"),
+        format!("ConnectTimeout={}", opts.connect_timeout_s),
+        String::from("--"),
+        host.to_owned(),
+        remote_command(&local_program(kind, opts), &inner, Some(&opts.remote_term)),
+    ];
+    Ok((opts.ssh_program.clone(), argv))
+}
+
+/// Smallest free `mutiny-N` given the names already in use. Matches the naming
+/// convention already in the wild (`mutiny-27`, `radio-translator-34`).
+pub fn free_session_name(taken: &[String]) -> String {
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("mutiny-{n}");
+        if !taken.iter().any(|t| t == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 pub fn local_program(kind: MuxKind, opts: &MuxOptions) -> String {
     match kind {
         MuxKind::Tmux => opts.tmux_program.clone(),
@@ -754,6 +877,97 @@ mod tests {
         assert!(
             !text.lines().any(|l| l == "x"),
             "the injected command must not have run:\n{text}"
+        );
+    }
+
+    #[test]
+    fn create_never_silently_attaches_to_an_existing_name() {
+        let (_p, tmux) = create_argv(MuxKind::Tmux, "fresh", &opts());
+        assert!(tmux.contains(&String::from("new-session")));
+        assert!(
+            !tmux.contains(&String::from("-A")),
+            "-A would attach on a collision instead of failing: {tmux:?}"
+        );
+        // The attach path keeps -A, which is correct for opening a known session.
+        let (_p, attach) = attach_argv(MuxKind::Tmux, "fresh", &opts());
+        assert!(attach.contains(&String::from("-A")));
+
+        let (_p, zellij) = create_argv(MuxKind::Zellij, "fresh", &opts());
+        assert_eq!(zellij, vec!["--session", "fresh"]);
+        assert!(
+            !zellij.contains(&String::from("--create")),
+            "attach --create attaches on a collision: {zellij:?}"
+        );
+    }
+
+    #[test]
+    fn rename_uses_each_multiplexers_own_command() {
+        let (prog, argv) = rename_command(MuxKind::Tmux, "old", "new", None, &opts()).unwrap();
+        assert_eq!(prog, "tmux");
+        assert_eq!(argv, vec!["rename-session", "-t", "old", "new"]);
+
+        let (prog, argv) = rename_command(MuxKind::Zellij, "old", "new", None, &opts()).unwrap();
+        assert_eq!(prog, "zellij");
+        assert_eq!(
+            argv,
+            vec!["--session", "old", "action", "rename-session", "new"]
+        );
+
+        // tmux re-parses a trailing semicolon in BOTH names.
+        let (_p, argv) = rename_command(MuxKind::Tmux, "old;", "new;", None, &opts()).unwrap();
+        assert_eq!(argv, vec!["rename-session", "-t", "old\\;", "new\\;"]);
+
+        assert!(rename_command(MuxKind::Tmux, "old", "  ", None, &opts()).is_err());
+    }
+
+    #[test]
+    fn remote_rename_and_create_quote_and_guard_the_host() {
+        let (prog, argv) =
+            rename_command(MuxKind::Tmux, "old", "a;echo x", Some("meteor"), &opts()).unwrap();
+        assert_eq!(prog, "ssh");
+        assert!(
+            argv.contains(&String::from("BatchMode=yes")),
+            "must not prompt"
+        );
+        assert!(argv.contains(&String::from("--")));
+        let cmd = argv.last().unwrap();
+        assert!(cmd.contains("'rename-session'"), "{cmd}");
+        assert!(
+            cmd.contains("'a;echo x'"),
+            "the new name must be one argument: {cmd}"
+        );
+
+        let (_p, argv) = remote_create_argv("meteor", MuxKind::Tmux, "fresh", &opts()).unwrap();
+        assert!(
+            argv.contains(&String::from("-t")),
+            "create opens a pane, so it needs a tty"
+        );
+        assert!(argv.last().unwrap().starts_with("TERM="));
+        assert!(!argv.last().unwrap().contains("'-A'"));
+
+        assert!(
+            rename_command(MuxKind::Tmux, "o", "n", Some("-oProxyCommand=x"), &opts()).is_err()
+        );
+        assert!(remote_create_argv("-v", MuxKind::Tmux, "n", &opts()).is_err());
+    }
+
+    #[test]
+    fn auto_name_picks_the_smallest_free_slot() {
+        assert_eq!(free_session_name(&[]), "mutiny-1");
+        let taken: Vec<String> = ["mutiny-1", "mutiny-2", "mutiny-4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(free_session_name(&taken), "mutiny-3", "fills the gap");
+        let taken: Vec<String> = ["mutiny-1", "mutiny-2", "mutiny-3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(free_session_name(&taken), "mutiny-4");
+        // Unrelated names do not consume slots.
+        assert_eq!(
+            free_session_name(&["sdr".to_string(), "mutiny-x".to_string()]),
+            "mutiny-1"
         );
     }
 

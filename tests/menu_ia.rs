@@ -19,6 +19,8 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("new-window", "Ctrl+Shift+N", "Session"),
     ("new-tab", "Ctrl+Shift+T", "Session"),
     ("session-picker", "Ctrl+Shift+S", "Session"),
+    // No chord: reachable from the Session menu, the tab menu, and the palette.
+    ("new-session", "", "Session"),
     ("copy", "Ctrl+Shift+C", "Edit"),
     ("paste", "Ctrl+Shift+V", "Edit"),
     ("search", "Ctrl+Shift+F", "Edit"),
@@ -151,4 +153,77 @@ fn sessions_submenu_lists_sessions_inline_and_keeps_the_picker_reachable() {
         .and_then(|v| v.get::<String>())
         .unwrap();
     assert_eq!(first, "No sessions found");
+}
+
+/// The tab menu must not offer to rename or copy a session that does not exist,
+/// and must never offer to kill one.
+#[test]
+fn tab_menu_offers_session_actions_only_when_attached() {
+    let labels = |attached: bool| -> Vec<String> {
+        let menu = mutiny::action::build_tab_menu_model(attached, 7);
+        (0..menu.n_items())
+            .map(|i| {
+                menu.item_attribute_value(i, "label", None)
+                    .and_then(|v| v.get::<String>())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    let attached = labels(true);
+    assert!(attached.iter().any(|l| l.starts_with("Rename Session")));
+    assert!(attached.iter().any(|l| l == "Copy Session Name"));
+    assert!(attached.iter().any(|l| l == "Close Tab"));
+    assert!(attached.iter().any(|l| l == "Detach to Window"));
+    assert!(attached.iter().any(|l| l.starts_with("New Session")));
+
+    let plain = labels(false);
+    assert!(
+        !plain.iter().any(|l| l.contains("Rename")),
+        "nothing to rename: {plain:?}"
+    );
+    assert!(
+        !plain.iter().any(|l| l.contains("Copy")),
+        "nothing to copy: {plain:?}"
+    );
+    assert!(plain.iter().any(|l| l == "Close Tab"));
+    assert!(plain.iter().any(|l| l.starts_with("New Session")));
+
+    for list in [&attached, &plain] {
+        assert!(
+            !list.iter().any(|l| l.to_ascii_lowercase().contains("kill")),
+            "the menu must never kill a session: {list:?}"
+        );
+    }
+}
+
+/// A parameterised action needs its target ON THE MENU ITEM. Without it GTK
+/// renders the item insensitive and the click does nothing, which is exactly
+/// how this first shipped before a live right-click caught it.
+#[test]
+fn every_tab_menu_item_carries_its_tab_target() {
+    let menu = mutiny::action::build_tab_menu_model(true, 42);
+    let mut saw_targeted = 0;
+    for i in 0..menu.n_items() {
+        let action = menu
+            .item_attribute_value(i, "action", None)
+            .and_then(|v| v.get::<String>())
+            .unwrap_or_default();
+        let target = menu
+            .item_attribute_value(i, "target", None)
+            .and_then(|v| v.get::<u64>());
+        if action.ends_with("-tab") || action.ends_with("-tab-target") {
+            assert_eq!(
+                target,
+                Some(42),
+                "item {action} must carry the tab id, or GTK disables it"
+            );
+            saw_targeted += 1;
+        } else {
+            assert_eq!(target, None, "the plain New Session item takes no target");
+        }
+    }
+    assert_eq!(
+        saw_targeted, 4,
+        "rename, close, detach, copy are all targeted"
+    );
 }

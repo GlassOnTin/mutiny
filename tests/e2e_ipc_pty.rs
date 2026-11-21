@@ -584,6 +584,9 @@ fn every_advertised_mcp_tool_dispatches() {
             "present_media" => json!({"pane": p1.0, "path": "/nonexistent-probe.png"}),
             "list_sessions" => json!({}),
             "save_session" => json!({}),
+            // A plain shell, so the probe needs no multiplexer installed.
+            "new_session" => json!({"kind": "none", "mode": "tab"}),
+            "rename_session" => json!({"name": "mutiny-probe", "new_name": "mutiny-probe-x"}),
             // A nonexistent pane: the probe asserts dispatch, not success, and
             // closing a real pane would tear down the server other probes use.
             "close_pane" => json!({"pane": 999999}),

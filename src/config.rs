@@ -135,6 +135,10 @@ pub struct SessionsConfig {
     /// Re-list sessions every N seconds so the Sessions submenu stays current.
     /// 0 disables the periodic refresh; startup and picker opens still scan.
     pub refresh_interval_s: u32,
+    /// Which multiplexer New Tab uses: "tmux", "zellij", or "none" for a plain
+    /// shell. The New Session dialog can override it per session. This changes
+    /// what Ctrl+Shift+T does; "none" restores the plain-shell behaviour.
+    pub preferred: String,
 }
 
 impl Default for SessionsConfig {
@@ -152,6 +156,7 @@ impl Default for SessionsConfig {
             ignore_size: false,
             show_exited: true,
             refresh_interval_s: 15,
+            preferred: String::from("tmux"),
         }
     }
 }
@@ -205,6 +210,8 @@ pub struct ResolvedConfig {
     pub session_hosts: Vec<String>,
     pub show_exited_sessions: bool,
     pub session_refresh_interval_s: u32,
+    /// `None` means New Tab opens a plain shell.
+    pub preferred_mux: Option<crate::mux::MuxKind>,
     pub discovery_timeout_ms: u64,
 }
 
@@ -269,6 +276,24 @@ fn color_or_default(value: &str, fallback: &str, key: &str) -> Rgb {
 
 /// Applies overrides on top of the file, then parses and clamps. Precedence:
 /// CLI flag, then config file, then built-in default.
+/// Parses the preferred-multiplexer setting. An unrecognised value falls back
+/// to a plain shell with a warning, rather than silently picking a multiplexer
+/// the user did not ask for.
+fn parse_preferred(text: &str) -> Option<crate::mux::MuxKind> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "tmux" => Some(crate::mux::MuxKind::Tmux),
+        "zellij" => Some(crate::mux::MuxKind::Zellij),
+        "none" | "" => None,
+        other => {
+            eprintln!(
+                "warning: config sessions.preferred {other:?} is not tmux, zellij, or none; \
+                 New Tab will open a plain shell"
+            );
+            None
+        }
+    }
+}
+
 pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
     let defaults = Config::default();
     let family = overrides
@@ -364,6 +389,7 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
             .collect(),
         show_exited_sessions: config.sessions.show_exited,
         session_refresh_interval_s: config.sessions.refresh_interval_s.min(3600),
+        preferred_mux: parse_preferred(&config.sessions.preferred),
         discovery_timeout_ms: config.sessions.discovery_timeout_ms.clamp(200, 60_000),
     }
 }
