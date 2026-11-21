@@ -139,6 +139,7 @@ pub struct AppController {
     /// Last agent-active state pushed to the window icons, so the icon is only
     /// touched on a transition.
     agent_icon_active: Cell<bool>,
+    last_discovery_started: Cell<Option<Instant>>,
     /// Mode the agent carrier assigns to every connection it accepts. Pinned
     /// by the operator at GUI launch; no client can raise it.
     agent_mode: Cell<ConsentMode>,
@@ -221,6 +222,7 @@ impl AppController {
             sessions_menus: RefCell::new(Vec::new()),
             sessions_menu_gen: Cell::new(u64::MAX),
             agent_icon_active: Cell::new(false),
+            last_discovery_started: Cell::new(None),
             agent_socket_path: RefCell::new(None),
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
@@ -707,6 +709,28 @@ impl AppController {
         *self.recent_agent.borrow_mut() = None;
     }
 
+    /// Re-runs discovery on a modest cadence so the Sessions submenu reflects
+    /// sessions that appeared or died since startup. This polls an external
+    /// listing command; it owns no sessions and starts no daemon, so the
+    /// crash-semantics contract is untouched.
+    fn refresh_sessions_periodically(&self) {
+        if self.gtk_app.borrow().is_none() || self.ui_windows.borrow().is_empty() {
+            return;
+        }
+        let interval = self.config.borrow().session_refresh_interval_s;
+        if interval == 0 || self.discovery_in_flight() {
+            return;
+        }
+        let due = match self.last_discovery_started.get() {
+            None => true,
+            Some(at) => at.elapsed() >= Duration::from_secs(u64::from(interval)),
+        };
+        if due {
+            let targets = self.discovery_targets_all();
+            self.begin_discovery(targets, true, None);
+        }
+    }
+
     /// True while an external agent is driving the terminal. Derived from the
     /// same signal as the in-window agent badge, so the icon and the badge can
     /// never disagree: a non-Operator carrier call within the last 15 seconds.
@@ -783,7 +807,9 @@ impl AppController {
         let timeout = Duration::from_millis(self.config.borrow().discovery_timeout_ms);
         {
             let mut cache = self.session_cache.borrow_mut();
-            cache.sessions.clear();
+            // Keep the previous sessions until each target's result replaces
+            // its slice. Clearing here would make the Sessions submenu flash
+            // "No sessions found" at the start of every refresh.
             cache.hosts.clear();
             cache.partial = false;
             cache.scanned_at_ms = now_ms();
@@ -810,6 +836,7 @@ impl AppController {
             }
         }
         *self.pending_session_reply.borrow_mut() = stream;
+        self.last_discovery_started.set(Some(Instant::now()));
         self.discovery_deadline.set(Some(Instant::now() + timeout));
         self.start_queued_discoveries();
         // Every program may have failed to spawn synchronously (not installed),
@@ -1505,6 +1532,7 @@ impl AppController {
         self.advance_searches();
         self.advance_discoveries();
         self.refresh_agent_icon();
+        self.refresh_sessions_periodically();
         self.expire_pending_consents();
 
         for pid in panes_exited {

@@ -371,6 +371,64 @@ impl Drop for PaneEngine {
     }
 }
 
+/// What a wheel event should do. Extracted so the decision is testable without
+/// synthesising a GTK scroll event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelAction {
+    /// Forward to the program, which asked for mouse events.
+    Report(u16),
+    /// Scroll mutiny's own scrollback by this many lines.
+    LocalScroll(i32),
+    Ignore,
+}
+
+/// tmux and full-screen programs own the wheel when they enable mouse mode;
+/// scrolling mutiny's scrollback instead is what made tmux scrolling look
+/// broken. Shift is the conventional override back to local scrollback.
+pub fn wheel_action(mouse_mode: bool, shift: bool, dy: f64) -> WheelAction {
+    if dy == 0.0 {
+        return WheelAction::Ignore;
+    }
+    if mouse_mode && !shift {
+        WheelAction::Report(if dy < 0.0 {
+            MOUSE_WHEEL_UP
+        } else {
+            MOUSE_WHEEL_DOWN
+        })
+    } else {
+        WheelAction::LocalScroll(if dy < 0.0 { 3 } else { -3 })
+    }
+}
+
+/// Wheel button codes in the xterm mouse protocol.
+pub const MOUSE_WHEEL_UP: u16 = 64;
+pub const MOUSE_WHEEL_DOWN: u16 = 65;
+/// Drag motion adds 32 to the button code.
+pub const MOUSE_MOTION_FLAG: u16 = 32;
+
+/// Encodes one mouse report. Pure, so the protocol is unit-testable without a
+/// PTY or a running tmux.
+///
+/// SGR (mode 1006) is `ESC [ < Cb ; Cx ; Cy M`, with `m` for release. The legacy
+/// X10 encoding is `ESC [ M` followed by three bytes offset by 32, which caps
+/// coordinates at 223 and uses button 3 for any release.
+pub fn mouse_report(button: u16, col: usize, row: usize, release: bool, sgr: bool) -> Vec<u8> {
+    // Coordinates are 1-based in both encodings.
+    let cx = (col + 1).min(223);
+    let cy = (row + 1).min(223);
+    if sgr {
+        let tail = if release { 'm' } else { 'M' };
+        format!("\x1b[<{button};{cx};{cy}{tail}").into_bytes()
+    } else {
+        let cb = if release {
+            3
+        } else {
+            button.min(255 - 32) as u8
+        };
+        vec![0x1b, b'[', b'M', 32 + cb, 32 + cx as u8, 32 + cy as u8]
+    }
+}
+
 impl PaneEngine {
     pub fn new_headless(cols: usize, rows: usize) -> Self {
         Self::new_headless_with_scrollback(cols, rows, 10_000)
@@ -594,6 +652,22 @@ impl PaneEngine {
     /// `Event::ResetTitle` clears whatever we set at spawn.
     pub fn set_mux_session(&mut self, session: Option<crate::mux::MuxSessionRef>) {
         self.mux_session = session;
+    }
+
+    /// True when the program in this pane has asked for mouse events, as tmux
+    /// and full-screen editors do. The wheel and clicks must then go to the
+    /// PTY, not to mutiny's own scrollback and selection.
+    pub fn mouse_mode(&self) -> bool {
+        self.term
+            .mode()
+            .intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
+    }
+
+    /// True when the program asked for SGR (1006) encoding rather than X10.
+    pub fn sgr_mouse(&self) -> bool {
+        self.term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::SGR_MOUSE)
     }
 
     pub fn mux_session(&self) -> Option<&crate::mux::MuxSessionRef> {

@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 163 tests: 96 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 168 tests: 96 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -272,6 +272,20 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### Mouse reporting: the program owns the mouse when it asks
+
+`PaneEngine::mouse_mode()` reads alacritty's `TermMode::MOUSE_MODE`. When it is set, the wheel and left press/drag/release must be encoded and written to the PTY, NOT applied to mutiny's scrollback and selection. Getting this wrong is what made tmux scrolling look broken: the wheel handler always scrolled locally and returned `Stop`.
+
+`engine::mouse_report` is the pure encoder (SGR 1006 `ESC [ < Cb ; Cx ; Cy M`/`m`, legacy X10 `ESC [ M` plus three bytes offset by 32, coordinates 1-based and capped at 223). `engine::wheel_action` is the pure decision, extracted so it is testable without synthesising a GTK scroll event. Shift is the conventional override back to local behaviour, for both wheel and selection.
+
+A scroll event carries no coordinates, so an `EventControllerMotion` tracks the pointer and the wheel reports the cell under it.
+
+### Session discovery runs on its own, not only when the picker opens
+
+The Sessions submenu used to be empty until the picker window was opened, because that was the only caller of `begin_discovery`. Discovery now starts in `connect_activate` and re-runs every `sessions.refresh_interval_s` (default 15, 0 disables) from `poll_once` while windows exist. This polls an external listing command; it owns no sessions and starts no daemon.
+
+`begin_discovery` must NOT clear `cache.sessions`. Each target's result replaces its own (host, kind) slice in `record_discovery_result`, so keeping the old sessions until then is what stops the submenu flashing "No sessions found" at the start of every refresh.
 
 ### Menu IA: four archetypes, one home per action
 

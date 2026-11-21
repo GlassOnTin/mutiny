@@ -132,6 +132,9 @@ pub struct SessionsConfig {
     pub ignore_size: bool,
     /// Show zellij's resurrectable EXITED sessions, badged and sorted last.
     pub show_exited: bool,
+    /// Re-list sessions every N seconds so the Sessions submenu stays current.
+    /// 0 disables the periodic refresh; startup and picker opens still scan.
+    pub refresh_interval_s: u32,
 }
 
 impl Default for SessionsConfig {
@@ -148,6 +151,7 @@ impl Default for SessionsConfig {
             create_if_missing: true,
             ignore_size: false,
             show_exited: true,
+            refresh_interval_s: 15,
         }
     }
 }
@@ -200,6 +204,7 @@ pub struct ResolvedConfig {
     pub sessions: crate::mux::MuxOptions,
     pub session_hosts: Vec<String>,
     pub show_exited_sessions: bool,
+    pub session_refresh_interval_s: u32,
     pub discovery_timeout_ms: u64,
 }
 
@@ -358,6 +363,7 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
             .cloned()
             .collect(),
         show_exited_sessions: config.sessions.show_exited,
+        session_refresh_interval_s: config.sessions.refresh_interval_s.min(3600),
         discovery_timeout_ms: config.sessions.discovery_timeout_ms.clamp(200, 60_000),
     }
 }

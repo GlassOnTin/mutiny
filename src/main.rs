@@ -741,6 +741,11 @@ fn run_gui_app(
 
     let ctrl_activate = Rc::clone(&controller);
     app.connect_activate(move |_| {
+        // Populate the Sessions submenu before the user opens it. Without this
+        // it stayed empty until the picker window was opened, which was the
+        // only thing that used to start a discovery pass.
+        let targets = ctrl_activate.discovery_targets_all();
+        ctrl_activate.begin_discovery(targets, true, None);
         if ctrl_activate.workspace.borrow().windows().is_empty()
             && let Err(err) = ctrl_activate.create_window(initial_cwd.clone())
         {

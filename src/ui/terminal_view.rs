@@ -38,6 +38,8 @@ mod imp {
         pub cell_w: Cell<f32>,
         pub cell_h: Cell<f32>,
         pub drag_origin_px: Cell<(f64, f64)>,
+        /// Last pointer position, so a wheel event knows which cell it is over.
+        pub pointer_px: Cell<(f64, f64)>,
         pub context_popover: RefCell<Option<gtk4::PopoverMenu>>,
         pub im_context: RefCell<Option<gtk4::IMMulticontext>>,
         /// In-progress composition text, drawn at the cursor until committed.
@@ -310,30 +312,69 @@ impl TerminalView {
         let drag = gtk4::GestureDrag::new();
         drag.set_button(gdk::BUTTON_PRIMARY);
         let view_weak = self.downgrade();
-        drag.connect_drag_begin(move |_, start_x, start_y| {
+        drag.connect_drag_begin(move |gesture, start_x, start_y| {
             let Some(view) = view_weak.upgrade() else {
                 return;
             };
             view.grab_focus();
             view.imp().drag_origin_px.set((start_x, start_y));
+            view.imp().pointer_px.set((start_x, start_y));
             if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
                 let _ = ctrl.workspace.borrow_mut().focus_pane(pid);
-                if let Some(eng) = ctrl.workspace.borrow_mut().pane_mut(pid) {
+                let shift = gesture
+                    .current_event()
+                    .map(|e| e.modifier_state().contains(gdk::ModifierType::SHIFT_MASK))
+                    .unwrap_or(false);
+                let (col, row) = view.px_to_cell(start_x, start_y);
+                let mut ws = ctrl.workspace.borrow_mut();
+                if let Some(eng) = ws.pane_mut(pid) {
+                    if eng.mouse_mode() && !shift {
+                        // The program owns the mouse: report the press rather
+                        // than starting a mutiny selection.
+                        let report =
+                            crate::engine::mouse_report(0, col, row, false, eng.sgr_mouse());
+                        let _ = eng.write_to_pty(&report);
+                        return;
+                    }
                     eng.clear_selection();
                 }
+                drop(ws);
                 view.queue_draw();
             }
         });
 
         let view_weak = self.downgrade();
-        drag.connect_drag_update(move |_, off_x, off_y| {
+        drag.connect_drag_update(move |gesture, off_x, off_y| {
             let Some(view) = view_weak.upgrade() else {
                 return;
             };
+            let (sx, sy) = view.imp().drag_origin_px.get();
+            view.imp().pointer_px.set((sx + off_x, sy + off_y));
+            if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
+                let shift = gesture
+                    .current_event()
+                    .map(|e| e.modifier_state().contains(gdk::ModifierType::SHIFT_MASK))
+                    .unwrap_or(false);
+                let mut ws = ctrl.workspace.borrow_mut();
+                if let Some(eng) = ws.pane_mut(pid)
+                    && eng.mouse_mode()
+                    && !shift
+                {
+                    let (col, row) = view.px_to_cell(sx + off_x, sy + off_y);
+                    let report = crate::engine::mouse_report(
+                        crate::engine::MOUSE_MOTION_FLAG,
+                        col,
+                        row,
+                        false,
+                        eng.sgr_mouse(),
+                    );
+                    let _ = eng.write_to_pty(&report);
+                    return;
+                }
+            }
             if off_x.hypot(off_y) < 3.0 {
                 return;
             }
-            let (sx, sy) = view.imp().drag_origin_px.get();
             let (sc, sr) = view.px_to_cell(sx, sy);
             let (ec, er) = view.px_to_cell(sx + off_x, sy + off_y);
             if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
@@ -348,11 +389,27 @@ impl TerminalView {
         });
 
         let view_weak = self.downgrade();
-        drag.connect_drag_end(move |_, _, _| {
+        drag.connect_drag_end(move |gesture, off_x, off_y| {
             let Some(view) = view_weak.upgrade() else {
                 return;
             };
             if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
+                let shift = gesture
+                    .current_event()
+                    .map(|e| e.modifier_state().contains(gdk::ModifierType::SHIFT_MASK))
+                    .unwrap_or(false);
+                let (sx, sy) = view.imp().drag_origin_px.get();
+                let (col, row) = view.px_to_cell(sx + off_x, sy + off_y);
+                let mut ws = ctrl.workspace.borrow_mut();
+                if let Some(eng) = ws.pane_mut(pid)
+                    && eng.mouse_mode()
+                    && !shift
+                {
+                    let report = crate::engine::mouse_report(0, col, row, true, eng.sgr_mouse());
+                    let _ = eng.write_to_pty(&report);
+                    return;
+                }
+                drop(ws);
                 let selected = ctrl
                     .workspace
                     .borrow()
@@ -412,20 +469,53 @@ impl TerminalView {
         });
         self.add_controller(secondary);
 
-        // Mouse wheel scrolls scrollback history.
+        // Track the pointer so a wheel event knows which cell it is over. A
+        // scroll event carries no coordinates of its own.
+        let motion = gtk4::EventControllerMotion::new();
+        let view_weak = self.downgrade();
+        motion.connect_motion(move |_, x, y| {
+            if let Some(view) = view_weak.upgrade() {
+                view.imp().pointer_px.set((x, y));
+            }
+        });
+        self.add_controller(motion);
+
+        // Mouse wheel. When the program has asked for mouse events (tmux, vim,
+        // less), the wheel belongs to IT: scrolling mutiny's own scrollback
+        // instead made tmux scrolling appear broken. Shift is the conventional
+        // override that keeps local scrollback reachable.
         let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let view_weak = self.downgrade();
-        scroll.connect_scroll(move |_, _dx, dy| {
+        scroll.connect_scroll(move |controller, _dx, dy| {
             let Some(view) = view_weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            let shift = controller
+                .current_event()
+                .map(|e| e.modifier_state().contains(gdk::ModifierType::SHIFT_MASK))
+                .unwrap_or(false);
             if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
-                let lines = if dy < 0.0 { 3 } else { -3 };
-                if let Some(eng) = ctrl.workspace.borrow_mut().pane_mut(pid) {
-                    eng.scroll(Scroll::Delta(lines));
+                let (px, py) = view.imp().pointer_px.get();
+                let (col, row) = view.px_to_cell(px, py);
+                let mut ws = ctrl.workspace.borrow_mut();
+                let Some(eng) = ws.pane_mut(pid) else {
+                    return glib::Propagation::Proceed;
+                };
+                match crate::engine::wheel_action(eng.mouse_mode(), shift, dy) {
+                    crate::engine::WheelAction::Report(button) => {
+                        let report =
+                            crate::engine::mouse_report(button, col, row, false, eng.sgr_mouse());
+                        let _ = eng.write_to_pty(&report);
+                        return glib::Propagation::Stop;
+                    }
+                    crate::engine::WheelAction::LocalScroll(lines) => {
+                        eng.scroll(Scroll::Delta(lines));
+                        drop(ws);
+                        view.queue_draw();
+                        return glib::Propagation::Stop;
+                    }
+                    crate::engine::WheelAction::Ignore => return glib::Propagation::Proceed,
                 }
-                view.queue_draw();
-                return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
         });

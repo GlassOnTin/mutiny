@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 163 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 168 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -21,6 +21,7 @@ Working today:
 - A ring of the last eight exited panes keeps the final screen and exit code, so a session that fails on startup is still diagnosable.
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
+- Mouse reporting: when a program asks for mouse events (tmux with `mouse on`, vim, less), the wheel and clicks go to it instead of mutiny's scrollback and selection. Hold Shift to override back to local scrollback and selection.
 - One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 22 IPC verbs, 18 MCP tools, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
 - Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
 - An authenticated HTTP MCP listener, off by default, so a peer such as Haven can drive the desktop terminal from a phone. It refuses an unpaired client and can never assign Operator. See [Remote agents over HTTP](#remote-agents-over-http).
@@ -225,7 +226,7 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 
 The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View" held session attaching, and "Panes" mixed structure with content navigation. Help existed for one item, which now sits in View. Action slugs and keybinds are unchanged; `tests/menu_ia.rs` holds a golden list so a rename or rebound chord fails a test.
 
-**Open Session** is a submenu listing discovered sessions inline, not a pop-up. `Ctrl+Shift+S` still opens the full picker, which is also the last item in that submenu.
+**Open Session** is a submenu listing discovered sessions inline, not a pop-up. It is filled at startup and re-listed every `refresh_interval_s` seconds, so it is populated before you open it and reflects sessions that came and went. A refresh keeps the sessions it already knows until each host's new result replaces them, so the list never flashes empty. `Ctrl+Shift+S` still opens the full picker, which is also the last item in that submenu.
 
 Labels follow the Haven convention: **title is the session name, subtitle is the host** (this machine's hostname for local sessions, the SSH host for remote ones). Tabs and the picker both use two lines, title prominent and subtitle dimmer, with the title ellipsised so wrapped tabs stay readable. Session numbers are gone: once sessions are named, an index is redundant noise.
 
@@ -298,6 +299,7 @@ remote_term = "xterm-256color" # mutiny advertises TERM=alacritty, which remote 
 create_if_missing = true       # attach-or-create
 ignore_size = false            # true adds tmux -f ignore-size, so this client cannot resize other viewers
 show_exited = true             # show zellij's resurrectable EXITED sessions, badged
+refresh_interval_s = 15        # re-list sessions so the submenu stays current; 0 disables
 ```
 
 Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are computed, not configurable.
@@ -386,7 +388,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 163 tests, no display required
+cargo test                    # 168 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
