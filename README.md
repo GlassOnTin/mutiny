@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 168 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 171 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -43,8 +43,7 @@ Not built yet:
 - Drag gestures work, but their GTK wiring is not covered by tests (the model operations they call are).
 - Kitty graphics is a slice: no animation, file/shared-memory transmission, or unicode placeholders.
 - Render measurement covers node construction under Xvfb, not GPU compositing or presentation on a real compositor.
-- Running processes are not restored. There is no multiplexer daemon, so a crash kills every shell; session restore brings back layout and history with fresh shells. `tmux` and `zellij` compose alongside rather than being reimplemented.
-- Session restore does not re-attach multiplexer clients: a restored pane that was running tmux comes back as a plain shell.
+- Mutiny-owned shells are not restored. There is no multiplexer daemon, so a crash kills them; session restore brings back layout and history with fresh shells. A pane attached to tmux or zellij re-attaches, because those processes belong to the multiplexer. `tmux` and `zellij` compose alongside rather than being reimplemented.
 - A pane attached to tmux or zellij gets no shell integration, so prompt jumping and command capture do not work inside it.
 - The session picker scans local tmux and zellij plus configured SSH hosts. screen, abduco, and dtach are not discovered.
 - The HTTP MCP carrier is a slice: no SSE and no session management. Peer identity, session grants, and consent mode are all per token. Driven end to end from Haven on a phone over both an SSH forward and a real WireGuard tunnel.
@@ -119,6 +118,8 @@ One binary, three entry points:
 ```sh
 mutiny                          # GUI, binds both control sockets
 mutiny install-desktop          # app icon + launcher into ~/.local/share
+mutiny ctl save-session         # snapshot the current layout and session list now
+mutiny ctl quit                 # save, then quit
 mutiny ctl list                 # human and script CLI, JSON output
 mutiny mcp --consent ask        # stdio JSON-RPC 2.0 MCP server for an agent
 ```
@@ -318,13 +319,19 @@ Sessions already attached elsewhere are **shared, not taken over**. Mutiny never
 
 Remote hosts come from `[sessions] hosts`, falling back to literal `Host` aliases in `~/.ssh/config`. Discovery uses `BatchMode=yes` and never prompts; attaching allocates a tty and lets you type a passphrase in the pane. A host that is unreachable or lacks the multiplexer is shown as an unavailable row with the reason, alongside the sessions that did answer.
 
-Two limits worth knowing. A pane running tmux gets no shell integration, because tmux is not a shell mutiny injects into: prompt jumping and command capture do not work inside it unless tmux passes those sequences through. And session restore does not re-attach: a restored pane that was a tmux client comes back as a plain shell.
+One limit worth knowing: a pane running tmux gets no shell integration, because tmux is not a shell mutiny injects into. Prompt jumping and command capture do not work inside it unless tmux passes those sequences through.
 
 ### Session restore
 
 On clean exit mutiny writes `$XDG_STATE_HOME/mutiny/session.json`, and on launch it restores that bundle unless you pass `--no-restore`. A restored session reproduces the window/tab/split layout with its divider ratios, each pane's working directory and grid size, and its scrollback.
 
-**Processes are not restored.** There is no multiplexer daemon, so a crash kills every shell; that is a deliberate contract. A restore starts a fresh shell in each saved directory and replays the saved history into it. Restored scrollback is plain text, so colors and attributes are not preserved, and a crash loses changes since the last clean save.
+`mutiny ctl save-session` snapshots on demand; `mutiny ctl quit` saves and exits. Closing a pane is `mutiny ctl close-pane`, the counterpart to `spawn-tab` and `split`.
+
+The bundle carries the **opened session list with its window and tab ordering**, split trees and ratios, working directories, and scrollback. Reopening reproduces the arrangement exactly.
+
+**Mutiny-owned shells are not restored.** There is no multiplexer daemon, so a crash kills them; that is a deliberate contract. A restore starts a fresh shell in each saved directory and replays the saved history into it. Restored scrollback is plain text, so colors and attributes are not preserved, and a crash loses changes since the last clean save.
+
+**A pane attached to a multiplexer re-attaches.** Its session name and host are saved, and the next load attaches to that session again rather than starting a bare shell. This is not mutiny resurrecting processes: tmux or zellij owns them, and their survival was never mutiny's promise. Saved text is not replayed into an attaching pane, because the multiplexer owns and redraws that screen. If the session no longer exists, attach-or-create makes a fresh one under the same name, exactly as the picker does.
 
 ### Inline images
 
@@ -388,7 +395,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 168 tests, no display required
+cargo test                    # 171 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

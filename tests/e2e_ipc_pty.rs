@@ -583,6 +583,13 @@ fn every_advertised_mcp_tool_dispatches() {
             "present_notice" => json!({"pane": p1.0, "message": "x"}),
             "present_media" => json!({"pane": p1.0, "path": "/nonexistent-probe.png"}),
             "list_sessions" => json!({}),
+            "save_session" => json!({}),
+            // A nonexistent pane: the probe asserts dispatch, not success, and
+            // closing a real pane would tear down the server other probes use.
+            "close_pane" => json!({"pane": 999999}),
+            // On a headless controller there is no GTK application to stop, so
+            // quit saves and returns without ending the test server.
+            "quit" => json!({}),
             "open_session" => json!({"kind": "tmux", "name": "mutiny-probe", "mode": "tab"}),
             _ => return None,
         })

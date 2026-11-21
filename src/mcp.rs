@@ -62,6 +62,9 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::PresentMedia { .. } => Some(McpSurface::Tool("present_media")),
         IpcRequest::ListSessions { .. } => Some(McpSurface::Tool("list_sessions")),
         IpcRequest::OpenSession { .. } => Some(McpSurface::Tool("open_session")),
+        IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
+        IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
+        IpcRequest::Quit => Some(McpSurface::Tool("quit")),
     }
 }
 
@@ -563,6 +566,14 @@ impl McpBridge {
                     Duration::from_secs(30),
                 )
             }
+            "save_session" => (IpcRequest::SaveSession, Duration::from_secs(15)),
+            "close_pane" => (
+                IpcRequest::ClosePane {
+                    pane: opt_pane("pane"),
+                },
+                Duration::from_secs(15),
+            ),
+            "quit" => (IpcRequest::Quit, Duration::from_secs(15)),
             "list_sessions" => {
                 let host = args.get("host").and_then(Value::as_str).map(str::to_owned);
                 let refresh = args
@@ -851,6 +862,24 @@ pub fn tool_definitions() -> Value {
                     "window": { "type": "integer" }
                 }
             }
+        },
+        {
+            "name": "save_session",
+            "description": "Tier-2 Act: write the current layout and opened session list to the state file now, instead of waiting for a clean exit. Use it to snapshot a layout deliberately.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "close_pane",
+            "description": "Tier-2 Act: close a pane, defaulting to the active one. Closing the last pane of a tab closes the tab, and the last tab closes the window. For a pane attached to a multiplexer this kills only its client, never the server.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "pane": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "quit",
+            "description": "Tier-2 Act: save the session, then quit Mutiny. This ends every mutiny-owned shell; processes inside tmux or zellij survive because the multiplexer owns them.",
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "list_sessions",

@@ -152,6 +152,17 @@ pub enum IpcRequest {
         pane: Option<PaneId>,
         message: Option<String>,
     },
+    /// Writes the current layout and opened session list to the state file now,
+    /// without waiting for a clean exit. Lets a layout be snapshotted on demand.
+    SaveSession,
+    /// Closes a pane. If it is the last pane of a tab the tab goes, and if that
+    /// was the last tab the window goes. The symmetric counterpart to the spawn
+    /// verbs, which previously had no matching close.
+    ClosePane {
+        pane: Option<PaneId>,
+    },
+    /// Saves the session and quits. Act-tier: it ends every mutiny-owned shell.
+    Quit,
     /// Lists tmux/zellij sessions. `host: None` means THIS machine only, which
     /// is Observe. Naming a host authenticates to it with the user's keys and
     /// runs a command there, so that case is Act: an observe-only carrier must
@@ -244,6 +255,9 @@ impl IpcRequest {
                 }
             }
             IpcRequest::OpenSession { .. } => ConsentTier::Act,
+            IpcRequest::SaveSession => ConsentTier::Act,
+            IpcRequest::ClosePane { .. } => ConsentTier::Act,
+            IpcRequest::Quit => ConsentTier::Act,
 
             IpcRequest::SpawnWindow { .. }
             | IpcRequest::SpawnTab { .. }
@@ -264,6 +278,9 @@ impl IpcRequest {
             IpcRequest::List => "list",
             IpcRequest::ListSessions { .. } => "list-sessions",
             IpcRequest::OpenSession { .. } => "open-session",
+            IpcRequest::SaveSession => "save-session",
+            IpcRequest::ClosePane { .. } => "close-pane",
+            IpcRequest::Quit => "quit",
             IpcRequest::Actions => "actions",
             IpcRequest::AuditLog { .. } => "audit-log",
             IpcRequest::Snapshot { .. } => "snapshot",
@@ -316,6 +333,7 @@ impl IpcRequest {
             IpcRequest::ListSessions { host, refresh } => {
                 format!("host={host:?} refresh={refresh}")
             }
+            IpcRequest::ClosePane { pane } => format!("pane={pane:?}"),
             IpcRequest::OpenSession {
                 kind,
                 name,
@@ -905,6 +923,9 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             window: None,
             pane: None,
         },
+        IpcRequest::SaveSession,
+        IpcRequest::ClosePane { pane: None },
+        IpcRequest::Quit,
     ]
 }
 
@@ -938,6 +959,9 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::PresentMedia { .. } => 21,
         IpcRequest::ListSessions { .. } => 22,
         IpcRequest::OpenSession { .. } => 23,
+        IpcRequest::SaveSession => 24,
+        IpcRequest::ClosePane { .. } => 25,
+        IpcRequest::Quit => 26,
     }
 }
 

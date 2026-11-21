@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 168 tests: 96 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 2 session + 1 shell + 7 queries
+cargo test                               # 171 tests: 97 unit + 7 config + 11 e2e + 7 http + 10 mux + 3 menuia + 4 mouse + 1 sessmenu + 1 restoregui + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 3 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -104,9 +104,17 @@ Do not remove that Drop or replace it with a plain SIGHUP. Exit-code capture is 
 
 ### Session restore
 
+**`attach_gtk_app` must materialise any model window that has no view.** `ensure_ui_window` returns early when no application is attached, so a restore that runs before startup populates the model but creates no widgets, leaving an application with nothing to show, which GTK then exits. This was a real bug: session restore had never worked in the GUI, and the headless tests could not see it because they never attach an application. Restore now runs in `connect_activate`, and `attach_gtk_app` also creates views for existing model windows so the ordering is safe either way. `tests/restore_gui.rs` restores BEFORE attaching on purpose to guard it.
+
+
+
 `src/session.rs` captures geometry by reusing the live `WindowModel`/`SplitNode` types, so ratios and tree shape serialize verbatim rather than being re-derived. Pane content is title, cwd, grid size, and scrollback as plain text. `Workspace::restore_from_session` replaces the model with saved ids and counters; `AppController::restore_session` spawns the engines first, then installs the tree that references them.
 
-Processes are never restored. That is the no-daemon contract, not a missing feature: a restore spawns fresh shells in saved cwds and replays scrollback. Do not add process resurrection without revisiting the crash-semantics contract in VISION.
+Mutiny-owned shells are never restored. That is the no-daemon contract, not a missing feature: a restore spawns fresh shells in saved cwds and replays scrollback. Do not add process resurrection for them without revisiting the crash-semantics contract in VISION.
+
+Three verbs fill gaps the CLI surface had: `save-session` (snapshot the layout now, rather than only on clean exit), `close-pane` (the symmetric counterpart to the spawn verbs, previously reachable only through `run close-pane`), and `quit` (save then quit, deferring the quit to an idle callback so the reply is written first). All are Act.
+
+`SessionPane.mux` is the exception and not a violation: a pane attached to tmux or zellij saves its `MuxSessionRef` and RE-ATTACHES on restore, because the multiplexer owns those processes. Two rules follow. Do not replay saved scrollback into an attaching pane, since the multiplexer owns and redraws that screen. And a remote session's saved cwd is a path on that host, so it must not become a local cwd. The field is `#[serde(default)]`, so bundles written before it still load and `SESSION_VERSION` stays 1.
 
 Save is atomic (temp file plus rename) and happens on clean exit in `main.rs`, not in `shutdown_ipc`, so tests do not write to the user's real state directory. Tests must call `set_session_path` with a temp path. Load rejects an unknown version and reports corrupt files rather than half-restoring.
 
@@ -346,9 +354,8 @@ These look closer to done than they are:
 - **Kitty graphics is a slice.** No animation frames, file or shared-memory transmission, unicode placeholders, or cursor-movement policies. Placements drift once scrollback is capped, sharing the OSC 133 marker limitation.
 - **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
 - **No in-app settings UI.** The TOML file is the only config surface.
-- **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Processes are never restored, by contract.
+- **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Mutiny-owned shells are never restored, by contract; multiplexer-attached panes re-attach because the multiplexer owns those processes.
 - **No quick terminal yet (M2).**
-- **Session restore does not re-attach multiplexer clients.** `SessionPane` has no command field, so a restored tmux pane returns as a plain shell. Changing that edits the stated restore contract and needs its own rung.
 - **Multiplexer panes get no shell integration.** tmux classifies as `ShellKind::Other`, so no OSC 133/7 injection; prompt jumping and command capture do not work inside them.
 - **Only tmux and zellij are discovered.** screen, abduco, and dtach are not.
 - **The HTTP MCP carrier is a slice.** No SSE, session management, or DELETE. Requests are stateless, so `initialize`'s client name does not persist. Identity, session grants, and consent mode are all per token. Driven end to end from Haven on a phone over an SSH local forward: unpaired 401, paired 200, a command sent and its output read back, `spawn_pane` and `present_notice` accepted, and both Act verbs denied when the carrier was pinned to `observe-only`. Also driven over a real WireGuard tunnel with the listener bound to the workstation's WG address, so both named transports are exercised.

@@ -2,11 +2,17 @@
 //! a state file, restored on launch.
 //!
 //! Processes are NOT restored. There is no multiplexer daemon, so the
-//! crash-semantics contract stands: a crash kills every shell. What a restore
-//! gives back is the layout, each pane's working directory, and its scrollback
-//! as text, with a fresh shell spawned in that directory. Restored scrollback
-//! is plain text, not styled cells, because alacritty's grid is not a stable
-//! serialization format.
+//! crash-semantics contract stands: a crash kills every mutiny-owned shell.
+//! What a restore gives back is the layout, each pane's working directory, and
+//! its scrollback as text, with a fresh shell spawned in that directory.
+//! Restored scrollback is plain text, not styled cells, because alacritty's
+//! grid is not a stable serialization format.
+//!
+//! A pane that was attached to an external multiplexer is the exception, and
+//! not a violation: it RE-ATTACHES to that session. The multiplexer, not
+//! mutiny, owns those processes, so their survival was never mutiny's promise.
+//! Window order, tab order, and split trees with their ratios are carried
+//! verbatim in `WindowModel`, so the arrangement comes back exactly.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,6 +32,11 @@ pub struct SessionPane {
     pub cols: usize,
     pub rows: usize,
     pub scrollback: Vec<String>,
+    /// The external multiplexer session this pane was attached to, if any.
+    /// Restoring re-attaches it rather than starting a bare shell. Additive and
+    /// defaulted, so bundles written before this field still load.
+    #[serde(default)]
+    pub mux: Option<crate::mux::MuxSessionRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +86,7 @@ pub fn capture(ws: &Workspace) -> SessionState {
                         cols: eng.size().cols,
                         rows: eng.size().rows,
                         scrollback: eng.scrollback_text(),
+                        mux: eng.mux_session().cloned(),
                     });
                 }
             }
@@ -232,6 +244,24 @@ mod tests {
         // A new pane must not collide with a restored id.
         let fresh = restored.reserve_pane_id();
         assert!(fresh != p1 && fresh != p2);
+    }
+
+    /// A bundle written before the mux field existed must still load, and its
+    /// panes must come back as plain shells rather than failing to parse.
+    #[test]
+    fn a_bundle_without_the_mux_field_still_loads() {
+        let (ws, _p1, _p2) = workspace_with_history();
+        let state = capture(&ws);
+        let mut json = serde_json::to_value(&state).unwrap();
+        for pane in json["panes"].as_array_mut().unwrap() {
+            pane.as_object_mut().unwrap().remove("mux");
+        }
+        let text = serde_json::to_string(&json).unwrap();
+        assert!(!text.contains("\"mux\""), "fixture must omit the field");
+        let loaded: SessionState = serde_json::from_str(&text).expect("legacy bundle loads");
+        assert_eq!(loaded.version, SESSION_VERSION, "version stays 1");
+        assert!(loaded.panes.iter().all(|p| p.mux.is_none()));
+        assert_eq!(loaded.panes.len(), 2);
     }
 
     #[test]

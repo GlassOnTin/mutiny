@@ -2,13 +2,15 @@
 //! ratios, working directories, and scrollback in a fresh controller, with
 //! fresh shells rather than restored processes.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use mutiny::app::AppController;
 use mutiny::config::Overrides;
-use mutiny::topology::{PaneId, SplitAxis, SplitNode};
+use mutiny::mux::{MuxKind, SessionMode};
+use mutiny::topology::{PaneId, SplitAxis, SplitNode, TabId, WindowId};
 
 fn controller(dir: &std::path::Path, session: &std::path::Path) -> Rc<AppController> {
     let ctrl = AppController::with_config(
@@ -187,5 +189,235 @@ fn no_state_file_restores_nothing_and_corrupt_state_is_reported() {
         ctrl.workspace.borrow().windows().is_empty(),
         "a corrupt file must not half-restore"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The saved bundle must carry the opened session list with its window and tab
+/// ordering, and re-attach those sessions on the next load rather than coming
+/// back as bare shells.
+#[test]
+fn saved_session_list_reopens_in_order_and_reattaches() {
+    let tmux = std::env::var("MUTINY_TEST_TMUX")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", "command -v tmux"])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if p.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(p))
+            }
+        });
+    let Some(tmux) = tmux else {
+        eprintln!("skipping: tmux not installed (CI installs it)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("mutiny-relist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("tmux.sock");
+    let run = |args: &[&str]| {
+        std::process::Command::new(&tmux)
+            .arg("-S")
+            .arg(&sock)
+            .args(args)
+            .output()
+            .expect("tmux")
+    };
+    for name in ["alpha", "beta", "gamma"] {
+        assert!(run(&["new-session", "-d", "-s", name]).status.success());
+    }
+    let session_file = dir.join("session.json");
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[sessions]\ntmux_program = {:?}\ntmux_socket = {:?}\nzellij_program = \"/nonexistent-zellij\"\nssh_program = \"/nonexistent-ssh\"\n",
+            tmux.display().to_string(), sock.display().to_string()
+        ),
+    ).unwrap();
+    let make = || {
+        let c = AppController::with_config(
+            Some((String::from("/bin/sh"), Vec::new())),
+            dir.join("audit.jsonl"),
+            dir.join("config.toml"),
+            Overrides::default(),
+        );
+        c.set_session_path(session_file.clone());
+        c
+    };
+
+    // Window 1: tabs alpha, beta. Window 2: tab gamma plus a plain shell.
+    let first = make();
+    let (w1, t1, p1) = first.create_window(None).expect("w1");
+    first
+        .open_session(
+            MuxKind::Tmux,
+            "alpha",
+            None,
+            SessionMode::Tab,
+            Some(w1),
+            None,
+        )
+        .expect("alpha");
+    let (_w, t2, p_alpha) = first
+        .open_session(
+            MuxKind::Tmux,
+            "beta",
+            None,
+            SessionMode::Tab,
+            Some(w1),
+            None,
+        )
+        .expect("beta");
+    let (w2, t3, _p) = first.create_window(None).expect("w2");
+    let (_w2, _t4, p_gamma) = first
+        .open_session(
+            MuxKind::Tmux,
+            "gamma",
+            None,
+            SessionMode::Tab,
+            Some(w2),
+            None,
+        )
+        .expect("gamma");
+    let (_w2b, t_plain, p_plain) = first.create_tab(Some(w2), None).expect("plain tab");
+    first
+        .workspace
+        .borrow_mut()
+        .pane_mut(p_plain)
+        .unwrap()
+        .advance_bytes(b"plain-shell-history\r\n");
+    pump(&first, 1200);
+
+    let expected_windows: Vec<WindowId> = first
+        .workspace
+        .borrow()
+        .windows()
+        .iter()
+        .map(|w| w.id)
+        .collect();
+    let expected_tabs: Vec<Vec<TabId>> = first
+        .workspace
+        .borrow()
+        .windows()
+        .iter()
+        .map(|w| w.tabs.iter().map(|t| t.id).collect())
+        .collect();
+    let expected_names: Vec<Vec<Option<String>>> = first
+        .workspace
+        .borrow()
+        .windows()
+        .iter()
+        .map(|w| {
+            w.tabs
+                .iter()
+                .map(|t| {
+                    first
+                        .workspace
+                        .borrow()
+                        .pane(t.active_pane)
+                        .and_then(|e| e.mux_session())
+                        .map(|s| s.name.clone())
+                })
+                .collect()
+        })
+        .collect();
+    first.save_session().expect("save");
+    let _ = (t1, t2, t3, t_plain, p1, p_alpha, p_gamma);
+    drop(first);
+
+    // A fresh controller reopens the list.
+    let second = make();
+    let restored = second
+        .restore_session_from_file()
+        .expect("restore")
+        .expect("bundle");
+    assert_eq!(restored, 6, "all six panes come back");
+    let got_windows: Vec<WindowId> = second
+        .workspace
+        .borrow()
+        .windows()
+        .iter()
+        .map(|w| w.id)
+        .collect();
+    assert_eq!(
+        got_windows, expected_windows,
+        "window order must be preserved"
+    );
+    let got_tabs: Vec<Vec<TabId>> = second
+        .workspace
+        .borrow()
+        .windows()
+        .iter()
+        .map(|w| w.tabs.iter().map(|t| t.id).collect())
+        .collect();
+    assert_eq!(got_tabs, expected_tabs, "tab order must be preserved");
+    let got_names: Vec<Vec<Option<String>>> = second
+        .workspace
+        .borrow()
+        .windows()
+        .iter()
+        .map(|w| {
+            w.tabs
+                .iter()
+                .map(|t| {
+                    second
+                        .workspace
+                        .borrow()
+                        .pane(t.active_pane)
+                        .and_then(|e| e.mux_session())
+                        .map(|s| s.name.clone())
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        got_names, expected_names,
+        "the session list must match, in order"
+    );
+    assert_eq!(
+        got_names,
+        vec![
+            vec![None, Some("alpha".into()), Some("beta".into())],
+            vec![None, Some("gamma".into()), None]
+        ],
+        "sanity: the arrangement we built"
+    );
+
+    // The attached panes must really re-attach, not just carry a label.
+    pump(&second, 2000);
+    let clients = run(&["list-clients", "-F", "#{client_session}"]);
+    let text = String::from_utf8_lossy(&clients.stdout);
+    for name in ["alpha", "beta", "gamma"] {
+        assert!(
+            text.lines().any(|l| l == name),
+            "restored pane must re-attach to {name}; clients:\n{text}"
+        );
+    }
+
+    // A plain pane still replays its history; an attached one must not, because
+    // the multiplexer owns and redraws that screen.
+    let plain_text = second
+        .workspace
+        .borrow()
+        .pane(p_plain)
+        .unwrap()
+        .scrollback_text()
+        .join("\n");
+    assert!(
+        plain_text.contains("plain-shell-history"),
+        "plain pane history: {plain_text}"
+    );
+
+    let _ = run(&["kill-server"]);
+    second.shutdown_ipc();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -231,6 +231,15 @@ enum CtlVerb {
         pane: Option<u64>,
         message: Option<String>,
     },
+    /// Write the current layout and session list to the state file now
+    SaveSession,
+    /// Close a pane (defaults to the active one)
+    ClosePane {
+        #[arg(long)]
+        pane: Option<u64>,
+    },
+    /// Save the session and quit Mutiny
+    Quit,
     /// List tmux and zellij sessions. Omit --host for this machine only
     Sessions {
         #[arg(long)]
@@ -467,6 +476,11 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             pane: pane.map(PaneId),
             message,
         },
+        CtlVerb::SaveSession => IpcRequest::SaveSession,
+        CtlVerb::ClosePane { pane } => IpcRequest::ClosePane {
+            pane: pane.map(PaneId),
+        },
+        CtlVerb::Quit => IpcRequest::Quit,
         CtlVerb::Sessions { host, refresh } => IpcRequest::ListSessions { host, refresh },
         CtlVerb::OpenSession {
             name,
@@ -631,17 +645,6 @@ fn run_gui_app(
         );
     }
 
-    // Restore the saved session before the first window is created, so
-    // connect_activate only spawns a fresh pane when there is nothing to
-    // restore. Processes are not restored; shells start fresh in saved cwds.
-    if !no_restore {
-        match controller.restore_session_from_file() {
-            Ok(Some(n)) => eprintln!("mutiny: restored {n} panes from the saved session"),
-            Ok(None) => {}
-            Err(err) => eprintln!("warning: session not restored: {err}"),
-        }
-    }
-
     // Authenticated HTTP MCP carrier. Off unless explicitly bound. Each peer
     // token gets its own relay carrier, identity, and consent mode, so a network
     // peer can never be assigned Operator.
@@ -741,6 +744,17 @@ fn run_gui_app(
 
     let ctrl_activate = Rc::clone(&controller);
     app.connect_activate(move |_| {
+        // Restore HERE, not before app.run: `attach_gtk_app` happens in
+        // connect_startup, and `ensure_ui_window` returns early without it. A
+        // restore run earlier populated the model but created no GTK windows,
+        // so the application had nothing to show and exited immediately.
+        if !no_restore {
+            match ctrl_activate.restore_session_from_file() {
+                Ok(Some(n)) => eprintln!("mutiny: restored {n} panes from the saved session"),
+                Ok(None) => {}
+                Err(err) => eprintln!("warning: session not restored: {err}"),
+            }
+        }
         // Populate the Sessions submenu before the user opens it. Without this
         // it stayed empty until the picker window was opened, which was the
         // only thing that used to start a discovery pass.

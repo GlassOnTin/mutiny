@@ -278,18 +278,45 @@ impl AppController {
         }
     }
 
-    /// Restores a saved bundle: fresh shells in the saved directories, with the
-    /// saved geometry, ratios, and scrollback. Processes are not restored; the
-    /// no-daemon crash contract stands.
+    /// Restores a saved bundle: window and tab order, split trees and ratios,
+    /// working directories, and scrollback. Mutiny-owned shells start fresh;
+    /// the no-daemon crash contract stands for them.
+    ///
+    /// A pane that was attached to a multiplexer re-attaches to that session
+    /// instead. Those processes belong to the multiplexer, so this is not
+    /// process resurrection by mutiny.
     pub fn restore_session(self: &Rc<Self>, state: SessionState) -> Result<usize, String> {
+        let opts = self.config.borrow().sessions.clone();
         let mut engines = Vec::new();
         for sp in &state.panes {
+            let attach = match &sp.mux {
+                Some(session) => match &session.host {
+                    None => Some(mux::attach_argv(session.kind, &session.name, &opts)),
+                    Some(host) => Some(
+                        mux::remote_attach_argv(host, session.kind, &session.name, &opts)
+                            .map_err(|e| format!("pane {}: {e}", sp.id))?,
+                    ),
+                },
+                None => None,
+            };
+            // A remote session's saved cwd is a path on that host, never a
+            // local directory.
+            let cwd = match (&sp.mux, attach.is_some()) {
+                (Some(session), true) if session.host.is_some() => None,
+                _ => sp.cwd.clone(),
+            };
             let mut eng = self
-                .spawn_engine(sp.id, sp.cwd.clone(), None)
+                .spawn_engine(sp.id, cwd, attach.clone())
                 .map_err(|e| format!("pane {}: {e}", sp.id))?;
             eng.resize(GridSize::new(sp.cols, sp.rows, 9, 18));
             eng.set_title(sp.title.clone());
-            eng.replay_scrollback(&sp.scrollback);
+            if let Some(session) = &sp.mux {
+                eng.set_mux_session(Some(session.clone()));
+                // The multiplexer owns the screen and will redraw it. Replaying
+                // saved text into an attaching pane would corrupt that display.
+            } else {
+                eng.replay_scrollback(&sp.scrollback);
+            }
             engines.push((sp.id, eng));
         }
         let count = engines.len();
@@ -378,8 +405,24 @@ impl AppController {
         }
     }
 
-    pub fn attach_gtk_app(&self, app: &gtk4::Application) {
+    pub fn attach_gtk_app(self: &Rc<Self>, app: &gtk4::Application) {
         *self.gtk_app.borrow_mut() = Some(app.clone());
+        // Any model window that exists without a view gets one now. A restore
+        // that ran before the application was attached populated the model but
+        // could not create widgets, leaving an app with nothing to show, which
+        // then exited immediately. Doing it here makes the order safe either
+        // way rather than relying on the caller's sequencing.
+        let ids: Vec<WindowId> = self
+            .workspace
+            .borrow()
+            .windows()
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        for id in ids {
+            self.ensure_ui_window(id);
+            self.sync_ui_window(id);
+        }
     }
 
     pub fn start_ipc_listener(&self, path: &Path) -> io::Result<()> {
@@ -1813,6 +1856,31 @@ impl AppController {
                     stream: cloned,
                 });
                 None
+            }
+            IpcRequest::SaveSession => match self.save_session() {
+                Ok(()) => Some(IpcResponse::empty_ok()),
+                Err(err) => Some(IpcResponse::err(format!("could not save session: {err}"))),
+            },
+            IpcRequest::ClosePane { pane } => {
+                let pid = pane.or_else(|| self.workspace.borrow().active_pane_id());
+                let Some(pid) = pid else {
+                    return Some(IpcResponse::err("no active pane"));
+                };
+                if self.workspace.borrow().pane(pid).is_none() {
+                    return Some(IpcResponse::err(format!("no such pane {}", pid.0)));
+                }
+                self.close_pane(pid);
+                Some(IpcResponse::empty_ok())
+            }
+            IpcRequest::Quit => {
+                if let Err(err) = self.save_session() {
+                    return Some(IpcResponse::err(format!("could not save session: {err}")));
+                }
+                // Defer the quit so this reply is written before the loop stops.
+                if let Some(app) = self.gtk_app.borrow().clone() {
+                    gtk4::glib::idle_add_local_once(move || app.quit());
+                }
+                Some(IpcResponse::empty_ok())
             }
             IpcRequest::ListSessions { host, refresh } => {
                 // `host: None` is local only. Scanning configured remotes is the
