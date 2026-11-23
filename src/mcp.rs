@@ -738,7 +738,17 @@ impl McpBridge {
                 } else {
                     Duration::from_secs(15)
                 };
-                (IpcRequest::ListSessions { host, refresh }, timeout)
+                (
+                    IpcRequest::ListSessions {
+                        host,
+                        refresh,
+                        unattached_only: args
+                            .get("unattached_only")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
+                    timeout,
+                )
             }
             "open_session" => {
                 let name = args
@@ -1133,7 +1143,8 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "host": { "type": "string", "description": "SSH destination to scan. Omit for local only." },
-                    "refresh": { "type": "boolean", "description": "Force a rescan instead of returning the cached inventory." }
+                    "refresh": { "type": "boolean", "description": "Force a rescan instead of returning the cached inventory." },
+                    "unattached_only": { "type": "boolean", "description": "Only tmux sessions with no client attached. A view for deliberate pruning, not an automatic cleanup: persistent detached sessions appear here too." }
                 }
             }
         },

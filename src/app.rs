@@ -179,6 +179,7 @@ pub struct AppController {
     /// so a handler can bind a proposal to the verified peer, including the
     /// token-derived identity of an HTTP peer rather than this process's pid.
     dispatch_peer: Cell<PeerIdentity>,
+    unattached_filter: Cell<bool>,
     last_discovery_started: Cell<Option<Instant>>,
     /// In-flight one-shot multiplexer commands (rename). Same tick-polled shape
     /// as discovery: a rename may go over ssh, so it must not block the loop.
@@ -270,6 +271,7 @@ impl AppController {
             next_policy_id: Cell::new(1),
             pending_policies: RefCell::new(Vec::new()),
             dispatch_peer: Cell::new(PeerIdentity::default()),
+            unattached_filter: Cell::new(false),
             last_discovery_started: Cell::new(None),
             mux_commands: RefCell::new(Vec::new()),
             agent_socket_path: RefCell::new(None),
@@ -1315,9 +1317,17 @@ impl AppController {
     }
 
     fn inventory_response(&self) -> IpcResponse {
+        let mut inventory = self.session_inventory();
+        if self.unattached_filter.get() {
+            // tmux reports a client count; zellij does not, so its sessions are
+            // left alone rather than guessed at.
+            inventory
+                .sessions
+                .retain(|s| s.kind != MuxKind::Tmux || s.attached == 0);
+        }
         let mut resp = IpcResponse::empty_ok();
         if let IpcResponse::Ok { sessions, .. } = &mut resp {
-            *sessions = Some(self.session_inventory());
+            *sessions = Some(inventory);
         }
         resp
     }
@@ -2552,7 +2562,11 @@ impl AppController {
                 }
                 Some(IpcResponse::empty_ok())
             }
-            IpcRequest::ListSessions { host, refresh } => {
+            IpcRequest::ListSessions {
+                host,
+                refresh,
+                unattached_only,
+            } => {
                 // `host: None` is local only. Scanning configured remotes is the
                 // GUI picker's job, where the human is the consent; an Observe
                 // IPC call must not spend the user's SSH credentials.
@@ -2568,6 +2582,7 @@ impl AppController {
                 let Ok(stream) = raw_stream.try_clone() else {
                     return Some(IpcResponse::err("could not clone the request stream"));
                 };
+                self.unattached_filter.set(unattached_only);
                 self.begin_discovery(targets, refresh, Some(stream))
             }
             IpcRequest::OpenSession {

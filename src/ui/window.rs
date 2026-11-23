@@ -2346,6 +2346,12 @@ fn rebuild_session_rows(picker: &Rc<SessionPicker>, inventory: &MuxInventory, qu
         );
         if session.attached > 0 {
             meta.push_str(&format!(" · attached ×{}", session.attached));
+        } else if session.kind == MuxKind::Tmux && !session.exited {
+            // Say so explicitly: an orphan a New Tab left behind and a session
+            // deliberately detached look identical otherwise, and the operator
+            // needs to tell them apart before pruning. zellij reports no count,
+            // so it is not guessed at.
+            meta.push_str(" · no clients");
         }
         if session.exited {
             meta.push_str(" · exited");

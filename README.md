@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 199 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 200 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -240,7 +240,7 @@ The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View"
 | Close Tab / Close Pane / Close Window | this terminal client | the session and everything running in it |
 | End Session | the session itself | nothing inside it, on any device |
 
-End Session sits in its own menu section, behind a confirmation that names the session and defaults to **Keep It Running**, so Enter cannot destroy anything. Sessions outliving tabs is the point of using a multiplexer, so nothing is cleaned up automatically.
+End Session sits in its own menu section, behind a confirmation that names the session and defaults to **Keep It Running**, so Enter cannot destroy anything. Sessions outliving tabs is the point of using a multiplexer, so nothing is cleaned up automatically. A New Tab does leave an auto-named session behind when its tab closes; those are marked **"no clients"** in the picker, and `mutiny ctl sessions --unattached-only` lists them so you can prune deliberately with `end-session`. Your persistent detached sessions appear there too, which is exactly why it is a view and not a cleanup.
 
 **Right-click a tab** for Rename Session, Copy Session Name, Close Tab (session keeps running), Move to New Window, and End Session. "Move to New Window" is deliberately not called "Detach": to a tmux user, detaching means detaching a client. Rename runs the multiplexer's own command (`tmux rename-session`, `zellij action rename-session`) and updates every Mutiny pane attached to that session, so labels, window titles, and the saved layout all follow. Rename and Copy Name appear only on attached tabs. The menu never kills a session: closing a tab kills only its client.
 
@@ -439,7 +439,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 199 tests, no display required
+cargo test                    # 200 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

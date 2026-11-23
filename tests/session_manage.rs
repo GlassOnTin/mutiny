@@ -364,3 +364,55 @@ fn closing_a_tab_keeps_the_session_but_ending_it_stops_it() {
     );
     ctrl.shutdown_ipc();
 }
+
+/// An orphan a New Tab leaves behind must be VISIBLE and filterable, so it can
+/// be pruned deliberately. Nothing is reaped automatically: a persistent
+/// session the operator detached looks the same to tmux, and killing those
+/// would destroy the workflow.
+#[test]
+fn unattached_sessions_are_visible_and_filterable_but_never_auto_reaped() {
+    let Some(tmux) = find_tmux() else {
+        eprintln!("skipping: tmux not installed (CI installs it)");
+        return;
+    };
+    let env = Env::new("orphans", tmux, "tmux");
+    let ctrl = env.controller();
+    ctrl.create_window(None).expect("window");
+    // New Tab creates an auto-named session.
+    ctrl.execute_action(mutiny::action::ActionId::NewTab, None);
+    pump(&ctrl, 1500);
+    let created: Vec<String> = env.sessions();
+    assert!(
+        created.iter().any(|n| n.starts_with("mutiny-")),
+        "{created:?}"
+    );
+
+    // Closing that tab leaves the session behind, which is the point.
+    let tab = ctrl
+        .workspace
+        .borrow()
+        .windows()
+        .first()
+        .and_then(|w| w.tabs.last().map(|t| t.id))
+        .expect("a tab");
+    let win = ctrl.workspace.borrow().windows()[0].id;
+    ctrl.close_tab(win, tab);
+    pump(&ctrl, 1200);
+    assert!(
+        !env.sessions().is_empty(),
+        "closing the tab must NOT reap the session: {:?}",
+        env.sessions()
+    );
+
+    // It is discoverable, and marked as having no clients.
+    ctrl.begin_discovery(vec![None], true, None);
+    pump(&ctrl, 1500);
+    let inv = ctrl.session_inventory();
+    let orphan = inv
+        .sessions
+        .iter()
+        .find(|s| s.name.starts_with("mutiny-"))
+        .unwrap_or_else(|| panic!("the orphan must be listed: {inv:?}"));
+    assert_eq!(orphan.attached, 0, "no client is attached to it");
+    ctrl.shutdown_ipc();
+}

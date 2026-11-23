@@ -311,6 +311,9 @@ enum CtlVerb {
         /// Force a rescan instead of returning the cached inventory
         #[arg(long)]
         refresh: bool,
+        /// Only sessions with no client attached (for deliberate pruning)
+        #[arg(long)]
+        unattached_only: bool,
     },
     /// Attach a pane to a tmux or zellij session, locally or over SSH
     OpenSession {
@@ -627,7 +630,15 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             window: window.map(WindowId),
         },
         CtlVerb::Quit => IpcRequest::Quit,
-        CtlVerb::Sessions { host, refresh } => IpcRequest::ListSessions { host, refresh },
+        CtlVerb::Sessions {
+            host,
+            refresh,
+            unattached_only,
+        } => IpcRequest::ListSessions {
+            host,
+            refresh,
+            unattached_only,
+        },
         CtlVerb::OpenSession {
             name,
             kind,

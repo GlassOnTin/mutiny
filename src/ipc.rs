@@ -227,6 +227,12 @@ pub enum IpcRequest {
         host: Option<String>,
         #[serde(default)]
         refresh: bool,
+        /// Only sessions with no client attached. These are the ones a New Tab
+        /// leaves behind, but also the persistent ones an operator deliberately
+        /// detached, so this is a VIEW for deliberate pruning, never an
+        /// automatic cleanup.
+        #[serde(default)]
+        unattached_only: bool,
     },
     /// Attaches a pane to a multiplexer session, locally or over SSH. The
     /// multiplexer owns process survival; closing the pane kills only its
@@ -451,8 +457,12 @@ impl IpcRequest {
                     .unwrap_or_else(|| String::from("<cleared>"));
                 format!("pane={pane:?} notice={preview:?}")
             }
-            IpcRequest::ListSessions { host, refresh } => {
-                format!("host={host:?} refresh={refresh}")
+            IpcRequest::ListSessions {
+                host,
+                refresh,
+                unattached_only,
+            } => {
+                format!("host={host:?} refresh={refresh} unattached_only={unattached_only}")
             }
             IpcRequest::ClosePane { pane } => format!("pane={pane:?}"),
             IpcRequest::NewSession {
@@ -1067,6 +1077,7 @@ pub fn verb_samples() -> Vec<IpcRequest> {
         IpcRequest::ListSessions {
             host: None,
             refresh: false,
+            unattached_only: false,
         },
         IpcRequest::OpenSession {
             kind: crate::mux::MuxKind::Tmux,
@@ -1365,10 +1376,12 @@ mod tests {
         let local = IpcRequest::ListSessions {
             host: None,
             refresh: false,
+            unattached_only: false,
         };
         let remote = IpcRequest::ListSessions {
             host: Some(String::from("meteor")),
             refresh: false,
+            unattached_only: false,
         };
         let open = IpcRequest::OpenSession {
             kind: crate::mux::MuxKind::Tmux,
