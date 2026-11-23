@@ -159,55 +159,22 @@ fn sessions_submenu_lists_sessions_inline_and_keeps_the_picker_reachable() {
     assert_eq!(first, "No sessions found");
 }
 
-/// The tab menu must not offer to rename or copy a session that does not exist,
-/// and must never offer to kill one.
-#[test]
-fn tab_menu_offers_session_actions_only_when_attached() {
-    let labels = |attached: bool| -> Vec<String> {
-        let menu = mutiny::action::build_tab_menu_model(attached, 7);
-        (0..menu.n_items())
-            .map(|i| {
-                menu.item_attribute_value(i, "label", None)
-                    .and_then(|v| v.get::<String>())
-                    .unwrap_or_default()
-            })
-            .collect()
-    };
-    let attached = labels(true);
-    assert!(attached.iter().any(|l| l.starts_with("Rename Session")));
-    assert!(attached.iter().any(|l| l == "Copy Session Name"));
-    assert!(attached.iter().any(|l| l == "Close Tab"));
-    assert!(attached.iter().any(|l| l == "Detach to Window"));
-    assert!(attached.iter().any(|l| l.starts_with("New Session")));
-
-    let plain = labels(false);
-    assert!(
-        !plain.iter().any(|l| l.contains("Rename")),
-        "nothing to rename: {plain:?}"
-    );
-    assert!(
-        !plain.iter().any(|l| l.contains("Copy")),
-        "nothing to copy: {plain:?}"
-    );
-    assert!(plain.iter().any(|l| l == "Close Tab"));
-    assert!(plain.iter().any(|l| l.starts_with("New Session")));
-
-    for list in [&attached, &plain] {
-        assert!(
-            !list.iter().any(|l| l.to_ascii_lowercase().contains("kill")),
-            "the menu must never kill a session: {list:?}"
-        );
-    }
-}
-
-/// A parameterised action needs its target ON THE MENU ITEM. Without it GTK
-/// renders the item insensitive and the click does nothing, which is exactly
-/// how this first shipped before a live right-click caught it.
-#[test]
-fn every_tab_menu_item_carries_its_tab_target() {
-    let menu = mutiny::action::build_tab_menu_model(true, 42);
-    let mut saw_targeted = 0;
+/// Flattens a gio menu, following section links. `append_section` nests items,
+/// so a top-level walk sees only the sections.
+fn flatten(menu: &gtk4::gio::MenuModel) -> Vec<(String, String, Option<u64>)> {
+    let mut out = Vec::new();
     for i in 0..menu.n_items() {
+        if let Some(sub) = menu
+            .item_link(i, "section")
+            .or_else(|| menu.item_link(i, "submenu"))
+        {
+            out.extend(flatten(&sub));
+            continue;
+        }
+        let label = menu
+            .item_attribute_value(i, "label", None)
+            .and_then(|v| v.get::<String>())
+            .unwrap_or_default();
         let action = menu
             .item_attribute_value(i, "action", None)
             .and_then(|v| v.get::<String>())
@@ -215,19 +182,72 @@ fn every_tab_menu_item_carries_its_tab_target() {
         let target = menu
             .item_attribute_value(i, "target", None)
             .and_then(|v| v.get::<u64>());
-        if action.ends_with("-tab") || action.ends_with("-tab-target") {
-            assert_eq!(
-                target,
-                Some(42),
-                "item {action} must carry the tab id, or GTK disables it"
-            );
-            saw_targeted += 1;
-        } else {
-            assert_eq!(target, None, "the plain New Session item takes no target");
-        }
+        out.push((label, action, target));
     }
-    assert_eq!(
-        saw_targeted, 4,
-        "rename, close, detach, copy are all targeted"
+    out
+}
+
+/// Closing a VIEW and ending a SESSION are different operations with a
+/// multiplexer, and the wording must make that unambiguous. Session-only items
+/// appear only on attached tabs, and ending sits apart from closing.
+#[test]
+fn tab_menu_separates_closing_a_view_from_ending_a_session() {
+    let labels = |attached: bool| -> Vec<String> {
+        flatten(
+            mutiny::action::build_tab_menu_model(attached, 7).upcast_ref::<gtk4::gio::MenuModel>(),
+        )
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect()
+    };
+    let attached = labels(true);
+    assert!(attached.iter().any(|l| l.starts_with("Rename Session")));
+    assert!(attached.iter().any(|l| l == "Copy Session Name"));
+    assert!(
+        attached
+            .iter()
+            .any(|l| l == "Close Tab (session keeps running)"),
+        "closing must say what survives: {attached:?}"
     );
+    assert!(attached.iter().any(|l| l == "Move to New Window"));
+    assert!(
+        !attached.iter().any(|l| l.starts_with("Detach")),
+        "detach means detaching a client to a tmux user: {attached:?}"
+    );
+    assert!(attached.iter().any(|l| l == "End Session…"));
+
+    // Three sections: identity, views, and the destructive one.
+    let menu = mutiny::action::build_tab_menu_model(true, 7);
+    assert_eq!(menu.n_items(), 3, "ending must sit in its own section");
+
+    let plain = labels(false);
+    assert!(!plain.iter().any(|l| l.contains("Rename")), "{plain:?}");
+    assert!(!plain.iter().any(|l| l.contains("Copy")), "{plain:?}");
+    assert!(
+        !plain.iter().any(|l| l.contains("End Session")),
+        "a plain tab has no session to end: {plain:?}"
+    );
+    assert!(plain.iter().any(|l| l.starts_with("Close Tab")));
+}
+
+/// A parameterised action needs its target ON THE MENU ITEM. Without it GTK
+/// renders the item insensitive and the click does nothing, which is exactly
+/// how this first shipped before a live right-click caught it.
+#[test]
+fn every_tab_menu_item_carries_its_tab_target() {
+    let items = flatten(
+        mutiny::action::build_tab_menu_model(true, 42).upcast_ref::<gtk4::gio::MenuModel>(),
+    );
+    assert_eq!(items.len(), 5, "rename, copy, close, move, end");
+    for (label, action, target) in &items {
+        assert!(
+            action.ends_with("-tab") || action.ends_with("-tab-target"),
+            "unexpected item {label:?} ({action})"
+        );
+        assert_eq!(
+            *target,
+            Some(42),
+            "item {action} must carry the tab id, or GTK disables it"
+        );
+    }
 }

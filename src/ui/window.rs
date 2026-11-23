@@ -516,6 +516,7 @@ impl MutinyWindow {
             crate::action::DETACH_TAB_TARGET,
             crate::action::RENAME_TAB_TARGET,
             crate::action::COPY_NAME_TAB_TARGET,
+            crate::action::END_TAB_TARGET,
         ] {
             let slug = name.trim_start_matches("win.");
             let action = gio::SimpleAction::new(slug, Some(glib::VariantTy::UINT64));
@@ -546,6 +547,7 @@ impl MutinyWindow {
                         }
                     }
                     "rename-session-tab" => this.show_rename_dialog(tab),
+                    "end-session-tab" => this.show_end_session_dialog(tab),
                     "copy-session-name-tab" => {
                         let name = ctrl
                             .workspace
@@ -1224,6 +1226,85 @@ impl MutinyWindow {
                 eprintln!("failed to rename session: {err}");
             }
         });
+    }
+
+    /// Confirm before ENDING a session. Closing a tab only ends this client;
+    /// this stops everything running inside the session, so it names the
+    /// session and says plainly what is lost.
+    pub fn show_end_session_dialog(&self, tab: TabId) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let session = {
+            let ws = ctrl.workspace.borrow();
+            ws.window(self.inner.window_id)
+                .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                .and_then(|t| ws.pane(t.active_pane))
+                .and_then(|e| e.mux_session())
+                .cloned()
+        };
+        let Some(session) = session else {
+            return;
+        };
+        let where_ = session.subtitle();
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("End Session")
+            .default_width(460)
+            .build();
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        vbox.set_margin_top(14);
+        vbox.set_margin_bottom(14);
+        vbox.set_margin_start(14);
+        vbox.set_margin_end(14);
+        let heading = gtk4::Label::new(None);
+        heading.set_markup(&format!(
+            "<b>End {} session \"{}\"?</b>",
+            session.kind.label(),
+            glib::markup_escape_text(&session.name)
+        ));
+        heading.set_xalign(0.0);
+        vbox.append(&heading);
+        let body = gtk4::Label::new(Some(&format!(
+            "On {where_}. Everything running inside this session stops, including \
+             anything in other windows or on other devices.\n\n\
+             Closing the tab instead would leave it running."
+        )));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        vbox.append(&body);
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let cancel = gtk4::Button::with_label("Keep It Running");
+        let end = gtk4::Button::with_label("End Session");
+        end.add_css_class("destructive-action");
+        buttons.append(&cancel);
+        buttons.append(&end);
+        vbox.append(&buttons);
+        dialog.set_child(Some(&vbox));
+        // Default to the safe choice, so Enter cannot destroy anything.
+        dialog.set_default_widget(Some(&cancel));
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| dialog.close());
+        }
+        {
+            let dialog = dialog.clone();
+            let ctrl = Rc::downgrade(&ctrl);
+            end.connect_clicked(move |_| {
+                dialog.close();
+                if let Some(c) = ctrl.upgrade()
+                    && let Err(err) =
+                        c.end_session(session.kind, &session.name, session.host.as_deref())
+                {
+                    eprintln!("failed to end session: {err}");
+                }
+            });
+        }
+        attach_escape_to_close(&dialog);
+        dialog.present();
     }
 
     /// Create a new session, with the multiplexer preselected from config and

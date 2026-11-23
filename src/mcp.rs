@@ -65,6 +65,7 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
         IpcRequest::NewSession { .. } => Some(McpSurface::Tool("new_session")),
         IpcRequest::RenameSession { .. } => Some(McpSurface::Tool("rename_session")),
+        IpcRequest::EndSession { .. } => Some(McpSurface::Tool("end_session")),
         IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
         IpcRequest::CloseTab { .. } => Some(McpSurface::Tool("close_tab")),
         IpcRequest::CloseWindow { .. } => Some(McpSurface::Tool("close_window")),
@@ -596,6 +597,26 @@ impl McpBridge {
                     Duration::from_secs(30),
                 )
             }
+            "end_session" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`name` is required")))?
+                    .to_owned();
+                let kind = match args.get("kind").and_then(Value::as_str).unwrap_or("tmux") {
+                    "tmux" => crate::mux::MuxKind::Tmux,
+                    "zellij" => crate::mux::MuxKind::Zellij,
+                    other => return Err((-32602, format!("unknown kind {other:?}"))),
+                };
+                (
+                    IpcRequest::EndSession {
+                        kind,
+                        name,
+                        host: args.get("host").and_then(Value::as_str).map(str::to_owned),
+                    },
+                    Duration::from_secs(30),
+                )
+            }
             "rename_session" => {
                 let name = args
                     .get("name")
@@ -944,6 +965,19 @@ pub fn tool_definitions() -> Value {
                     "name": { "type": "string" },
                     "mode": { "type": "string", "enum": ["window", "tab", "split-right", "split-down"] },
                     "window": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "end_session",
+            "description": "Tier-2 Act, DESTRUCTIVE: end a multiplexer session (tmux kill-session, zellij kill-session). Everything running inside it stops, on every device attached to it. This is NOT the same as close_tab or close_pane, which only end this client and leave the session running. The GUI gates this behind a confirmation; an agent calling it directly does not get one.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["tmux", "zellij"] },
+                    "host": { "type": "string" }
                 }
             }
         },

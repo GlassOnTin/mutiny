@@ -522,6 +522,51 @@ pub fn remote_create_argv(
     Ok((opts.ssh_program.clone(), argv))
 }
 
+/// Inner argv for ENDING a session. Destructive: everything running inside it
+/// stops. Kept separate from the close-view path, which only ends a client.
+pub fn inner_end_argv(kind: MuxKind, name: &str, opts: &MuxOptions) -> Vec<String> {
+    match kind {
+        MuxKind::Tmux => {
+            let mut argv = tmux_socket_args(opts);
+            argv.push(String::from("kill-session"));
+            argv.push(String::from("-t"));
+            argv.push(tmux_escape_name(name));
+            argv
+        }
+        MuxKind::Zellij => vec![String::from("kill-session"), name.to_owned()],
+    }
+}
+
+/// End runs as a one-shot command, so no tty and never a prompt.
+pub fn end_command(
+    kind: MuxKind,
+    name: &str,
+    host: Option<&str>,
+    opts: &MuxOptions,
+) -> Result<(String, Vec<String>), String> {
+    if name.trim().is_empty() {
+        return Err(String::from("the session name must not be empty"));
+    }
+    let inner = inner_end_argv(kind, name, opts);
+    match host {
+        None => Ok((local_program(kind, opts), inner)),
+        Some(host) => {
+            validate_host(host)?;
+            let argv = vec![
+                String::from("-n"),
+                String::from("-o"),
+                String::from("BatchMode=yes"),
+                String::from("-o"),
+                format!("ConnectTimeout={}", opts.connect_timeout_s),
+                String::from("--"),
+                host.to_owned(),
+                remote_command(&local_program(kind, opts), &inner, None),
+            ];
+            Ok((opts.ssh_program.clone(), argv))
+        }
+    }
+}
+
 /// Smallest free `mutiny-N` given the names already in use. Matches the naming
 /// convention already in the wild (`mutiny-27`, `radio-translator-34`).
 pub fn free_session_name(taken: &[String]) -> String {
@@ -949,6 +994,24 @@ mod tests {
             rename_command(MuxKind::Tmux, "o", "n", Some("-oProxyCommand=x"), &opts()).is_err()
         );
         assert!(remote_create_argv("-v", MuxKind::Tmux, "n", &opts()).is_err());
+    }
+
+    #[test]
+    fn end_uses_each_multiplexers_kill_command() {
+        let (prog, argv) = end_command(MuxKind::Tmux, "work", None, &opts()).unwrap();
+        assert_eq!(prog, "tmux");
+        assert_eq!(argv, vec!["kill-session", "-t", "work"]);
+        let (prog, argv) = end_command(MuxKind::Zellij, "work", None, &opts()).unwrap();
+        assert_eq!(prog, "zellij");
+        assert_eq!(argv, vec!["kill-session", "work"]);
+        let (_p, argv) = end_command(MuxKind::Tmux, "work;", None, &opts()).unwrap();
+        assert_eq!(argv, vec!["kill-session", "-t", r"work\;"]);
+        assert!(end_command(MuxKind::Tmux, "  ", None, &opts()).is_err());
+        let (prog, argv) = end_command(MuxKind::Tmux, "a;echo x", Some("meteor"), &opts()).unwrap();
+        assert_eq!(prog, "ssh");
+        assert!(argv.contains(&String::from("BatchMode=yes")));
+        assert!(argv.last().unwrap().contains("'a;echo x'"));
+        assert!(end_command(MuxKind::Tmux, "w", Some("-v"), &opts()).is_err());
     }
 
     #[test]

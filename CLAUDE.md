@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 189 tests: 102 unit + 7 config + 11 e2e + 7 http + 14 mux + 5 menuia + 4 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 settings + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 191 tests: 103 unit + 7 config + 11 e2e + 7 http + 15 mux + 5 menuia + 5 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 settings + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -292,6 +292,16 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### Closing a view versus ending a session
+
+With a multiplexer these are different operations and the vocabulary must not blur them. `close_pane` / `close_tab` / `close_window` end a CLIENT; the session keeps running. `end_session` runs the multiplexer's kill command and stops everything inside it, on every device. Menu labels say which ("Close Tab (session keeps running)"), and End Session sits in its own menu section behind a confirmation whose default button is the safe one.
+
+Do not auto-end sessions when a tab closes. Persistent sessions that outlive their viewers are the reason to use a multiplexer at all; most of a real user's unattached sessions are deliberate, not abandoned.
+
+Avoid "detach" for moving a pane to another window: to a tmux user detaching means detaching a client. The action is titled "Move Pane to New Window" and the tab item "Move to New Window". The `detach-split` SLUG is unchanged, because slugs are contract.
+
+`build_tab_menu_model` uses `append_section`, so items are nested. A test walking the menu must follow `item_link(i, "section")` or it sees only sections and concludes the menu is empty.
 
 ### Session management: create, rename, and the tab menu
 

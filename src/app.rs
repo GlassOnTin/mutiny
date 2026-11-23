@@ -93,6 +93,9 @@ struct PendingMuxCommand {
 /// Applied only after the command exits successfully, so a failed rename does
 /// not leave mutiny claiming a name the multiplexer never accepted.
 enum MuxEffect {
+    /// Nothing to rewrite: the panes' clients exit when the session dies, and
+    /// the usual exited-pane path closes them. Only the inventory needs a refresh.
+    End,
     Rename {
         kind: MuxKind,
         host: Option<String>,
@@ -826,6 +829,47 @@ impl AppController {
         Ok(())
     }
 
+    /// Ends a multiplexer session. DESTRUCTIVE: everything running inside it
+    /// stops, unlike closing a tab, which only ends this client. The UI gates
+    /// this behind an explicit confirmation naming the session.
+    pub fn end_session(&self, kind: MuxKind, name: &str, host: Option<&str>) -> io::Result<()> {
+        let opts = self.config.borrow().sessions.clone();
+        let (program, argv) = mux::end_command(kind, name, host, &opts)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.launch_mux_command(&program, &argv, MuxEffect::End)
+    }
+
+    fn launch_mux_command(
+        &self,
+        program: &str,
+        argv: &[String],
+        effect: MuxEffect,
+    ) -> io::Result<()> {
+        let child = Command::new(program)
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| io::Error::new(e.kind(), format!("could not run {program}: {e}")))?;
+        if let Some(out) = child.stdout.as_ref() {
+            set_nonblocking(out.as_raw_fd());
+        }
+        if let Some(err) = child.stderr.as_ref() {
+            set_nonblocking(err.as_raw_fd());
+        }
+        let timeout = Duration::from_millis(self.config.borrow().discovery_timeout_ms);
+        self.mux_commands.borrow_mut().push(PendingMuxCommand {
+            child,
+            out: Vec::new(),
+            err: Vec::new(),
+            deadline: Instant::now() + timeout,
+            killed: false,
+            effect,
+        });
+        Ok(())
+    }
+
     /// Polls one-shot commands. Same nonblocking drain and kill-then-reap rules
     /// as discovery: `Child::drop` does neither.
     fn advance_mux_commands(self: &Rc<Self>) {
@@ -898,6 +942,13 @@ impl AppController {
         let mut changed = false;
         for (effect, ok, detail) in done {
             match effect {
+                MuxEffect::End => {
+                    if ok {
+                        changed = true;
+                    } else {
+                        eprintln!("warning: ending the session failed: {detail}");
+                    }
+                }
                 MuxEffect::Rename {
                     kind,
                     host,
@@ -2239,6 +2290,12 @@ impl AppController {
                 Ok((w, t, p)) => Some(ids_ok(Some(w), Some(t), Some(p))),
                 Err(err) => Some(IpcResponse::err(err.to_string())),
             },
+            IpcRequest::EndSession { kind, name, host } => {
+                match self.end_session(kind, &name, host.as_deref()) {
+                    Ok(()) => Some(IpcResponse::empty_ok()),
+                    Err(err) => Some(IpcResponse::err(err.to_string())),
+                }
+            }
             IpcRequest::RenameSession {
                 kind,
                 name,

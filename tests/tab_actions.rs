@@ -172,6 +172,39 @@ esac
     }
     settle(&ctrl, 8);
 
+    // End Session must open a CONFIRMATION, not act immediately, and the
+    // default button must be the safe one so Enter cannot destroy anything.
+    let before = gtk4::Window::toplevels().n_items();
+    gtk4::prelude::WidgetExt::activate_action(
+        &gtk_win,
+        "win.end-session-tab",
+        Some(&gtk4::glib::Variant::from(t_attached.0)),
+    )
+    .expect("the end action must exist");
+    settle(&ctrl, 12);
+    assert!(
+        gtk4::Window::toplevels().n_items() > before,
+        "End Session must ask first"
+    );
+    let confirm = (0..gtk4::Window::toplevels().n_items())
+        .filter_map(|i| {
+            gtk4::Window::toplevels()
+                .item(i)
+                .and_downcast::<gtk4::Window>()
+        })
+        .find(|w| w.title().as_deref() == Some("End Session"))
+        .expect("a dialog titled End Session");
+    assert_eq!(
+        confirm
+            .default_widget()
+            .and_then(|w| w.downcast::<gtk4::Button>().ok())
+            .and_then(|b| b.label()),
+        Some("Keep It Running".into()),
+        "the safe choice must be the default"
+    );
+    confirm.close();
+    settle(&ctrl, 8);
+
     // Close Tab really closes it.
     gtk4::prelude::WidgetExt::activate_action(
         &gtk_win,

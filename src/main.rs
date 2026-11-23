@@ -247,6 +247,14 @@ enum CtlVerb {
         #[arg(long)]
         window: Option<u64>,
     },
+    /// END a multiplexer session: everything running inside it stops
+    EndSession {
+        name: String,
+        #[arg(long, default_value = "tmux")]
+        kind: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Rename a multiplexer session and update the panes attached to it
     RenameSession {
         name: String,
@@ -541,6 +549,17 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
                 mode,
                 window: window.map(WindowId),
             }
+        }
+        CtlVerb::EndSession { name, kind, host } => {
+            let kind = match kind.as_str() {
+                "tmux" => mutiny::mux::MuxKind::Tmux,
+                "zellij" => mutiny::mux::MuxKind::Zellij,
+                other => {
+                    eprintln!("unknown kind {other:?}: expected tmux or zellij");
+                    return ExitCode::from(2);
+                }
+            };
+            IpcRequest::EndSession { kind, name, host }
         }
         CtlVerb::RenameSession {
             name,

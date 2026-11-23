@@ -161,6 +161,14 @@ pub enum IpcRequest {
         mode: crate::mux::SessionMode,
         window: Option<WindowId>,
     },
+    /// ENDS a multiplexer session. Destructive: everything running inside it
+    /// stops, on every device. Distinct from closing a tab, which only ends
+    /// this client and leaves the session running.
+    EndSession {
+        kind: crate::mux::MuxKind,
+        name: String,
+        host: Option<String>,
+    },
     /// Renames a multiplexer session using its own command, then updates every
     /// pane attached to it.
     RenameSession {
@@ -284,6 +292,7 @@ impl IpcRequest {
             IpcRequest::SaveSession => ConsentTier::Act,
             IpcRequest::NewSession { .. } => ConsentTier::Act,
             IpcRequest::RenameSession { .. } => ConsentTier::Act,
+            IpcRequest::EndSession { .. } => ConsentTier::Act,
             IpcRequest::ClosePane { .. } => ConsentTier::Act,
             IpcRequest::CloseTab { .. } => ConsentTier::Act,
             IpcRequest::CloseWindow { .. } => ConsentTier::Act,
@@ -311,6 +320,7 @@ impl IpcRequest {
             IpcRequest::SaveSession => "save-session",
             IpcRequest::NewSession { .. } => "new-session",
             IpcRequest::RenameSession { .. } => "rename-session",
+            IpcRequest::EndSession { .. } => "end-session",
             IpcRequest::ClosePane { .. } => "close-pane",
             IpcRequest::CloseTab { .. } => "close-tab",
             IpcRequest::CloseWindow { .. } => "close-window",
@@ -385,6 +395,10 @@ impl IpcRequest {
             ),
             IpcRequest::CloseTab { window, tab } => format!("window={window:?} tab={tab:?}"),
             IpcRequest::CloseWindow { window } => format!("window={window:?}"),
+            IpcRequest::EndSession { kind, name, host } => format!(
+                "kind={kind:?} host={host:?} name={:?}",
+                crate::mux::sanitize_text(name, 64)
+            ),
             IpcRequest::OpenSession {
                 kind,
                 name,
@@ -987,6 +1001,11 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             new_name: String::from("mutiny-probe-renamed"),
             host: None,
         },
+        IpcRequest::EndSession {
+            kind: crate::mux::MuxKind::Tmux,
+            name: String::from("mutiny-probe-absent"),
+            host: None,
+        },
         IpcRequest::ClosePane { pane: None },
         IpcRequest::CloseTab {
             window: None,
@@ -1030,6 +1049,7 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::SaveSession => 24,
         IpcRequest::NewSession { .. } => 29,
         IpcRequest::RenameSession { .. } => 30,
+        IpcRequest::EndSession { .. } => 31,
         IpcRequest::ClosePane { .. } => 25,
         IpcRequest::CloseTab { .. } => 27,
         IpcRequest::CloseWindow { .. } => 28,

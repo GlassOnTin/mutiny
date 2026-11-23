@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 189 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 191 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -222,7 +222,7 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 
 | Menu | Covers | Actions |
 | --- | --- | --- |
-| **Session** | the lifecycle of a session context | New Window, New Tab, New Session, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
+| **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
 | **Edit** | the focused pane's content, and settings | Copy, Paste, Search, Previous/Next Command, Settings |
 | **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
 | **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Keybind Cheatsheet |
@@ -233,7 +233,16 @@ The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View"
 
 **New Session** (Session menu, tab menu, or palette) asks for a name and lets you pick tmux, zellij, or none per session, overriding the config default. Creating fails if the name is taken rather than attaching to it; use Open Session for that.
 
-**Right-click a tab** for Rename Session, Close Tab, Detach to Window, Copy Session Name, and New Session. Rename runs the multiplexer's own command (`tmux rename-session`, `zellij action rename-session`) and updates every Mutiny pane attached to that session, so labels, window titles, and the saved layout all follow. Rename and Copy Name appear only on attached tabs. The menu never kills a session: closing a tab kills only its client.
+**Closing a view is not ending a session.** With a multiplexer these are different operations, and the wording says so rather than leaving you to guess:
+
+| Action | What ends | What survives |
+| --- | --- | --- |
+| Close Tab / Close Pane / Close Window | this terminal client | the session and everything running in it |
+| End Session | the session itself | nothing inside it, on any device |
+
+End Session sits in its own menu section, behind a confirmation that names the session and defaults to **Keep It Running**, so Enter cannot destroy anything. Sessions outliving tabs is the point of using a multiplexer, so nothing is cleaned up automatically.
+
+**Right-click a tab** for Rename Session, Copy Session Name, Close Tab (session keeps running), Move to New Window, and End Session. "Move to New Window" is deliberately not called "Detach": to a tmux user, detaching means detaching a client. Rename runs the multiplexer's own command (`tmux rename-session`, `zellij action rename-session`) and updates every Mutiny pane attached to that session, so labels, window titles, and the saved layout all follow. Rename and Copy Name appear only on attached tabs. The menu never kills a session: closing a tab kills only its client.
 
 **Open Session** is a submenu listing discovered sessions inline, not a pop-up. It is filled at startup and re-listed every `refresh_interval_s` seconds, so it is populated before you open it and reflects sessions that came and went. A refresh keeps the sessions it already knows until each host's new result replaces them, so the list never flashes empty. `Ctrl+Shift+S` still opens the full picker, which is also the last item in that submenu.
 
@@ -412,7 +421,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 189 tests, no display required
+cargo test                    # 191 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

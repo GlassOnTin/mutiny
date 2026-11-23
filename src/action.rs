@@ -141,7 +141,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::NewTab,
         slug: "new-tab",
-        title: "New Tab",
+        title: "New Session Tab",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>t"),
@@ -152,7 +152,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::ClosePane,
         slug: "close-pane",
-        title: "Close Active Pane",
+        title: "Close Pane (session keeps running)",
         category: MenuCategory::Pane,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>w"),
@@ -207,7 +207,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::DetachSplit,
         slug: "detach-split",
-        title: "Detach Split to Window",
+        title: "Move Pane to New Window",
         category: MenuCategory::Pane,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>d"),
@@ -328,7 +328,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::CloseTab,
         slug: "close-tab",
-        title: "Close Tab",
+        title: "Close Tab (session keeps running)",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: None,
@@ -339,7 +339,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::CloseWindow,
         slug: "close-window",
-        title: "Close Window",
+        title: "Close Window (sessions keep running)",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: None,
@@ -361,7 +361,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::SessionPicker,
         slug: "session-picker",
-        title: "Open Multiplexer Session",
+        title: "Open Session…",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>s"),
@@ -482,6 +482,7 @@ pub const CLOSE_TAB_TARGET: &str = "win.close-tab-target";
 pub const DETACH_TAB_TARGET: &str = "win.detach-tab-target";
 pub const RENAME_TAB_TARGET: &str = "win.rename-session-tab";
 pub const COPY_NAME_TAB_TARGET: &str = "win.copy-session-name-tab";
+pub const END_TAB_TARGET: &str = "win.end-session-tab";
 
 /// The right-click menu for one tab. Rename and Copy Name only appear when the
 /// tab is attached to a multiplexer session, because there is nothing to rename
@@ -491,20 +492,40 @@ pub fn build_tab_menu_model(attached: bool, tab: u64) -> gio::Menu {
     let menu = gio::Menu::new();
     // A parameterised action needs its target ON THE ITEM, not just the action
     // name: without it GTK renders the item insensitive and it cannot fire.
-    let targeted = |label: &str, action: &str| {
+    let targeted = |section: &gio::Menu, label: &str, action: &str| {
         let item = gio::MenuItem::new(Some(label), None);
         item.set_action_and_target_value(Some(action), Some(&glib::Variant::from(tab)));
-        menu.append_item(&item);
+        section.append_item(&item);
     };
+
+    // Session identity first.
     if attached {
-        targeted("Rename Session…", RENAME_TAB_TARGET);
+        let identity = gio::Menu::new();
+        targeted(&identity, "Rename Session…", RENAME_TAB_TARGET);
+        targeted(&identity, "Copy Session Name", COPY_NAME_TAB_TARGET);
+        menu.append_section(None, &identity);
     }
-    targeted("Close Tab", CLOSE_TAB_TARGET);
-    targeted("Detach to Window", DETACH_TAB_TARGET);
+
+    // Closing a VIEW. The wording says what survives, because with a
+    // multiplexer "close" and "end" are different operations and a tmux user
+    // must not have to guess which one this is.
+    let views = gio::Menu::new();
+    targeted(
+        &views,
+        "Close Tab (session keeps running)",
+        CLOSE_TAB_TARGET,
+    );
+    // Not "Detach": to a tmux user that means detaching a CLIENT, while this
+    // moves a pane to another window.
+    targeted(&views, "Move to New Window", DETACH_TAB_TARGET);
+    menu.append_section(None, &views);
+
+    // Ending the SESSION is destructive and sits apart, behind a confirmation.
     if attached {
-        targeted("Copy Session Name", COPY_NAME_TAB_TARGET);
+        let danger = gio::Menu::new();
+        targeted(&danger, "End Session…", END_TAB_TARGET);
+        menu.append_section(None, &danger);
     }
-    menu.append(Some("New Session…"), Some("win.new-session"));
     menu
 }
 

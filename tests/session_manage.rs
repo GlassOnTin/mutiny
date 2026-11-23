@@ -293,3 +293,74 @@ fn new_tab_follows_the_preferred_multiplexer_and_spawn_tab_stays_plain() {
     );
     ctrl.shutdown_ipc();
 }
+
+/// The distinction Ian asked to reconcile: closing a tab ends only this client
+/// and the session keeps running; ending a session stops it. Both must be true,
+/// or the menu wording is a lie.
+#[test]
+fn closing_a_tab_keeps_the_session_but_ending_it_stops_it() {
+    let Some(tmux) = find_tmux() else {
+        eprintln!("skipping: tmux not installed (CI installs it)");
+        return;
+    };
+    let env = Env::new("close-vs-end", tmux, "none");
+    assert!(
+        env.tmux(&["new-session", "-d", "-s", "persist"])
+            .status
+            .success()
+    );
+    assert!(
+        env.tmux(&["new-session", "-d", "-s", "doomed"])
+            .status
+            .success()
+    );
+    let ctrl = env.controller();
+    let (w, _t, _p) = ctrl.create_window(None).expect("window");
+    let (_w, tab_keep, _pk) = ctrl
+        .open_session(
+            MuxKind::Tmux,
+            "persist",
+            None,
+            SessionMode::Tab,
+            Some(w),
+            None,
+        )
+        .expect("open persist");
+    let (_w2, _t2, _pd) = ctrl
+        .open_session(
+            MuxKind::Tmux,
+            "doomed",
+            None,
+            SessionMode::Tab,
+            Some(w),
+            None,
+        )
+        .expect("open doomed");
+    pump(&ctrl, 1500);
+    assert!(env.sessions().contains(&"persist".to_string()));
+    assert!(env.sessions().contains(&"doomed".to_string()));
+
+    // Closing the tab must NOT end the session.
+    assert!(ctrl.close_tab(w, tab_keep), "close_tab must report success");
+    pump(&ctrl, 1200);
+    assert!(
+        env.sessions().contains(&"persist".to_string()),
+        "closing a tab must leave the session running: {:?}",
+        env.sessions()
+    );
+
+    // Ending the session must actually stop it.
+    ctrl.end_session(MuxKind::Tmux, "doomed", None)
+        .expect("end");
+    pump(&ctrl, 1500);
+    assert!(
+        !env.sessions().contains(&"doomed".to_string()),
+        "ending a session must stop it: {:?}",
+        env.sessions()
+    );
+    assert!(
+        env.sessions().contains(&"persist".to_string()),
+        "ending one session must not touch another"
+    );
+    ctrl.shutdown_ipc();
+}
