@@ -28,7 +28,7 @@ Working today:
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
-- Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 69x cheaper than a full repaint, measured under Xvfb.
+- Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 19x cheaper than a full repaint, measured under Xvfb.
 - Text is placed one glyph cluster per cell, so the drawn cursor sits exactly on the emulator's grid cursor instead of drifting past the end of the line.
 - Session restore: layout, split ratios, working directories, and scrollback survive a restart. See [Session restore](#session-restore).
 - A session picker (`Ctrl+Shift+S`) lists tmux and zellij sessions, local and over SSH, and opens one in a new tab or window. See [Multiplexer sessions](#multiplexer-sessions).

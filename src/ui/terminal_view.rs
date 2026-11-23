@@ -52,6 +52,12 @@ mod imp {
         /// the damaged region" means rebuilding only damaged row nodes and
         /// re-appending cached ones, not partial framebuffer updates.
         pub row_cache: RefCell<Vec<Option<gtk4::gsk::RenderNode>>>,
+        /// Pango layouts keyed by (cluster, bold, italic). Building a layout per
+        /// cell is what made per-cell placement cost 2.7x a run-based repaint;
+        /// reusing them for repeated glyphs recovers most of it. Colour is
+        /// applied at append time and underline is drawn separately, so neither
+        /// belongs in the key. Cleared whenever the font or config changes.
+        pub layout_cache: RefCell<std::collections::HashMap<(String, bool, bool), pango::Layout>>,
         pub(crate) cache_key: RefCell<Option<RenderCacheKey>>,
         /// Rows rebuilt by the most recent snapshot. Test instrumentation.
         pub rows_rebuilt: Cell<usize>,
@@ -633,6 +639,10 @@ impl TerminalView {
         };
         let full_invalidate = self.imp().cache_key.borrow().as_ref() != Some(&key);
         *self.imp().cache_key.borrow_mut() = Some(key);
+        if full_invalidate {
+            // Cached layouts carry the old font description.
+            self.imp().layout_cache.borrow_mut().clear();
+        }
 
         let mut dirty = vec![full_invalidate; rows];
         if !full_invalidate {
@@ -730,8 +740,6 @@ impl TerminalView {
                     // 0.17 px per column. Per-cell placement is exact for any
                     // font, including fallbacks whose advance differs.
                     let mut col = 0usize;
-                    let mut current: Option<RunStyle> = None;
-                    let mut current_underline = false;
                     let mut cluster = String::new();
                     let recording = self.imp().record_glyphs.get();
                     while col < cols {
@@ -748,18 +756,6 @@ impl TerminalView {
 
                         let style = RunStyle::from_cell(cell, &cfg);
                         let fg_rgba = rgb_to_gdk(style.fg, 1.0);
-                        if current.as_ref() != Some(&style) || underline != current_underline {
-                            let mut desc = base_font.clone();
-                            if style.bold {
-                                desc.set_weight(pango::Weight::Bold);
-                            }
-                            if style.italic {
-                                desc.set_style(pango::Style::Italic);
-                            }
-                            layout.set_font_description(Some(&desc));
-                            current = Some(style);
-                            current_underline = underline;
-                        }
 
                         // Combining marks belong to this cell's cluster, so they
                         // render on the base glyph instead of being dropped.
@@ -770,17 +766,46 @@ impl TerminalView {
                                 cluster.push(*mark);
                             }
                         }
-                        layout.set_text(&cluster);
+
+                        // Reuse a layout for a repeated (cluster, style). This is
+                        // the mitigation for per-cell placement's cost: setting
+                        // text and font on a fresh layout per cell dominated the
+                        // repaint, and terminal content repeats glyphs heavily.
+                        let key = (cluster.clone(), style.bold, style.italic);
+                        let cached = self.imp().layout_cache.borrow().get(&key).cloned();
+                        let glyph = match cached {
+                            Some(l) => l,
+                            None => {
+                                let l = pango::Layout::new(&pango_ctx);
+                                let mut desc = base_font.clone();
+                                if style.bold {
+                                    desc.set_weight(pango::Weight::Bold);
+                                }
+                                if style.italic {
+                                    desc.set_style(pango::Style::Italic);
+                                }
+                                l.set_font_description(Some(&desc));
+                                l.set_text(&cluster);
+                                let mut cache = self.imp().layout_cache.borrow_mut();
+                                // Bounded: a pathological screen of unique
+                                // clusters must not grow this without limit.
+                                if cache.len() >= 1024 {
+                                    cache.clear();
+                                }
+                                cache.insert(key, l.clone());
+                                l
+                            }
+                        };
 
                         let x = padding + (col as f32) * cw;
                         sub.save();
                         sub.translate(&graphene::Point::new(x, y));
-                        sub.append_layout(&layout, &fg_rgba);
+                        sub.append_layout(&glyph, &fg_rgba);
                         sub.restore();
 
                         if underline {
                             sub.append_color(
-                                &rgb_to_gdk(current.as_ref().unwrap().fg, 0.85),
+                                &rgb_to_gdk(style.fg, 0.85),
                                 &graphene::Rect::new(x, y + ch - 1.5, cw, 1.0),
                             );
                         }

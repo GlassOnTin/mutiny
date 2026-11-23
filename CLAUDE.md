@@ -389,7 +389,7 @@ The cursor is drawn at `grid.cursor.point * cell_size`, which was always correct
 
 The text pass therefore draws one glyph cluster per cell at `padding + col * cw`, including the cell's `zerowidth()` combining marks (which the run path dropped). This is exact for any font, including fallbacks whose advance differs. Do not "optimise" it back into runs without also forcing the advance per cluster.
 
-Cost, measured: full repaint 646.9 -> 1741.6 us, idle frame 4.9 -> 25.3 us. See benches/BASELINE.md. A per-glyph layout cache keyed on (cluster, style) is the mitigation if it ever matters.
+Cost and its paydown, measured: per-cell placement first cost 646.9 -> 1741.6 us on a full repaint. A layout cache keyed on (cluster, bold, italic) brought it to 451.7 us, faster than the original run-based path while keeping exactness. Clear that cache whenever the font or config changes, since cached layouts carry the old font description. See benches/BASELINE.md.
 
 `record_glyph_positions(true)` makes the next frame log (row, col, x) for every glyph, which is how `tests/cursor_grid.rs` proves the grid invariant. It is off in normal use.
 
