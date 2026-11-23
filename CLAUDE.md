@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 191 tests: 103 unit + 7 config + 11 e2e + 7 http + 15 mux + 5 menuia + 5 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 settings + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 199 tests: 108 unit + 7 config + 11 e2e + 7 http + 15 mux + 5 menuia + 5 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 settings + 3 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -292,6 +292,16 @@ Two holders, one code path: the pane's own slot (`begin_search` / `advance_searc
 Grid line indices are relative to the current screen, so output arriving mid-scan invalidates the cursor and every collected match. `advance_external_search` compares `output_seq` and restarts the scan when it moved, which means a flooding pane shows "scanning" rather than stale results.
 
 `search_scrollback` still exists with its original signature and runs to completion; it is for callers that are not tick-bound, and the bench measures it. Do not call it from `poll_once` or a widget.
+
+### Tier 3 standing policies
+
+`src/policy.rs` is pure: `policy_match` and `policy_decision` take the clock and the call history as arguments, so scope, pins, ceiling, and expiry are all testable without sleeping. The controller consults `policy_decision` BEFORE `consent_outcome`, and only for ask + Act, so a policy substitutes for a prompt and can never escalate a carrier.
+
+`propose_policy` is Observe because asking is not acting; it queues an inert proposal. `install_policy` is Act and operator-side, which is what stops an agent installing its own proposal: on an ask carrier the install call itself needs consent. Policies bind to `PeerIdentity`, taken from `dispatch_peer` so an HTTP peer's token-derived identity is used rather than this process's pid.
+
+`IpcRequest::pin_fields` supplies the exact-match values a policy can pin. Verbs without meaningful scalars return an empty map, so a pin on a key the call does not carry does NOT match vacuously.
+
+Rate limiting is a rolling 60 s window per policy, pruned and bounded in `prune_uses`. Beyond the ceiling `policy_decision` returns None, so the caller falls through to prompting rather than allowing.
 
 ### Closing a view versus ending a session
 

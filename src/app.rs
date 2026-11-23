@@ -170,6 +170,15 @@ pub struct AppController {
     /// Last agent-active state pushed to the window icons, so the icon is only
     /// touched on a transition.
     agent_icon_active: Cell<bool>,
+    /// Installed Tier-3 standing policies, and their rolling call history.
+    policies: RefCell<Vec<crate::policy::StandingPolicy>>,
+    policy_uses: RefCell<std::collections::BTreeMap<u64, VecDeque<u64>>>,
+    next_policy_id: Cell<u64>,
+    pending_policies: RefCell<Vec<crate::policy::StandingPolicy>>,
+    /// Identity of the call currently being dispatched. Set by the consent path
+    /// so a handler can bind a proposal to the verified peer, including the
+    /// token-derived identity of an HTTP peer rather than this process's pid.
+    dispatch_peer: Cell<PeerIdentity>,
     last_discovery_started: Cell<Option<Instant>>,
     /// In-flight one-shot multiplexer commands (rename). Same tick-polled shape
     /// as discovery: a rename may go over ssh, so it must not block the loop.
@@ -256,6 +265,11 @@ impl AppController {
             sessions_menus: RefCell::new(Vec::new()),
             sessions_menu_gen: Cell::new(u64::MAX),
             agent_icon_active: Cell::new(false),
+            policies: RefCell::new(Vec::new()),
+            policy_uses: RefCell::new(std::collections::BTreeMap::new()),
+            next_policy_id: Cell::new(1),
+            pending_policies: RefCell::new(Vec::new()),
+            dispatch_peer: Cell::new(PeerIdentity::default()),
             last_discovery_started: Cell::new(None),
             mux_commands: RefCell::new(Vec::new()),
             agent_socket_path: RefCell::new(None),
@@ -1100,6 +1114,77 @@ impl AppController {
             let targets = self.discovery_targets_all();
             self.begin_discovery(targets, true, None);
         }
+    }
+
+    /// Queues a policy proposal. Grants nothing: the operator installs it from
+    /// the Agent activity dialog. Bound to the proposing peer, so a policy can
+    /// never be installed for a different one.
+    pub fn propose_policy(
+        &self,
+        peer: PeerIdentity,
+        description: String,
+        verbs: Vec<String>,
+        arg_constraints: std::collections::BTreeMap<String, String>,
+        max_calls_per_minute: u32,
+        expires_in_minutes: u64,
+    ) -> Result<u64, String> {
+        if self.policies.borrow().len() >= crate::policy::MAX_POLICIES {
+            return Err(format!(
+                "at most {} policies; revoke one first",
+                crate::policy::MAX_POLICIES
+            ));
+        }
+        let id = self.next_policy_id.get();
+        let lifetime = expires_in_minutes.clamp(1, crate::policy::MAX_LIFETIME_MINUTES);
+        let proposal = crate::policy::StandingPolicy {
+            id,
+            peer,
+            description,
+            verbs,
+            arg_constraints,
+            max_calls_per_minute,
+            expires_at_ms: now_ms() + lifetime * 60_000,
+        }
+        .sanitised()?;
+        self.next_policy_id.set(id + 1);
+        self.pending_policies.borrow_mut().push(proposal);
+        self.refresh_all_window_chromes();
+        Ok(id)
+    }
+
+    /// Operator-side install. Moves a proposal into force.
+    pub fn install_policy(&self, id: u64) -> Result<(), String> {
+        let mut pending = self.pending_policies.borrow_mut();
+        let Some(at) = pending.iter().position(|p| p.id == id) else {
+            return Err(format!("no pending policy {id}"));
+        };
+        let policy = pending.remove(at);
+        drop(pending);
+        self.policies.borrow_mut().push(policy);
+        self.refresh_all_window_chromes();
+        Ok(())
+    }
+
+    pub fn revoke_policy(&self, id: u64) -> bool {
+        let mut installed = self.policies.borrow_mut();
+        let before = installed.len();
+        installed.retain(|p| p.id != id);
+        let removed = installed.len() != before;
+        drop(installed);
+        self.pending_policies.borrow_mut().retain(|p| p.id != id);
+        self.policy_uses.borrow_mut().remove(&id);
+        if removed {
+            self.refresh_all_window_chromes();
+        }
+        removed
+    }
+
+    pub fn installed_policies(&self) -> Vec<crate::policy::StandingPolicy> {
+        self.policies.borrow().clone()
+    }
+
+    pub fn pending_policies(&self) -> Vec<crate::policy::StandingPolicy> {
+        self.pending_policies.borrow().clone()
     }
 
     /// True while an external agent is driving the terminal. Derived from the
@@ -2137,6 +2222,65 @@ impl AppController {
         }
 
         let gui_present = !self.ui_windows.borrow().is_empty();
+        // Tier 3 first: an installed policy substitutes for the prompt an ask
+        // carrier would raise. It never escalates a carrier, so it is consulted
+        // only for ask + Act and returns None otherwise.
+        self.dispatch_peer.set(peer);
+        let tier = env_req.request.consent_tier();
+        let verb = env_req.request.verb_name();
+        let pins = env_req.request.pin_fields();
+        let now = now_ms();
+        let policy_hit = {
+            let policies = self.policies.borrow();
+            let mut uses = self.policy_uses.borrow_mut();
+            for history in uses.values_mut() {
+                crate::policy::prune_uses(history, now);
+            }
+            crate::policy::policy_decision(
+                crate::policy::PolicyCall {
+                    tier,
+                    carrier,
+                    identity: peer,
+                    verb,
+                    pins: &pins,
+                    now_ms: now,
+                },
+                &policies,
+                &uses,
+            )
+        };
+        if let Some(ConsentOutcome::Allow(decision)) = policy_hit {
+            // Record the use against the covering policy so the ceiling holds.
+            let covering = self
+                .policies
+                .borrow()
+                .iter()
+                .find(|p| {
+                    p.peer == peer
+                        && crate::policy::policy_match(
+                            p,
+                            verb,
+                            &pins,
+                            now,
+                            &self
+                                .policy_uses
+                                .borrow()
+                                .get(&p.id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ) == crate::policy::PolicyMatch::Covered
+                })
+                .map(|p| p.id);
+            if let Some(id) = covering {
+                self.policy_uses
+                    .borrow_mut()
+                    .entry(id)
+                    .or_default()
+                    .push_back(now);
+            }
+            self.record_audit(&client_label, &env_req.request, decision, carrier, peer);
+            return self.execute_ipc_request(env_req.request, raw_stream);
+        }
         let outcome = consent_outcome(
             env_req.request.consent_tier(),
             carrier,
@@ -2290,6 +2434,56 @@ impl AppController {
                 Ok((w, t, p)) => Some(ids_ok(Some(w), Some(t), Some(p))),
                 Err(err) => Some(IpcResponse::err(err.to_string())),
             },
+            IpcRequest::ProposePolicy {
+                description,
+                verbs,
+                arg_constraints,
+                max_calls_per_minute,
+                expires_in_minutes,
+            } => {
+                let peer = self.dispatch_peer.get();
+                match self.propose_policy(
+                    peer,
+                    description,
+                    verbs,
+                    arg_constraints,
+                    max_calls_per_minute,
+                    expires_in_minutes,
+                ) {
+                    Ok(id) => {
+                        let mut resp = IpcResponse::empty_ok();
+                        if let IpcResponse::Ok { policy_id, .. } = &mut resp {
+                            *policy_id = Some(id);
+                        }
+                        Some(resp)
+                    }
+                    Err(err) => Some(IpcResponse::err(err)),
+                }
+            }
+            IpcRequest::ListPolicies => {
+                let mut resp = IpcResponse::empty_ok();
+                if let IpcResponse::Ok {
+                    policies,
+                    pending_policies,
+                    ..
+                } = &mut resp
+                {
+                    *policies = Some(self.installed_policies());
+                    *pending_policies = Some(self.pending_policies());
+                }
+                Some(resp)
+            }
+            IpcRequest::InstallPolicy { id } => match self.install_policy(id) {
+                Ok(()) => Some(IpcResponse::empty_ok()),
+                Err(err) => Some(IpcResponse::err(err)),
+            },
+            IpcRequest::RevokePolicy { id } => {
+                if self.revoke_policy(id) {
+                    Some(IpcResponse::empty_ok())
+                } else {
+                    Some(IpcResponse::err(format!("no such policy {id}")))
+                }
+            }
             IpcRequest::EndSession { kind, name, host } => {
                 match self.end_session(kind, &name, host.as_deref()) {
                     Ok(()) => Some(IpcResponse::empty_ok()),
@@ -3019,6 +3213,9 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         image_id: None,
         placement_id: None,
         sessions: None,
+        policy_id: None,
+        policies: None,
+        pending_policies: None,
     }
 }
 

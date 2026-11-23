@@ -247,6 +247,24 @@ enum CtlVerb {
         #[arg(long)]
         window: Option<u64>,
     },
+    /// Propose a Tier-3 standing policy (the operator installs it)
+    ProposePolicy {
+        #[arg(long)]
+        description: String,
+        /// Comma-separated verb slugs in scope
+        #[arg(long, value_delimiter = ',')]
+        verbs: Vec<String>,
+        #[arg(long, default_value = "60")]
+        max_calls_per_minute: u32,
+        #[arg(long, default_value = "60")]
+        expires_in_minutes: u64,
+    },
+    /// List installed and pending standing policies
+    ListPolicies,
+    /// Install a pending policy proposal (operator-side)
+    InstallPolicy { id: u64 },
+    /// Revoke a standing policy
+    RevokePolicy { id: u64 },
     /// END a multiplexer session: everything running inside it stops
     EndSession {
         name: String,
@@ -550,6 +568,21 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
                 window: window.map(WindowId),
             }
         }
+        CtlVerb::ProposePolicy {
+            description,
+            verbs,
+            max_calls_per_minute,
+            expires_in_minutes,
+        } => IpcRequest::ProposePolicy {
+            description,
+            verbs,
+            arg_constraints: std::collections::BTreeMap::new(),
+            max_calls_per_minute,
+            expires_in_minutes,
+        },
+        CtlVerb::ListPolicies => IpcRequest::ListPolicies,
+        CtlVerb::InstallPolicy { id } => IpcRequest::InstallPolicy { id },
+        CtlVerb::RevokePolicy { id } => IpcRequest::RevokePolicy { id },
         CtlVerb::EndSession { name, kind, host } => {
             let kind = match kind.as_str() {
                 "tmux" => mutiny::mux::MuxKind::Tmux,

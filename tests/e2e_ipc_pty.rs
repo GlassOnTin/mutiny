@@ -589,6 +589,10 @@ fn every_advertised_mcp_tool_dispatches() {
             "rename_session" => json!({"name": "mutiny-probe", "new_name": "mutiny-probe-x"}),
             // A session that does not exist, so the probe cannot destroy anything.
             "end_session" => json!({"name": "mutiny-probe-absent"}),
+            "propose_policy" => json!({"description": "probe", "verbs": ["send-input"]}),
+            "list_policies" => json!({}),
+            "install_policy" => json!({"id": 999999}),
+            "revoke_policy" => json!({"id": 999999}),
             // A nonexistent pane: the probe asserts dispatch, not success, and
             // closing a real pane would tear down the server other probes use.
             "close_pane" => json!({"pane": 999999}),

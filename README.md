@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 191 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 199 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -250,6 +250,24 @@ Labels follow the Haven convention: **title is the session name, subtitle is the
 
 The toolbar is glyph-only with tooltips (`+ → ↓ ↗ ⌘ ?`), measured at 157 px against 505 px for the labelled version. The full verb names live in the menus.
 
+## Standing policies (Tier 3)
+
+A trusted agent can propose a scoped grant so it stops prompting for every action. **Proposing grants nothing.** The proposal waits in the Agent activity dialog (`Ctrl+Shift+J`) until you install it, and you can revoke it there at any time.
+
+A policy names the verbs it covers (an empty scope is refused, never treated as "everything"), optionally pins scalar arguments to exact values, and carries a rate ceiling per rolling minute and an expiry. Beyond the ceiling, or outside the scope, calls fall back to the normal per-action prompt. Every covered call is still audited, as `approved-policy` rather than a prompt approval.
+
+A policy **cannot escalate a carrier**: it only substitutes for the prompt an `ask` carrier would raise. An `observe-only` peer stays read-only no matter what is installed, and a policy is bound to the kernel-verified peer that proposed it, so another process cannot use it.
+
+```sh
+mutiny ctl propose-policy --description "open tabs" --verbs spawn-tab,split \
+  --max-calls-per-minute 30 --expires-in-minutes 60
+mutiny ctl list-policies
+mutiny ctl install-policy 1      # operator-side
+mutiny ctl revoke-policy 1
+```
+
+The MCP surface mirrors Haven's vocabulary: `propose_policy`, `list_policies`, `install_policy`, `revoke_policy`. An agent cannot install its own proposal, because `install_policy` is itself an Act verb and needs consent.
+
 ## Settings
 
 `Ctrl+Shift+,` or Edit → Settings opens a dialog covering **every** key in the config store: font, all colours including the 16 ANSI entries, geometry, scrollback, and the whole `[sessions]` table. Save writes `config.toml`, which live-reloads, so most changes apply without a restart. Reset to Defaults writes the defaults back.
@@ -401,7 +419,7 @@ The tier is a property of the verb, not the caller. A human running `mutiny ctl`
 | --- | --- | --- |
 | 1 | Observe. Read-only tools and resources, no prompt. | shipped |
 | 2 | Act once. One-shot writes, per-action consent in window chrome. | shipped |
-| 3 | Standing policy. A scoped, rate-capped, expiring grant installed once. | planned (M2) |
+| 3 | Standing policy. A scoped, rate-capped, expiring grant installed once. | shipped |
 | 4 | Irreversible. Always per-action, never standing. | planned |
 
 Consent mode is assigned by the carrier that accepted the connection, never claimed by the client. An envelope carrying `consent_mode` is refused. Peer identity comes from the kernel via `SO_PEERCRED`, and a peer whose uid differs from the server's is refused outright.
@@ -421,7 +439,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 191 tests, no display required
+cargo test                    # 199 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

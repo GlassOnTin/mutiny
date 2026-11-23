@@ -161,6 +161,28 @@ pub enum IpcRequest {
         mode: crate::mux::SessionMode,
         window: Option<WindowId>,
     },
+    /// Proposes a Tier-3 standing policy. Grants NOTHING by itself: it queues a
+    /// proposal the operator installs from the Agent activity dialog. Observe
+    /// tier, because asking is not acting.
+    ProposePolicy {
+        description: String,
+        verbs: Vec<String>,
+        #[serde(default)]
+        arg_constraints: std::collections::BTreeMap<String, String>,
+        max_calls_per_minute: u32,
+        expires_in_minutes: u64,
+    },
+    /// Lists installed and pending standing policies.
+    ListPolicies,
+    /// Installs a pending proposal. Operator-side; an agent cannot install its
+    /// own proposal.
+    InstallPolicy {
+        id: u64,
+    },
+    /// Revokes an installed policy.
+    RevokePolicy {
+        id: u64,
+    },
     /// ENDS a multiplexer session. Destructive: everything running inside it
     /// stops, on every device. Distinct from closing a tab, which only ends
     /// this client and leaves the session running.
@@ -292,6 +314,10 @@ impl IpcRequest {
             IpcRequest::SaveSession => ConsentTier::Act,
             IpcRequest::NewSession { .. } => ConsentTier::Act,
             IpcRequest::RenameSession { .. } => ConsentTier::Act,
+            IpcRequest::ProposePolicy { .. } => ConsentTier::Observe,
+            IpcRequest::ListPolicies => ConsentTier::Observe,
+            IpcRequest::InstallPolicy { .. } => ConsentTier::Act,
+            IpcRequest::RevokePolicy { .. } => ConsentTier::Act,
             IpcRequest::EndSession { .. } => ConsentTier::Act,
             IpcRequest::ClosePane { .. } => ConsentTier::Act,
             IpcRequest::CloseTab { .. } => ConsentTier::Act,
@@ -312,6 +338,53 @@ impl IpcRequest {
         }
     }
 
+    /// Scalar fields a standing policy can pin, as exact-match strings. Only
+    /// the verbs where pinning is meaningful carry entries; everything else
+    /// returns an empty map, so a policy pinning a key the call lacks does not
+    /// match rather than matching vacuously.
+    pub fn pin_fields(&self) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        let mut put = |k: &str, v: String| {
+            m.insert(k.to_owned(), v);
+        };
+        match self {
+            IpcRequest::OpenSession {
+                kind,
+                host,
+                mode,
+                window,
+                ..
+            } => {
+                put("kind", kind.label().to_owned());
+                put("host", host.clone().unwrap_or_default());
+                put("mode", format!("{mode:?}").to_lowercase());
+                window.map(|w| put("window", w.0.to_string()));
+            }
+            IpcRequest::NewSession {
+                kind, mode, window, ..
+            } => {
+                put("kind", kind.map(|k| k.label()).unwrap_or("none").to_owned());
+                put("mode", format!("{mode:?}").to_lowercase());
+                window.map(|w| put("window", w.0.to_string()));
+            }
+            IpcRequest::SendInput { pane, .. } | IpcRequest::SendText { pane, .. } => {
+                pane.map(|p| put("pane", p.0.to_string()));
+            }
+            IpcRequest::SpawnTab { window, .. } => {
+                window.map(|w| put("window", w.0.to_string()));
+            }
+            IpcRequest::Split { pane, axis, .. } => {
+                put("axis", format!("{axis:?}").to_lowercase());
+                pane.map(|p| put("pane", p.0.to_string()));
+            }
+            IpcRequest::RunAction { action, .. } => {
+                put("action", crate::action::spec(*action).slug.to_owned());
+            }
+            _ => {}
+        }
+        m
+    }
+
     pub fn verb_name(&self) -> &'static str {
         match self {
             IpcRequest::List => "list",
@@ -320,6 +393,10 @@ impl IpcRequest {
             IpcRequest::SaveSession => "save-session",
             IpcRequest::NewSession { .. } => "new-session",
             IpcRequest::RenameSession { .. } => "rename-session",
+            IpcRequest::ProposePolicy { .. } => "propose-policy",
+            IpcRequest::ListPolicies => "list-policies",
+            IpcRequest::InstallPolicy { .. } => "install-policy",
+            IpcRequest::RevokePolicy { .. } => "revoke-policy",
             IpcRequest::EndSession { .. } => "end-session",
             IpcRequest::ClosePane { .. } => "close-pane",
             IpcRequest::CloseTab { .. } => "close-tab",
@@ -447,6 +524,8 @@ pub enum AuditDecision {
     Allowed,
     ApprovedOnce,
     ApprovedSession,
+    /// Allowed by an installed Tier-3 standing policy rather than a prompt.
+    ApprovedPolicy,
     Denied,
 }
 
@@ -523,6 +602,12 @@ pub enum IpcResponse {
         /// is reported alongside the sessions that did answer.
         #[serde(skip_serializing_if = "Option::is_none")]
         sessions: Option<crate::mux::MuxInventory>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policies: Option<Vec<crate::policy::StandingPolicy>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pending_policies: Option<Vec<crate::policy::StandingPolicy>>,
     },
     Error {
         message: String,
@@ -550,6 +635,9 @@ impl IpcResponse {
             image_id: None,
             placement_id: None,
             sessions: None,
+            policy_id: None,
+            policies: None,
+            pending_policies: None,
         }
     }
 
@@ -1006,6 +1094,16 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             name: String::from("mutiny-probe-absent"),
             host: None,
         },
+        IpcRequest::ProposePolicy {
+            description: String::from("probe policy"),
+            verbs: vec![String::from("send-input")],
+            arg_constraints: std::collections::BTreeMap::new(),
+            max_calls_per_minute: 10,
+            expires_in_minutes: 5,
+        },
+        IpcRequest::ListPolicies,
+        IpcRequest::InstallPolicy { id: 999_999 },
+        IpcRequest::RevokePolicy { id: 999_999 },
         IpcRequest::ClosePane { pane: None },
         IpcRequest::CloseTab {
             window: None,
@@ -1049,6 +1147,10 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::SaveSession => 24,
         IpcRequest::NewSession { .. } => 29,
         IpcRequest::RenameSession { .. } => 30,
+        IpcRequest::ProposePolicy { .. } => 32,
+        IpcRequest::ListPolicies => 33,
+        IpcRequest::InstallPolicy { .. } => 34,
+        IpcRequest::RevokePolicy { .. } => 35,
         IpcRequest::EndSession { .. } => 31,
         IpcRequest::ClosePane { .. } => 25,
         IpcRequest::CloseTab { .. } => 27,

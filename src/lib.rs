@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod mcp;
 pub mod mux;
 pub mod notify;
+pub mod policy;
 pub mod session;
 pub mod shell_integration;
 pub mod topology;

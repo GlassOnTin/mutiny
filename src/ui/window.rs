@@ -2075,6 +2075,99 @@ impl MutinyWindow {
         header.append(&revoke_btn);
         vbox.append(&header);
 
+        // Tier-3 standing policies. Proposals are inert until installed here,
+        // and an installed policy is revocable here, so the operator holds the
+        // wheel without leaving this dialog.
+        let policy_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        let policy_heading = gtk4::Label::new(None);
+        policy_heading.set_markup("<b>Standing policies</b>");
+        policy_heading.set_xalign(0.0);
+        policy_box.append(&policy_heading);
+        let rows = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        policy_box.append(&rows);
+        vbox.append(&policy_box);
+        {
+            let rows = rows.clone();
+            let ctrl = Rc::downgrade(&ctrl);
+            let rebuild = Rc::new(std::cell::RefCell::new(None::<Box<dyn Fn()>>));
+            let rebuild_slot = Rc::clone(&rebuild);
+            let f = move || {
+                while let Some(child) = rows.first_child() {
+                    rows.remove(&child);
+                }
+                let Some(c) = ctrl.upgrade() else { return };
+                let pending = c.pending_policies();
+                let installed = c.installed_policies();
+                if pending.is_empty() && installed.is_empty() {
+                    let none = gtk4::Label::new(Some("None proposed or installed."));
+                    none.set_xalign(0.0);
+                    none.add_css_class("dim-label");
+                    rows.append(&none);
+                    return;
+                }
+                for p in pending.iter().chain(installed.iter()) {
+                    let is_pending = pending.iter().any(|q| q.id == p.id);
+                    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+                    let text = gtk4::Label::new(Some(&format!(
+                        "{}: {} call(s)/min, verbs: {}",
+                        p.description,
+                        p.max_calls_per_minute,
+                        p.verbs.join(", ")
+                    )));
+                    text.set_xalign(0.0);
+                    text.set_hexpand(true);
+                    text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                    row.append(&text);
+                    let id = p.id;
+                    if is_pending {
+                        let install = gtk4::Button::with_label("Install");
+                        install.add_css_class("suggested-action");
+                        let weak = Rc::downgrade(&c);
+                        let again = Rc::clone(&rebuild_slot);
+                        install.connect_clicked(move |_| {
+                            if let Some(cc) = weak.upgrade() {
+                                let _ = cc.install_policy(id);
+                                if let Some(f) = again.borrow().as_ref() {
+                                    f();
+                                }
+                            }
+                        });
+                        row.append(&install);
+                        let reject = gtk4::Button::with_label("Reject");
+                        let weak = Rc::downgrade(&c);
+                        let again = Rc::clone(&rebuild_slot);
+                        reject.connect_clicked(move |_| {
+                            if let Some(cc) = weak.upgrade() {
+                                cc.revoke_policy(id);
+                                if let Some(f) = again.borrow().as_ref() {
+                                    f();
+                                }
+                            }
+                        });
+                        row.append(&reject);
+                    } else {
+                        let revoke = gtk4::Button::with_label("Revoke");
+                        let weak = Rc::downgrade(&c);
+                        let again = Rc::clone(&rebuild_slot);
+                        revoke.connect_clicked(move |_| {
+                            if let Some(cc) = weak.upgrade() {
+                                cc.revoke_policy(id);
+                                if let Some(f) = again.borrow().as_ref() {
+                                    f();
+                                }
+                            }
+                        });
+                        row.append(&revoke);
+                    }
+                    rows.append(&row);
+                }
+            };
+            *rebuild.borrow_mut() = Some(Box::new(f));
+            if let Some(f) = rebuild.borrow().as_ref() {
+                f();
+            }
+        }
+
         let grid = gtk4::Grid::builder()
             .column_spacing(14)
             .row_spacing(6)

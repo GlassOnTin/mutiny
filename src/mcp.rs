@@ -65,6 +65,10 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
         IpcRequest::NewSession { .. } => Some(McpSurface::Tool("new_session")),
         IpcRequest::RenameSession { .. } => Some(McpSurface::Tool("rename_session")),
+        IpcRequest::ProposePolicy { .. } => Some(McpSurface::Tool("propose_policy")),
+        IpcRequest::ListPolicies => Some(McpSurface::Tool("list_policies")),
+        IpcRequest::InstallPolicy { .. } => Some(McpSurface::Tool("install_policy")),
+        IpcRequest::RevokePolicy { .. } => Some(McpSurface::Tool("revoke_policy")),
         IpcRequest::EndSession { .. } => Some(McpSurface::Tool("end_session")),
         IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
         IpcRequest::CloseTab { .. } => Some(McpSurface::Tool("close_tab")),
@@ -597,6 +601,61 @@ impl McpBridge {
                     Duration::from_secs(30),
                 )
             }
+            "list_policies" => (IpcRequest::ListPolicies, Duration::from_secs(10)),
+            "install_policy" => (
+                IpcRequest::InstallPolicy {
+                    id: args.get("id").and_then(Value::as_u64).unwrap_or(0),
+                },
+                Duration::from_secs(10),
+            ),
+            "revoke_policy" => (
+                IpcRequest::RevokePolicy {
+                    id: args.get("id").and_then(Value::as_u64).unwrap_or(0),
+                },
+                Duration::from_secs(10),
+            ),
+            "propose_policy" => {
+                let description = args
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`description` is required")))?
+                    .to_owned();
+                let verbs = args
+                    .get("verbs")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let arg_constraints = args
+                    .get("arg_constraints")
+                    .and_then(Value::as_object)
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (
+                    IpcRequest::ProposePolicy {
+                        description,
+                        verbs,
+                        arg_constraints,
+                        max_calls_per_minute: args
+                            .get("max_calls_per_minute")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(60) as u32,
+                        expires_in_minutes: args
+                            .get("expires_in_minutes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(60),
+                    },
+                    Duration::from_secs(10),
+                )
+            }
             "end_session" => {
                 let name = args
                     .get("name")
@@ -966,6 +1025,44 @@ pub fn tool_definitions() -> Value {
                     "mode": { "type": "string", "enum": ["window", "tab", "split-right", "split-down"] },
                     "window": { "type": "integer" }
                 }
+            }
+        },
+        {
+            "name": "propose_policy",
+            "description": "Tier-1 Observe: propose a Tier-3 standing policy so a trusted agent stops prompting for every action. Grants NOTHING by itself: the operator installs it from Mutiny's Agent activity dialog. Name the verbs in scope (an empty scope is refused), optionally pin scalar arguments to exact values, and set a rate ceiling and expiry. Beyond the ceiling, calls fall back to per-action prompts. Returns policy_id; poll list_policies to see whether it was installed.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["description", "verbs"],
+                "properties": {
+                    "description": { "type": "string" },
+                    "verbs": { "type": "array", "items": { "type": "string" } },
+                    "arg_constraints": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "max_calls_per_minute": { "type": "integer" },
+                    "expires_in_minutes": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "list_policies",
+            "description": "Tier-1 Observe: list installed and pending standing policies, with their scope, pins, rate ceiling, and expiry.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "install_policy",
+            "description": "Tier-2 Act, operator-side: install a pending policy proposal. An agent arriving on an ask carrier cannot use this to install its own proposal, because the verb itself requires consent.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "revoke_policy",
+            "description": "Tier-2 Act: revoke a standing policy. Takes effect immediately; subsequent calls fall back to per-action consent.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "integer" } }
             }
         },
         {
