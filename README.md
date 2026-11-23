@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 187 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 189 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
 
 Working today:
 
@@ -222,8 +222,8 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 
 | Menu | Covers | Actions |
 | --- | --- | --- |
-| **Session** | the lifecycle of a session context | New Window, New Tab, Open Session (submenu) |
-| **Edit** | the focused pane's content | Copy, Paste, Search, Previous/Next Command |
+| **Session** | the lifecycle of a session context | New Window, New Tab, New Session, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
+| **Edit** | the focused pane's content, and settings | Copy, Paste, Search, Previous/Next Command, Settings |
 | **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
 | **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Keybind Cheatsheet |
 
@@ -240,6 +240,12 @@ The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View"
 Labels follow the Haven convention: **title is the session name, subtitle is the host** (this machine's hostname for local sessions, the SSH host for remote ones). Tabs and the picker both use two lines, title prominent and subtitle dimmer, with the title ellipsised so wrapped tabs stay readable. Session numbers are gone: once sessions are named, an index is redundant noise.
 
 The toolbar is glyph-only with tooltips (`+ → ↓ ↗ ⌘ ?`), measured at 157 px against 505 px for the labelled version. The full verb names live in the menus.
+
+## Settings
+
+`Ctrl+Shift+,` or Edit → Settings opens a dialog covering **every** key in the config store: font, all colours including the 16 ANSI entries, geometry, scrollback, and the whole `[sessions]` table. Save writes `config.toml`, which live-reloads, so most changes apply without a restart. Reset to Defaults writes the defaults back.
+
+A test counts the dialog's editable widgets against the number of config keys, so adding a key without exposing it fails the build rather than silently leaving it unreachable.
 
 ## App icon and launcher
 
@@ -406,7 +412,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 187 tests, no display required
+cargo test                    # 189 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

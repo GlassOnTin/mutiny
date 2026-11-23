@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 187 tests: 101 unit + 7 config + 11 e2e + 7 http + 14 mux + 5 menuia + 4 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 189 tests: 102 unit + 7 config + 11 e2e + 7 http + 14 mux + 5 menuia + 4 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 settings + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -301,6 +301,8 @@ Grid line indices are relative to the current screen, so output arriving mid-sca
 
 `ActionId::NewTab` honours `preferred_mux`; the IPC `SpawnTab` verb deliberately does not, because agents and scripts ask for a shell explicitly.
 
+**The tab context menu is parented to the WINDOW and reused.** The first version created a popover per right-click, parented it to the tab button, and unparented it on `closed`. Every item then did nothing: GTK emits `closed` BEFORE activating the action, so unparenting removed the widget path the action resolves through. The terminal view's menu has always used parent-once-and-reuse; the tab menu now does too, swapping its model per tab and translating the gesture's button-relative coordinates with `compute_point`. `tests/tab_actions.rs` asserts the menu stays parented after a popdown, which is the invariant that broke.
+
 **A parameterised gio action needs its target on the MENU ITEM**, not just the action name. `menu.append(label, action)` on an action that takes a parameter renders the item insensitive and it never fires. `build_tab_menu_model(attached, tab)` uses `MenuItem::set_action_and_target_value`. A screenshot cannot distinguish "rendered but dead" from working, which is why `tests/tab_actions.rs` drives the real actions with `activate_action` instead of trusting the picture.
 
 Tab buttons carry no tooltip: the two-line label already shows name and host, and a tooltip window stacks over the right-click menu and hides items.
@@ -332,6 +334,10 @@ The Sessions submenu is a `gio::Menu` returned by `build_menubar_model()` alongs
 Haven's convention. `PaneEngine::mux_session` holds a `MuxSessionRef { kind, name, host }`; `title()` returns the session name when attached, and `MuxSessionRef::subtitle()` returns the SSH host or `mux::local_hostname()`. Tabs and picker rows are two-line, title prominent, subtitle dim and smaller, title ellipsised. No session index: it is redundant once sessions are named.
 
 `tab_buttons` stores the button AND its two labels. `refresh_tab_strip_labels` must update those labels, never call `btn.set_label`, which would replace the two-line child with a plain string and silently undo the structure. `tab_labels()` reads the title label for the same reason.
+
+### Settings dialog
+
+`show_settings_dialog` builds one row per config key, grouped by TOML table. Each row contributes a `ConfigSetter` closure that reads its widget and writes its key, so Save starts from `config::load_or_default`, applies every setter, and writes `config::to_toml`. Adding a config key means adding one row; `tests/settings_dialog.rs` counts editable widgets against the key count so a missed row fails the build. The config store stays the single source of truth for the key set.
 
 ### App icon and desktop identity
 

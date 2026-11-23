@@ -31,6 +31,12 @@ struct MutinyWindowInner {
     /// squeezing the terminal. Horizontal scrolling is off: we wrap instead.
     tab_scroller: gtk4::ScrolledWindow,
     toolbar_box: gtk4::Box,
+    /// One tab context menu per window, parented to the WINDOW and reused.
+    /// Parenting it to a tab button and unparenting on `closed` broke every
+    /// item: GTK emits `closed` before activating the action, so the popover
+    /// lost its widget path and the action could not resolve. The terminal
+    /// view's menu has always used this parent-once pattern.
+    tab_menu: gtk4::PopoverMenu,
     agent_badge_btn: gtk4::Button,
     consent_bar: gtk4::Box,
     consent_label: gtk4::Label,
@@ -117,6 +123,9 @@ impl MutinyWindow {
         // Glyph-only with tooltips: the words cost more horizontal space than
         // the tab strip could afford once sessions wrap. Meaning lives in the
         // tooltip and in the Session/Pane menus, which name each verb in full.
+        let tab_menu = gtk4::PopoverMenu::from_model(None::<&gtk4::gio::Menu>);
+        tab_menu.set_parent(&gtk_window);
+        tab_menu.set_has_arrow(false);
         let toolbar_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
         for (glyph, action, tip) in [
             ("+", "win.new-tab", "New Tab (Ctrl+Shift+T)"),
@@ -260,6 +269,7 @@ impl MutinyWindow {
                 tab_buttons_box,
                 tab_scroller,
                 toolbar_box,
+                tab_menu,
                 agent_badge_btn,
                 consent_bar,
                 consent_label,
@@ -569,6 +579,7 @@ impl MutinyWindow {
     /// GTK's transient-destroy propagation, which does not fire for a
     /// programmatic close.
     fn dismiss_session_picker(&self) {
+        self.inner.tab_menu.popdown();
         let picker = self.inner.session_picker.borrow_mut().take();
         if let Some(picker) = picker {
             picker.dialog.close();
@@ -643,6 +654,11 @@ impl MutinyWindow {
             crate::desktop::APP_ID
         };
         self.inner.gtk_window.set_icon_name(Some(name));
+    }
+
+    /// The tab context menu, for tests that check its lifetime.
+    pub fn tab_menu(&self) -> gtk4::PopoverMenu {
+        self.inner.tab_menu.clone()
     }
 
     /// The underlying GTK window, for tests that drive real gio actions.
@@ -887,8 +903,10 @@ impl MutinyWindow {
                 .is_some_and(|e| e.mux_session().is_some());
             let click = gtk4::GestureClick::new();
             click.set_button(gdk::BUTTON_SECONDARY);
-            let btn_for_menu = btn.clone();
             let ctrl_menu = Rc::downgrade(&ctrl);
+            let menu = self.inner.tab_menu.clone();
+            let win_for_menu = self.inner.gtk_window.clone();
+            let btn_for_menu = btn.clone();
             click.connect_pressed(move |_, _, x, y| {
                 let Some(c) = ctrl_menu.upgrade() else {
                     return;
@@ -897,14 +915,21 @@ impl MutinyWindow {
                 // and any active-pane verb target the tab that was clicked.
                 let _ = c.workspace.borrow_mut().focus_pane(first_pane);
                 let model = crate::action::build_tab_menu_model(attached, tid.0);
-                let popover = gtk4::PopoverMenu::from_model(Some(&model));
-                popover.set_parent(&btn_for_menu);
-                popover.set_has_arrow(false);
-                popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                // Tab buttons are rebuilt on every topology change, so the
-                // popover must not outlive this one.
-                popover.connect_closed(|p| p.unparent());
-                popover.popup();
+                menu.set_menu_model(Some(&model));
+                // The gesture gives button-relative coordinates; the popover is
+                // parented to the window, so translate them.
+                let point = gtk4::graphene::Point::new(x as f32, y as f32);
+                let translated = btn_for_menu
+                    .compute_point(&win_for_menu, &point)
+                    .unwrap_or(point);
+                let (wx, wy) = (f64::from(translated.x()), f64::from(translated.y()));
+                menu.set_pointing_to(Some(&gdk::Rectangle::new(
+                    wx.round() as i32,
+                    wy.round() as i32,
+                    1,
+                    1,
+                )));
+                menu.popup();
             });
             btn.add_controller(click);
 
@@ -1254,6 +1279,364 @@ impl MutinyWindow {
                 }
             },
         );
+    }
+
+    /// Settings: every key in the config store, grouped by its TOML table.
+    /// Each field contributes a setter closure, so adding a config key means
+    /// adding one row here rather than threading a new struct through.
+    pub fn show_settings_dialog(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let path = ctrl.config_path().to_path_buf();
+        let current = crate::config::load_or_default(&path);
+
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("Settings")
+            .default_width(560)
+            .default_height(620)
+            .build();
+        let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        outer.set_margin_top(12);
+        outer.set_margin_bottom(12);
+        outer.set_margin_start(12);
+        outer.set_margin_end(12);
+
+        let grid = gtk4::Grid::new();
+        grid.set_column_spacing(12);
+        grid.set_row_spacing(6);
+        let scroller = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
+            .child(&grid)
+            .build();
+        outer.append(&scroller);
+
+        let row = std::cell::Cell::new(0i32);
+        let setters: Rc<RefCell<Vec<ConfigSetter>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let heading = |text: &str| {
+            let label = gtk4::Label::new(None);
+            label.set_markup(&format!("<b>{text}</b>"));
+            label.set_xalign(0.0);
+            label.set_margin_top(8);
+            grid.attach(&label, 0, row.get(), 2, 1);
+            row.set(row.get() + 1);
+        };
+        let entry = |label: &str, value: &str, set: TextSetter| {
+            let l = gtk4::Label::new(Some(label));
+            l.set_xalign(0.0);
+            let e = gtk4::Entry::new();
+            e.set_text(value);
+            e.set_hexpand(true);
+            grid.attach(&l, 0, row.get(), 1, 1);
+            grid.attach(&e, 1, row.get(), 1, 1);
+            row.set(row.get() + 1);
+            let e = e.clone();
+            setters
+                .borrow_mut()
+                .push(Box::new(move |c| set(c, e.text().to_string())));
+        };
+        let spin = |label: &str, value: f64, min: f64, max: f64, step: f64, set: NumSetter| {
+            let l = gtk4::Label::new(Some(label));
+            l.set_xalign(0.0);
+            let s = gtk4::SpinButton::with_range(min, max, step);
+            s.set_value(value);
+            s.set_hexpand(true);
+            grid.attach(&l, 0, row.get(), 1, 1);
+            grid.attach(&s, 1, row.get(), 1, 1);
+            row.set(row.get() + 1);
+            let s = s.clone();
+            setters
+                .borrow_mut()
+                .push(Box::new(move |c| set(c, s.value())));
+        };
+        let check = |label: &str, value: bool, set: BoolSetter| {
+            let c = gtk4::CheckButton::with_label(label);
+            c.set_active(value);
+            grid.attach(&c, 0, row.get(), 2, 1);
+            row.set(row.get() + 1);
+            let c = c.clone();
+            setters
+                .borrow_mut()
+                .push(Box::new(move |cfg| set(cfg, c.is_active())));
+        };
+
+        heading("Font");
+        entry(
+            "Family",
+            &current.font.family,
+            Box::new(|c, v| c.font.family = v),
+        );
+        spin(
+            "Size",
+            current.font.size as f64,
+            6.0,
+            72.0,
+            1.0,
+            Box::new(|c, v| c.font.size = v as u32),
+        );
+
+        heading("Colors (#rrggbb)");
+        entry(
+            "Background",
+            &current.colors.background,
+            Box::new(|c, v| c.colors.background = v),
+        );
+        entry(
+            "Foreground",
+            &current.colors.foreground,
+            Box::new(|c, v| c.colors.foreground = v),
+        );
+        entry(
+            "Cursor",
+            &current.colors.cursor,
+            Box::new(|c, v| c.colors.cursor = v),
+        );
+        entry(
+            "Selection",
+            &current.colors.selection,
+            Box::new(|c, v| c.colors.selection = v),
+        );
+        entry(
+            "Accent",
+            &current.colors.accent,
+            Box::new(|c, v| c.colors.accent = v),
+        );
+        for i in 0..16 {
+            let value = current.colors.palette.get(i).cloned().unwrap_or_default();
+            entry(
+                &format!("ANSI {i}"),
+                &value,
+                Box::new(move |c, v| {
+                    while c.colors.palette.len() < 16 {
+                        c.colors.palette.push(String::from("#000000"));
+                    }
+                    c.colors.palette[i] = v;
+                }),
+            );
+        }
+
+        heading("Geometry");
+        spin(
+            "Initial columns",
+            current.geometry.initial_cols as f64,
+            20.0,
+            500.0,
+            1.0,
+            Box::new(|c, v| c.geometry.initial_cols = v as usize),
+        );
+        spin(
+            "Initial rows",
+            current.geometry.initial_rows as f64,
+            5.0,
+            200.0,
+            1.0,
+            Box::new(|c, v| c.geometry.initial_rows = v as usize),
+        );
+        spin(
+            "Window width",
+            current.geometry.window_width as f64,
+            320.0,
+            7680.0,
+            10.0,
+            Box::new(|c, v| c.geometry.window_width = v as i32),
+        );
+        spin(
+            "Window height",
+            current.geometry.window_height as f64,
+            200.0,
+            4320.0,
+            10.0,
+            Box::new(|c, v| c.geometry.window_height = v as i32),
+        );
+        spin(
+            "Padding px",
+            current.geometry.padding_px as f64,
+            0.0,
+            64.0,
+            1.0,
+            Box::new(|c, v| c.geometry.padding_px = v as f32),
+        );
+        spin(
+            "Tab strip max height px",
+            current.geometry.tab_strip_max_height_px as f64,
+            32.0,
+            600.0,
+            4.0,
+            Box::new(|c, v| c.geometry.tab_strip_max_height_px = v as i32),
+        );
+
+        heading("Terminal");
+        spin(
+            "Scrollback lines",
+            current.terminal.scrollback_lines as f64,
+            0.0,
+            1_000_000.0,
+            1000.0,
+            Box::new(|c, v| c.terminal.scrollback_lines = v as usize),
+        );
+
+        heading("Sessions");
+        let preferred = gtk4::DropDown::from_strings(&["tmux", "zellij", "none"]);
+        preferred.set_selected(match current.sessions.preferred.as_str() {
+            "zellij" => 1,
+            "none" => 2,
+            _ => 0,
+        });
+        let l = gtk4::Label::new(Some("Preferred multiplexer"));
+        l.set_xalign(0.0);
+        grid.attach(&l, 0, row.get(), 1, 1);
+        grid.attach(&preferred, 1, row.get(), 1, 1);
+        row.set(row.get() + 1);
+        {
+            let preferred = preferred.clone();
+            setters.borrow_mut().push(Box::new(move |c| {
+                c.sessions.preferred = match preferred.selected() {
+                    1 => String::from("zellij"),
+                    2 => String::from("none"),
+                    _ => String::from("tmux"),
+                };
+            }));
+        }
+        entry(
+            "Hosts (comma separated)",
+            &current.sessions.hosts.join(", "),
+            Box::new(|c, v| {
+                c.sessions.hosts = v
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }),
+        );
+        entry(
+            "tmux program",
+            &current.sessions.tmux_program,
+            Box::new(|c, v| c.sessions.tmux_program = v),
+        );
+        entry(
+            "zellij program",
+            &current.sessions.zellij_program,
+            Box::new(|c, v| c.sessions.zellij_program = v),
+        );
+        entry(
+            "ssh program",
+            &current.sessions.ssh_program,
+            Box::new(|c, v| c.sessions.ssh_program = v),
+        );
+        entry(
+            "tmux socket (blank = default)",
+            current.sessions.tmux_socket.as_deref().unwrap_or(""),
+            Box::new(|c, v| {
+                c.sessions.tmux_socket = if v.trim().is_empty() { None } else { Some(v) }
+            }),
+        );
+        entry(
+            "Remote TERM",
+            &current.sessions.remote_term,
+            Box::new(|c, v| c.sessions.remote_term = v),
+        );
+        spin(
+            "Connect timeout s",
+            current.sessions.connect_timeout_s as f64,
+            1.0,
+            60.0,
+            1.0,
+            Box::new(|c, v| c.sessions.connect_timeout_s = v as u32),
+        );
+        spin(
+            "Discovery timeout ms",
+            current.sessions.discovery_timeout_ms as f64,
+            200.0,
+            60_000.0,
+            100.0,
+            Box::new(|c, v| c.sessions.discovery_timeout_ms = v as u64),
+        );
+        spin(
+            "Refresh interval s (0 = off)",
+            current.sessions.refresh_interval_s as f64,
+            0.0,
+            3600.0,
+            1.0,
+            Box::new(|c, v| c.sessions.refresh_interval_s = v as u32),
+        );
+        check(
+            "Attach or create when opening a session",
+            current.sessions.create_if_missing,
+            Box::new(|c, v| c.sessions.create_if_missing = v),
+        );
+        check(
+            "Ignore this client's size (tmux)",
+            current.sessions.ignore_size,
+            Box::new(|c, v| c.sessions.ignore_size = v),
+        );
+        check(
+            "Show exited zellij sessions",
+            current.sessions.show_exited,
+            Box::new(|c, v| c.sessions.show_exited = v),
+        );
+
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let defaults = gtk4::Button::with_label("Reset to Defaults");
+        let cancel = gtk4::Button::with_label("Cancel");
+        let save = gtk4::Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        for b in [&defaults, &cancel, &save] {
+            buttons.append(b);
+        }
+        outer.append(&buttons);
+        let note = gtk4::Label::new(Some(&format!("Writes {}", path.display())));
+        note.set_xalign(0.0);
+        note.add_css_class("dim-label");
+        note.set_wrap(true);
+        outer.append(&note);
+        dialog.set_child(Some(&outer));
+        dialog.set_default_widget(Some(&save));
+
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| dialog.close());
+        }
+        {
+            let dialog = dialog.clone();
+            let path = path.clone();
+            let setters = Rc::clone(&setters);
+            let note = note.clone();
+            save.connect_clicked(move |_| {
+                let mut config = crate::config::load_or_default(&path);
+                for set in setters.borrow().iter() {
+                    set(&mut config);
+                }
+                match crate::config::to_toml(&config) {
+                    Ok(text) => match std::fs::write(&path, text) {
+                        Ok(()) => dialog.close(),
+                        Err(err) => note.set_text(&format!("Could not write: {err}")),
+                    },
+                    Err(err) => note.set_text(&format!("Could not serialise: {err}")),
+                }
+            });
+        }
+        {
+            let path = path.clone();
+            let note = note.clone();
+            defaults.connect_clicked(move |_| {
+                let config = crate::config::Config::default();
+                match crate::config::to_toml(&config) {
+                    Ok(text) => match std::fs::write(&path, text) {
+                        Ok(()) => note.set_text("Defaults written. Reopen to see them."),
+                        Err(err) => note.set_text(&format!("Could not write: {err}")),
+                    },
+                    Err(err) => note.set_text(&format!("Could not serialise: {err}")),
+                }
+            });
+        }
+        attach_escape_to_close(&dialog);
+        dialog.present();
     }
 
     pub fn show_command_palette(&self) {
@@ -1713,6 +2096,13 @@ impl MutinyWindow {
         dialog.present();
     }
 }
+
+/// A Settings field's write-back: read the widget, set the config key.
+type ConfigSetter = Box<dyn Fn(&mut crate::config::Config)>;
+/// A Settings field's typed write-back, before the widget is captured.
+type TextSetter = Box<dyn Fn(&mut crate::config::Config, String)>;
+type NumSetter = Box<dyn Fn(&mut crate::config::Config, f64)>;
+type BoolSetter = Box<dyn Fn(&mut crate::config::Config, bool)>;
 
 /// Live state of an open session picker. Stored on the window so the controller
 /// can refresh it when discovery results land, and cleared on close so a stale

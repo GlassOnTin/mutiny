@@ -21,6 +21,10 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("session-picker", "Ctrl+Shift+S", "Session"),
     // No chord: reachable from the Session menu, the tab menu, and the palette.
     ("new-session", "", "Session"),
+    ("settings", "Ctrl+Shift+,", "Edit"),
+    ("save-session", "", "Session"),
+    ("close-tab", "", "Session"),
+    ("close-window", "", "Session"),
     ("copy", "Ctrl+Shift+C", "Edit"),
     ("paste", "Ctrl+Shift+V", "Edit"),
     ("search", "Ctrl+Shift+F", "Edit"),

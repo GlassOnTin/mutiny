@@ -90,6 +90,24 @@ esac
     let window = ctrl.ui_window(w).expect("view");
     let gtk_win = window.gtk_window();
 
+    // The menu must be parented to the WINDOW and stay parented after it
+    // closes. Parenting it to a tab button and unparenting on `closed` broke
+    // every item, because GTK emits `closed` before activating the action.
+    let menu = window.tab_menu();
+    assert_eq!(
+        menu.parent(),
+        Some(gtk_win.clone().upcast::<gtk4::Widget>()),
+        "the tab menu must be parented to the window, not a tab button"
+    );
+    menu.popup();
+    settle(&ctrl, 6);
+    menu.popdown();
+    settle(&ctrl, 6);
+    assert!(
+        menu.parent().is_some(),
+        "the menu must stay parented after closing, or its actions cannot resolve"
+    );
+
     // Rename on an attached tab must open a dialog window.
     let before = gtk4::Window::toplevels().n_items();
     gtk4::prelude::WidgetExt::activate_action(

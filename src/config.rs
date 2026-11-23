@@ -221,6 +221,22 @@ impl Default for ResolvedConfig {
     }
 }
 
+/// Serialises a config back to TOML for the Settings dialog to write. The
+/// struct is the single source of truth for the key set, so a new field is
+/// editable as soon as it exists here.
+pub fn to_toml(config: &Config) -> Result<String, String> {
+    toml::to_string_pretty(config).map_err(|e| e.to_string())
+}
+
+/// Reads the config file if present, else the defaults. The Settings dialog
+/// starts from this so it shows what is actually in effect.
+pub fn load_or_default(path: &Path) -> Config {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<Config>(&text).ok())
+        .unwrap_or_default()
+}
+
 pub fn config_path() -> PathBuf {
     config_path_from(
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
@@ -606,6 +622,22 @@ scrollback_lines = 5000
         assert_eq!(resolved.initial_cols, 20);
         assert_eq!(resolved.initial_rows, 200);
         assert_eq!(resolved.padding_px, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn to_toml_round_trips_every_default_key() {
+        let dir = std::env::temp_dir().join(format!("mutiny-cfg-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = Config::default();
+        let text = to_toml(&original).expect("serialise");
+        std::fs::write(&path, &text).unwrap();
+        let back = load_or_default(&path);
+        assert_eq!(back, original, "every key must survive a write/read cycle");
+        // A missing file yields defaults rather than an error.
+        assert_eq!(load_or_default(&dir.join("absent.toml")), Config::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

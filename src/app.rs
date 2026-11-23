@@ -1726,6 +1726,34 @@ impl AppController {
                     ui_win.show_command_palette();
                 }
             }
+            ActionId::Settings => {
+                if let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.show_settings_dialog();
+                }
+            }
+            ActionId::SaveSession => {
+                if let Err(err) = self.save_session() {
+                    eprintln!("failed to save session: {err}");
+                }
+            }
+            ActionId::CloseTab => {
+                let target = active_win.and_then(|w| {
+                    self.workspace
+                        .borrow()
+                        .window(w)
+                        .map(|wm| (w, wm.active_tab))
+                });
+                if let Some((w, t)) = target {
+                    self.close_tab(w, t);
+                }
+            }
+            ActionId::CloseWindow => {
+                if let Some(w) = active_win {
+                    self.close_window(w);
+                }
+            }
             ActionId::NewSession => {
                 if let Some(win_id) = active_win
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
