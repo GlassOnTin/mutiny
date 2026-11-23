@@ -19,6 +19,45 @@ fn settle(ctrl: &Rc<AppController>, rounds: usize) {
     }
 }
 
+/// Collects the visible text of the menu items GTK actually built.
+///
+/// GtkModelButton is not a GtkButton in GTK4 and does not expose its action
+/// publicly, so a test cannot click it through the public API. What it CAN
+/// check is that the model produced real item widgets with the right labels,
+/// which is the half a model-only test misses. The other half, that the menu
+/// keeps its widget path so those items can resolve their actions, is the
+/// parented-after-popdown assertion in the test below.
+fn rendered_menu_items(pop: &gtk4::PopoverMenu) -> Vec<String> {
+    fn label_of(w: &gtk4::Widget) -> Option<String> {
+        if let Some(l) = w.downcast_ref::<gtk4::Label>() {
+            return Some(l.text().to_string());
+        }
+        let mut c = w.first_child();
+        while let Some(ch) = c {
+            if let Some(found) = label_of(&ch) {
+                return Some(found);
+            }
+            c = ch.next_sibling();
+        }
+        None
+    }
+    fn walk(w: &gtk4::Widget, out: &mut Vec<String>) {
+        if w.type_().name() == "GtkModelButton"
+            && let Some(text) = label_of(w)
+        {
+            out.push(text);
+        }
+        let mut c = w.first_child();
+        while let Some(ch) = c {
+            walk(&ch, out);
+            c = ch.next_sibling();
+        }
+    }
+    let mut out = Vec::new();
+    walk(pop.upcast_ref::<gtk4::Widget>(), &mut out);
+    out
+}
+
 #[test]
 fn tab_targeted_actions_fire_and_a_rename_dialog_opens() {
     if gtk4::init().is_err() {
@@ -107,6 +146,28 @@ esac
         menu.parent().is_some(),
         "the menu must stay parented after closing, or its actions cannot resolve"
     );
+
+    // The model must produce REAL item widgets with the right labels. A
+    // model-only test cannot see whether GTK actually built them.
+    let model = mutiny::action::build_tab_menu_model(true, t_attached.0);
+    menu.set_menu_model(Some(&model));
+    menu.popup();
+    settle(&ctrl, 12);
+    let rendered = rendered_menu_items(&menu);
+    for expected in [
+        "Rename Session…",
+        "Copy Session Name",
+        "Close Tab (session keeps running)",
+        "Move to New Window",
+        "End Session…",
+    ] {
+        assert!(
+            rendered.iter().any(|r| r == expected),
+            "GTK must build a real item for {expected:?}, got {rendered:?}"
+        );
+    }
+    menu.popdown();
+    settle(&ctrl, 6);
 
     // Rename on an attached tab must open a dialog window.
     let before = gtk4::Window::toplevels().n_items();

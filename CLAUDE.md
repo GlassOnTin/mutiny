@@ -311,6 +311,8 @@ Avoid "detach" for moving a pane to another window: to a tmux user detaching mea
 
 `ActionId::NewTab` honours `preferred_mux`; the IPC `SpawnTab` verb deliberately does not, because agents and scripts ask for a shell explicitly.
 
+**What a GUI test can and cannot reach.** GtkModelButton is not a GtkButton in GTK4 and does not expose its action publicly, so a test cannot click a popover item through the public API. Driving `activate_action` on the window works but bypasses the popover, which is exactly why it passed while every item was dead. The reachable pair is: assert the popped-up menu built real GtkModelButton widgets with the expected labels (`rendered_menu_items` walks the widget tree), and assert the menu keeps its parent after a popdown so those items can resolve their actions. Both were mutation-checked. Pointer synthesis via xdotool was unreliable for popovers and is not the answer.
+
 **The tab context menu is parented to the WINDOW and reused.** The first version created a popover per right-click, parented it to the tab button, and unparented it on `closed`. Every item then did nothing: GTK emits `closed` BEFORE activating the action, so unparenting removed the widget path the action resolves through. The terminal view's menu has always used parent-once-and-reuse; the tab menu now does too, swapping its model per tab and translating the gesture's button-relative coordinates with `compute_point`. `tests/tab_actions.rs` asserts the menu stays parented after a popdown, which is the invariant that broke.
 
 **A parameterised gio action needs its target on the MENU ITEM**, not just the action name. `menu.append(label, action)` on an action that takes a parameter renders the item insensitive and it never fires. `build_tab_menu_model(attached, tab)` uses `MenuItem::set_action_and_target_value`. A screenshot cannot distinguish "rendered but dead" from working, which is why `tests/tab_actions.rs` drives the real actions with `activate_action` instead of trusting the picture.
@@ -393,7 +395,7 @@ These look closer to done than they are:
 
 - **Kitty graphics is a slice.** No animation frames, file or shared-memory transmission, unicode placeholders, or cursor-movement policies. Placements drift once scrollback is capped, sharing the OSC 133 marker limitation.
 - **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
-- **No in-app settings UI.** The TOML file is the only config surface.
+- **The Settings dialog writes the file; it is not a live editor.** It covers every key, but a malformed hand-edited file still falls back to the previous config, and there is no per-key validation feedback in the dialog.
 - **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Mutiny-owned shells are never restored, by contract; multiplexer-attached panes re-attach because the multiplexer owns those processes.
 - **No quick terminal yet (M2).**
 - **Multiplexer panes get no shell integration.** tmux classifies as `ShellKind::Other`, so no OSC 133/7 injection; prompt jumping and command capture do not work inside them.
