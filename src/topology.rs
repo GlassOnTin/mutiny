@@ -193,6 +193,10 @@ pub struct WindowModel {
     pub tabs: Vec<TabModel>,
     pub active_tab: TabId,
     pub menubar_visible: bool,
+    /// The summonable quick terminal. A WM close dismisses it instead of
+    /// ending its shell, so the flag travels with the saved layout.
+    #[serde(default)]
+    pub quick: bool,
 }
 
 impl WindowModel {
@@ -240,6 +244,10 @@ impl std::error::Error for TopologyError {}
 pub struct WorkspaceSummary {
     pub active_window: Option<WindowId>,
     pub windows: Vec<WindowSummary>,
+    /// Whether the quick terminal is currently summoned. The controller fills
+    /// this in, because the summoned flag lives there rather than in the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_visible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +255,9 @@ pub struct WindowSummary {
     pub id: WindowId,
     pub active_tab: TabId,
     pub menubar_visible: bool,
+    /// The summonable scratch window, whose WM close dismisses rather than ends it.
+    #[serde(default)]
+    pub quick: bool,
     pub tabs: Vec<TabSummary>,
 }
 
@@ -425,6 +436,7 @@ impl Workspace {
             tabs: vec![tab],
             active_tab: tab_id,
             menubar_visible,
+            quick: false,
         };
         self.windows.push(win);
         self.active_window = Some(win_id);
@@ -502,6 +514,7 @@ impl Workspace {
             }],
             active_tab: new_tab_id,
             menubar_visible,
+            quick: false,
         });
         self.active_window = Some(new_win_id);
         Ok((new_win_id, new_tab_id))
@@ -770,6 +783,7 @@ impl Workspace {
                 id: w.id,
                 active_tab: w.active_tab,
                 menubar_visible: w.menubar_visible,
+                quick: w.quick,
                 tabs: w
                     .tabs
                     .iter()
@@ -807,6 +821,7 @@ impl Workspace {
         WorkspaceSummary {
             active_window: self.active_window,
             windows,
+            quick_visible: None,
         }
     }
 }

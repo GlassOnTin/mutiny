@@ -63,6 +63,7 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::ListSessions { .. } => Some(McpSurface::Tool("list_sessions")),
         IpcRequest::OpenSession { .. } => Some(McpSurface::Tool("open_session")),
         IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
+        IpcRequest::ToggleQuick => Some(McpSurface::Tool("toggle_quick")),
         IpcRequest::NewSession { .. } => Some(McpSurface::Tool("new_session")),
         IpcRequest::RenameSession { .. } => Some(McpSurface::Tool("rename_session")),
         IpcRequest::ProposePolicy { .. } => Some(McpSurface::Tool("propose_policy")),
@@ -576,6 +577,7 @@ impl McpBridge {
                 )
             }
             "save_session" => (IpcRequest::SaveSession, Duration::from_secs(15)),
+            "toggle_quick" => (IpcRequest::ToggleQuick, Duration::from_secs(15)),
             "new_session" => {
                 let kind = match args.get("kind").and_then(Value::as_str) {
                     None | Some("tmux") => Some(crate::mux::MuxKind::Tmux),
@@ -1101,6 +1103,11 @@ pub fn tool_definitions() -> Value {
                     "host": { "type": "string" }
                 }
             }
+        },
+        {
+            "name": "toggle_quick",
+            "description": "Tier-2 Act: summon or dismiss the quick terminal, a scratch shell in its own window that keeps running while dismissed. Returns the window id and whether it is now showing. Summoning raises the window; it is not pinned above others, because GTK4 has no keep-above API.",
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "save_session",

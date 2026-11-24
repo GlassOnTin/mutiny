@@ -312,7 +312,19 @@ impl MutinyWindow {
                 if !inner.closing_programmatically.get()
                     && let Some(ctrl) = inner.controller.upgrade()
                 {
-                    ctrl.handle_window_closed(inner.window_id);
+                    // A WM close on the quick terminal dismisses it. GTK's
+                    // hide-on-close does the hiding; ending the window here
+                    // would kill the scratch shell the toggle promises to keep.
+                    let quick = ctrl
+                        .workspace
+                        .borrow()
+                        .window(inner.window_id)
+                        .is_some_and(|w| w.quick);
+                    if quick {
+                        ctrl.mark_quick_dismissed();
+                    } else {
+                        ctrl.handle_window_closed(inner.window_id);
+                    }
                 }
             }
             glib::Propagation::Proceed
@@ -656,6 +668,20 @@ impl MutinyWindow {
             crate::desktop::APP_ID
         };
         self.inner.gtk_window.set_icon_name(Some(name));
+    }
+
+    /// Makes a WM close hide this window instead of destroying it, so the
+    /// quick terminal's shell keeps running while it is dismissed.
+    pub fn set_hide_on_close(&self, hide: bool) {
+        self.inner.gtk_window.set_hide_on_close(hide);
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.inner.gtk_window.is_visible()
+    }
+
+    pub fn hide(&self) {
+        self.inner.gtk_window.set_visible(false);
     }
 
     /// The tab context menu, for tests that check its lifetime.

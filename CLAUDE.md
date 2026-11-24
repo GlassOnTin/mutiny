@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v20). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore, the authenticated HTTP MCP listener with per-peer identity and per-peer consent mode, and a tmux/zellij session picker are shipped; the next rung is the quick terminal. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v20). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore, the authenticated HTTP MCP listener with per-peer identity and per-peer consent mode, and a tmux/zellij session picker are shipped. The quick terminal is shipped as a summonable scratch window, not a layer-shell drop-down; a system-wide global shortcut is not. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 200 tests: 108 unit + 7 config + 11 e2e + 7 http + 15 mux + 5 menuia + 6 manage + 4 mouse + 1 sessmenu + 1 restoregui + 1 settings + 3 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 203 tests: 108 unit + 7 config + 11 e2e + 7 http + 10 mux + 5 menuia + 6 manage + 4 mouse + 3 quick + 1 sessmenu + 1 restoregui + 1 settings + 3 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -248,6 +248,16 @@ Two shell facts worth remembering when editing snippets: fish 4 emits OSC 133 na
 
 `tests/shell_integration.rs` is its own test binary with a single test because it sets process-wide `HOME`, `SHELL`, and `XDG_RUNTIME_DIR` to simulate a fresh install. Keep it that way: adding a second test to that file would race on the environment.
 
+### The quick terminal
+
+`toggle_quick_terminal` summons or dismisses one scratch window. `WindowModel.quick` marks it, and that flag is persisted with the layout, so a restore brings it back dismissed. `prepare_quick_window` sets `hide_on_close`, and the window's `close_request` handler checks the flag: a WM close calls `mark_quick_dismissed` and lets GTK hide it, while the explicit `close_window` verb still destroys it. Keep those two paths distinct; collapsing them either kills the scratch shell on a WM close or makes Close Window a no-op.
+
+The summoned flag is `quick_visible: Cell<bool>` on the controller, not a read of `GtkWindow::is_visible`, so the toggle state machine is testable headlessly. The GTK calls are guarded on a view existing.
+
+It is a plain shell regardless of `sessions.preferred`: a scratch pane should not leave a multiplexer session behind. `SpawnTab` and the IPC surface are unchanged.
+
+There is no keep-above. GTK4 removed `set_keep_above` and `set_skip_taskbar_hint`, so summoning raises the window with `present()` and that is the whole of the stacking behaviour. Do not write docs claiming otherwise.
+
 ### Grid coordinates
 
 In alacritty, `Line(0)` is the top of the visible screen and negative lines are scrollback; `display_offset` is how far the viewport is scrolled up. Because `history_size` grows as lines scroll off, prompt markers and command-output bounds are stored as `line_from_history_top = history_size + cursor.line.0`, an absolute coordinate stable across scrolling. `jump_prev_prompt`, `jump_next_prompt`, and `extract_command_output` all translate between the two. Mixing them up silently targets the wrong line.
@@ -409,7 +419,7 @@ These look closer to done than they are:
 - **The D-Bus notification send is untested.** CI has no session bus; forwarding is verified through an injected recorder, and the no-bus path is verified not to panic.
 - **The Settings dialog writes the file; it is not a live editor.** It covers every key, but a malformed hand-edited file still falls back to the previous config, and there is no per-key validation feedback in the dialog.
 - **Session restore is text-only and save-on-exit.** Restored scrollback loses colors and attributes; a crash loses changes since the last clean save. Mutiny-owned shells are never restored, by contract; multiplexer-attached panes re-attach because the multiplexer owns those processes.
-- **No quick terminal yet (M2).**
+- **The quick terminal is a summonable window, not a drop-down.** No layer-shell, so no always-on-top (GTK4 has no `set_keep_above` and Wayland has no protocol for it), no taskbar skip, and no animation. The chord works only while mutiny has focus; a system-wide global shortcut needs layer-shell or a per-compositor binding. Verified under Xvfb and live on KWin Wayland; a physical keypress was not synthesised.
 - **Multiplexer panes get no shell integration.** tmux classifies as `ShellKind::Other`, so no OSC 133/7 injection; prompt jumping and command capture do not work inside them.
 - **Only tmux and zellij are discovered.** screen, abduco, and dtach are not.
 - **The HTTP MCP carrier is a slice.** No SSE, session management, or DELETE. Requests are stateless, so `initialize`'s client name does not persist. Identity, session grants, and consent mode are all per token. Driven end to end from Haven on a phone over an SSH local forward: unpaired 401, paired 200, a command sent and its output read back, `spawn_pane` and `present_notice` accepted, and both Act verbs denied when the carrier was pinned to `observe-only`. Also driven over a real WireGuard tunnel with the listener bound to the workstation's WG address, so both named transports are exercised.

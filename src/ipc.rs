@@ -202,6 +202,8 @@ pub enum IpcRequest {
     /// Writes the current layout and opened session list to the state file now,
     /// without waiting for a clean exit. Lets a layout be snapshotted on demand.
     SaveSession,
+    /// Summon or dismiss the quick terminal.
+    ToggleQuick,
     /// Closes a pane. If it is the last pane of a tab the tab goes, and if that
     /// was the last tab the window goes. The symmetric counterpart to the spawn
     /// verbs, which previously had no matching close.
@@ -318,6 +320,7 @@ impl IpcRequest {
             }
             IpcRequest::OpenSession { .. } => ConsentTier::Act,
             IpcRequest::SaveSession => ConsentTier::Act,
+            IpcRequest::ToggleQuick => ConsentTier::Act,
             IpcRequest::NewSession { .. } => ConsentTier::Act,
             IpcRequest::RenameSession { .. } => ConsentTier::Act,
             IpcRequest::ProposePolicy { .. } => ConsentTier::Observe,
@@ -397,6 +400,7 @@ impl IpcRequest {
             IpcRequest::ListSessions { .. } => "list-sessions",
             IpcRequest::OpenSession { .. } => "open-session",
             IpcRequest::SaveSession => "save-session",
+            IpcRequest::ToggleQuick => "toggle-quick",
             IpcRequest::NewSession { .. } => "new-session",
             IpcRequest::RenameSession { .. } => "rename-session",
             IpcRequest::ProposePolicy { .. } => "propose-policy",
@@ -618,6 +622,9 @@ pub enum IpcResponse {
         policies: Option<Vec<crate::policy::StandingPolicy>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pending_policies: Option<Vec<crate::policy::StandingPolicy>>,
+        /// Whether a toggled window is now showing rather than dismissed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        visible: Option<bool>,
     },
     Error {
         message: String,
@@ -648,6 +655,7 @@ impl IpcResponse {
             policy_id: None,
             policies: None,
             pending_policies: None,
+            visible: None,
         }
     }
 
@@ -1088,6 +1096,7 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             pane: None,
         },
         IpcRequest::SaveSession,
+        IpcRequest::ToggleQuick,
         IpcRequest::NewSession {
             kind: Some(crate::mux::MuxKind::Tmux),
             name: Some(String::from("mutiny-probe")),
@@ -1156,6 +1165,7 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::ListSessions { .. } => 22,
         IpcRequest::OpenSession { .. } => 23,
         IpcRequest::SaveSession => 24,
+        IpcRequest::ToggleQuick => 36,
         IpcRequest::NewSession { .. } => 29,
         IpcRequest::RenameSession { .. } => 30,
         IpcRequest::ProposePolicy { .. } => 32,

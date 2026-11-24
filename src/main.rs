@@ -284,6 +284,8 @@ enum CtlVerb {
     },
     /// Write the current layout and session list to the state file now
     SaveSession,
+    /// Summon or dismiss the quick terminal (a scratch shell that keeps running)
+    ToggleQuick,
     /// Close a pane (defaults to the active one)
     ClosePane {
         #[arg(long)]
@@ -619,6 +621,7 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             }
         }
         CtlVerb::SaveSession => IpcRequest::SaveSession,
+        CtlVerb::ToggleQuick => IpcRequest::ToggleQuick,
         CtlVerb::ClosePane { pane } => IpcRequest::ClosePane {
             pane: pane.map(PaneId),
         },

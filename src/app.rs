@@ -180,6 +180,9 @@ pub struct AppController {
     /// token-derived identity of an HTTP peer rather than this process's pid.
     dispatch_peer: Cell<PeerIdentity>,
     unattached_filter: Cell<bool>,
+    /// Whether the quick terminal is currently summoned. The controller owns
+    /// this rather than reading GTK, so the toggle is testable headlessly.
+    quick_visible: Cell<bool>,
     last_discovery_started: Cell<Option<Instant>>,
     /// In-flight one-shot multiplexer commands (rename). Same tick-polled shape
     /// as discovery: a rename may go over ssh, so it must not block the loop.
@@ -272,6 +275,7 @@ impl AppController {
             pending_policies: RefCell::new(Vec::new()),
             dispatch_peer: Cell::new(PeerIdentity::default()),
             unattached_filter: Cell::new(false),
+            quick_visible: Cell::new(false),
             last_discovery_started: Cell::new(None),
             mux_commands: RefCell::new(Vec::new()),
             agent_socket_path: RefCell::new(None),
@@ -382,6 +386,13 @@ impl AppController {
         for id in ids {
             self.ensure_ui_window(id);
             self.sync_ui_window(id);
+            if self.workspace.borrow().window(id).is_some_and(|w| w.quick) {
+                self.prepare_quick_window(id);
+                self.quick_visible.set(false);
+                if let Some(ui) = self.ui_windows.borrow().get(&id).cloned() {
+                    ui.hide();
+                }
+            }
         }
         Ok(count)
     }
@@ -1706,6 +1717,71 @@ impl AppController {
         true
     }
 
+    /// Marks a window as the quick terminal: a WM close dismisses it instead
+    /// of ending its shell.
+    fn prepare_quick_window(&self, win_id: WindowId) {
+        if let Some(win) = self.workspace.borrow_mut().window_mut(win_id) {
+            win.quick = true;
+        }
+        if let Some(ui) = self.ui_windows.borrow().get(&win_id).cloned() {
+            ui.set_hide_on_close(true);
+        }
+    }
+
+    pub fn quick_visible(&self) -> bool {
+        self.quick_visible.get()
+    }
+
+    /// A WM close dismissed the quick terminal. The window and its shell stay.
+    pub fn mark_quick_dismissed(&self) {
+        self.quick_visible.set(false);
+    }
+
+    /// Summons or dismisses the quick terminal, returning its window and
+    /// whether it is now showing.
+    ///
+    /// The shell keeps running while dismissed, so this is a scratch pane you
+    /// can reach with one keystroke rather than a new session each time. It is
+    /// a plain shell, not the preferred multiplexer: a scratch pane should not
+    /// leave a session behind.
+    ///
+    /// It is NOT pinned above other windows. GTK4 has no keep-above API and
+    /// Wayland has no protocol for it, so summoning raises the window and
+    /// dismissing hides it, and that is the whole of the stacking behaviour.
+    pub fn toggle_quick_terminal(self: &Rc<Self>) -> io::Result<(WindowId, bool)> {
+        let existing = self
+            .workspace
+            .borrow()
+            .windows()
+            .iter()
+            .find(|w| w.quick)
+            .map(|w| w.id);
+        let win_id = match existing {
+            Some(id) => id,
+            None => {
+                let (id, _tab, _pane) = self.create_window(None)?;
+                self.prepare_quick_window(id);
+                self.quick_visible.set(false);
+                id
+            }
+        };
+        let show = !self.quick_visible.get();
+        self.quick_visible.set(show);
+        if let Some(ui) = self.ui_windows.borrow().get(&win_id).cloned() {
+            if show {
+                ui.set_hide_on_close(true);
+                ui.gtk_window().set_visible(true);
+                ui.gtk_window().present();
+            } else {
+                ui.hide();
+            }
+        }
+        if show {
+            self.workspace.borrow_mut().set_active_window(win_id);
+        }
+        Ok((win_id, show))
+    }
+
     /// Closes a whole window and every pane in it.
     pub fn close_window(self: &Rc<Self>, win_id: WindowId) -> bool {
         if self.workspace.borrow().window(win_id).is_none() {
@@ -1731,6 +1807,14 @@ impl AppController {
     }
 
     pub fn handle_window_closed(&self, win_id: WindowId) {
+        if self
+            .workspace
+            .borrow()
+            .window(win_id)
+            .is_some_and(|w| w.quick)
+        {
+            self.quick_visible.set(false);
+        }
         self.save_before_last_window_goes();
         self.ui_windows.borrow_mut().remove(&win_id);
         let _dropped = self.workspace.borrow_mut().close_window(win_id);
@@ -1877,6 +1961,11 @@ impl AppController {
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
                 {
                     ui_win.show_settings_dialog();
+                }
+            }
+            ActionId::QuickTerminal => {
+                if let Err(err) = self.toggle_quick_terminal() {
+                    eprintln!("could not toggle the quick terminal: {err}");
                 }
             }
             ActionId::SaveSession => {
@@ -2344,7 +2433,10 @@ impl AppController {
     ) -> Option<IpcResponse> {
         match req {
             IpcRequest::List => {
-                let summary = self.workspace.borrow().summary();
+                let mut summary = self.workspace.borrow().summary();
+                if summary.windows.iter().any(|w| w.quick) {
+                    summary.quick_visible = Some(self.quick_visible.get());
+                }
                 let mut resp = IpcResponse::empty_ok();
                 if let IpcResponse::Ok { workspace, .. } = &mut resp {
                     *workspace = Some(summary);
@@ -2508,6 +2600,24 @@ impl AppController {
             } => match self.rename_session(kind, &name, &new_name, host.as_deref()) {
                 Ok(()) => Some(IpcResponse::empty_ok()),
                 Err(err) => Some(IpcResponse::err(err.to_string())),
+            },
+            IpcRequest::ToggleQuick => match self.toggle_quick_terminal() {
+                Ok((window, visible)) => {
+                    let mut resp = IpcResponse::empty_ok();
+                    if let IpcResponse::Ok {
+                        window: w,
+                        visible: v,
+                        ..
+                    } = &mut resp
+                    {
+                        *w = Some(window);
+                        *v = Some(visible);
+                    }
+                    Some(resp)
+                }
+                Err(err) => Some(IpcResponse::err(format!(
+                    "could not toggle the quick terminal: {err}"
+                ))),
             },
             IpcRequest::SaveSession => match self.save_session() {
                 Ok(()) => Some(IpcResponse::empty_ok()),
@@ -3231,6 +3341,7 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         policy_id: None,
         policies: None,
         pending_policies: None,
+        visible: None,
     }
 }
 
