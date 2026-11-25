@@ -1,0 +1,375 @@
+//! Minimal pure-Rust cryptographic primitives for M3 bilateral peer pairing
+//! and signed consent envelopes: SHA-256 (FIPS 180-4 / RFC 6234), HMAC-SHA256
+//! (RFC 2104), constant-time slice comparison, and kernel CSPRNG token
+//! generation (`libc::getrandom`).
+
+use std::io;
+
+use base64::Engine;
+
+const H0: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+const K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// Streaming SHA-256 state so large messages and HMAC inner/outer passes need
+/// no heap allocation.
+#[derive(Clone)]
+pub struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    pub const fn new() -> Self {
+        Self {
+            state: H0,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..64].copy_from_slice(&data[..need]);
+            let block = self.buf;
+            compress_block(&mut self.state, &block);
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+
+        let (blocks, remainder) = data.as_chunks::<64>();
+        for block in blocks {
+            compress_block(&mut self.state, block);
+        }
+        if !remainder.is_empty() {
+            self.buf[..remainder.len()].copy_from_slice(remainder);
+            self.buf_len = remainder.len();
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_bytes.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            let block = self.buf;
+            compress_block(&mut self.state, &block);
+            self.buf_len = 0;
+        }
+        self.buf[self.buf_len..56].fill(0);
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buf;
+        compress_block(&mut self.state, &block);
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+        w[i] = u32::from_be_bytes(*chunk);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
+}
+
+/// Computes SHA-256 (FIPS 180-4 / RFC 6234).
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/// Lowercase hexadecimal SHA-256 digest.
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex_encode(&sha256(data))
+}
+
+/// Computes HMAC-SHA256 (RFC 2104).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut key_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha256(key);
+        key_block[..32].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(msg);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_digest);
+    outer.finalize()
+}
+
+/// Length-independent byte comparison over equal-length slices. `black_box`
+/// keeps the optimizer from turning the XOR accumulator into an early-exit loop.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= std::hint::black_box(x ^ y);
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Fills `buf` from the Linux kernel CSPRNG via `libc::getrandom`.
+pub fn fill_random(buf: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let rc = unsafe {
+            libc::getrandom(
+                buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - filled,
+                0,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        filled += rc as usize;
+    }
+    Ok(())
+}
+
+/// Generates a 256-bit pairing token encoded as `"mty_"` plus base64url without
+/// padding (47 characters total).
+pub fn generate_pairing_token() -> io::Result<String> {
+    let mut raw = [0u8; 32];
+    fill_random(&mut raw)?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+    Ok(format!("mty_{encoded}"))
+}
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+pub fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    let trimmed = hex.trim();
+    if !trimmed.len().is_multiple_of(2) {
+        return Err(String::from("hex string must have even length"));
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let raw = trimmed.as_bytes();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let hi = (raw[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit at byte {i}"))?;
+        let lo = (raw[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit at byte {}", i + 1))?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+pub fn hex_decode_32(hex: &str) -> Result<[u8; 32], String> {
+    let bytes = hex_decode(hex)?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        format!(
+            "expected 32-byte digest (64 hex chars), got {} bytes",
+            v.len()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_nist_fips_180_4_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+
+        // 1,000,000 repetitions of 'a', fed in awkward 1000-byte chunks to
+        // exercise cross-block buffering.
+        let mut streaming = Sha256::new();
+        let chunk = [b'a'; 1000];
+        for _ in 0..1000 {
+            streaming.update(&chunk);
+        }
+        assert_eq!(
+            hex_encode(&streaming.finalize()),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_vectors() {
+        // Test Case 1
+        let key1 = [0x0bu8; 20];
+        assert_eq!(
+            hex_encode(&hmac_sha256(&key1, b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+
+        // Test Case 2 ("Jefe")
+        assert_eq!(
+            hex_encode(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+
+        // Test Case 3
+        let key3 = [0xaau8; 20];
+        let data3 = [0xddu8; 50];
+        assert_eq!(
+            hex_encode(&hmac_sha256(&key3, &data3)),
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
+        );
+
+        // Test Case 4
+        let key4 = hex_decode("0102030405060708090a0b0c0d0e0f10111213141516171819").unwrap();
+        let data4 = [0xcdu8; 50];
+        assert_eq!(
+            hex_encode(&hmac_sha256(&key4, &data4)),
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
+        );
+
+        // Test Case 6: 131-byte key (> 64-byte block size, exercises key hashing)
+        let key6 = [0xaau8; 131];
+        assert_eq!(
+            hex_encode(&hmac_sha256(
+                &key6,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+
+        // Test Case 7: 131-byte key + multi-block message
+        assert_eq!(
+            hex_encode(&hmac_sha256(
+                &key6,
+                b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm."
+            )),
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
+        );
+    }
+
+    #[test]
+    fn constant_time_comparison_and_token_generation() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"same-digest", b"same-digest"));
+        assert!(!constant_time_eq(b"same-digest", b"same-digesu"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+
+        let t1 = generate_pairing_token().expect("getrandom token 1");
+        let t2 = generate_pairing_token().expect("getrandom token 2");
+        assert!(t1.starts_with("mty_"), "got {t1}");
+        assert_eq!(t1.len(), 4 + 43, "32 bytes base64url-no-pad is 43 chars");
+        assert_ne!(t1, t2);
+        assert!(
+            t1[4..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must be URL-safe base64 without padding: {t1}"
+        );
+    }
+}

@@ -11,7 +11,7 @@ use gtk4::prelude::*;
 use mutiny::action::{ACTIONS, build_menubar_model, by_slug};
 use mutiny::app::AppController;
 use mutiny::config::{self, Overrides};
-use mutiny::http_mcp::{self, HttpMcpConfig, HttpPeer};
+use mutiny::http_mcp;
 use mutiny::ipc::{
     ConsentMode, IpcRequest, IpcResponse, agent_socket_path, default_audit_path,
     default_socket_path, send_request,
@@ -83,6 +83,16 @@ struct Cli {
     /// assignable to a peer.
     #[arg(long = "http-peer", value_name = "LABEL=TOKEN[:MODE]")]
     http_peers: Vec<String>,
+
+    /// GUI only: disable symmetric unauthenticated `initialize` tap-to-pair on
+    /// `--http-bind`.
+    #[arg(long)]
+    no_http_pair: bool,
+
+    /// GUI only: allow link-local or LAN hostnames for outbound Haven peer
+    /// URLs (public internet plaintext HTTP remains refused).
+    #[arg(long)]
+    allow_lan_peer: bool,
 
     #[command(subcommand)]
     command: Option<TopCommand>,
@@ -265,6 +275,24 @@ enum CtlVerb {
     InstallPolicy { id: u64 },
     /// Revoke a standing policy
     RevokePolicy { id: u64 },
+    /// List paired inbound HTTP MCP peers and outbound Haven limbs with live status
+    #[command(alias = "peers")]
+    ListPeers,
+    /// Pair an outbound Haven HTTP MCP limb over loopback or an encrypted tunnel
+    PairHaven {
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        url: String,
+        /// Optional pre-shared Bearer token; omit for interactive tap-to-pair on Haven
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Revoke an inbound or outbound paired peer immediately in memory and peers.json
+    RevokePeer {
+        #[arg(long)]
+        id_or_label: String,
+    },
     /// END a multiplexer session: everything running inside it stops
     EndSession {
         name: String,
@@ -430,7 +458,9 @@ fn main() -> ExitCode {
                 bind,
                 token: cli.http_token,
                 peers: cli.http_peers,
+                no_pair: cli.no_http_pair,
             }),
+            cli.allow_lan_peer,
             Overrides {
                 font_family: cli.font,
                 font_size: cli.font_size,
@@ -454,6 +484,9 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::Sessions { host: None, .. }
         | CtlVerb::RenameSession { host: None, .. }
         | CtlVerb::EndSession { host: None, .. } => Duration::from_secs(15),
+        CtlVerb::PairHaven { token: None, .. } => Duration::from_secs(70),
+        CtlVerb::PairHaven { token: Some(_), .. } => Duration::from_secs(20),
+        CtlVerb::RevokePeer { .. } => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     };
 
@@ -592,6 +625,9 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::ListPolicies => IpcRequest::ListPolicies,
         CtlVerb::InstallPolicy { id } => IpcRequest::InstallPolicy { id },
         CtlVerb::RevokePolicy { id } => IpcRequest::RevokePolicy { id },
+        CtlVerb::ListPeers => IpcRequest::ListPeers,
+        CtlVerb::PairHaven { label, url, token } => IpcRequest::PairHaven { label, url, token },
+        CtlVerb::RevokePeer { id_or_label } => IpcRequest::RevokePeer { id_or_label },
         CtlVerb::EndSession { name, kind, host } => {
             let kind = match kind.as_str() {
                 "tmux" => mutiny::mux::MuxKind::Tmux,
@@ -755,8 +791,10 @@ struct HttpOptions {
     bind: std::net::SocketAddr,
     token: Option<String>,
     peers: Vec<String>,
+    no_pair: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_gui_app(
     socket_path: PathBuf,
     initial_cwd: Option<PathBuf>,
@@ -764,6 +802,7 @@ fn run_gui_app(
     agent_consent: ConsentMode,
     no_restore: bool,
     http: Option<HttpOptions>,
+    allow_lan_peer: bool,
     overrides: Overrides,
 ) -> ExitCode {
     if socket_path.exists()
@@ -793,6 +832,7 @@ fn run_gui_app(
         config::config_path(),
         overrides,
     );
+    controller.set_allow_lan_peer(allow_lan_peer);
 
     if let Err(err) = controller.start_ipc_listener(&socket_path) {
         eprintln!(
@@ -814,6 +854,15 @@ fn run_gui_app(
     // peer can never be assigned Operator.
     let mut http_handle = None;
     if let Some(http) = http {
+        let agent_base = agent_socket_path(&socket_path);
+        let durable_count = match controller.bind_durable_inbound_peers(&agent_base) {
+            Ok(n) => n,
+            Err(err) => {
+                eprintln!("warning: could not bind durable inbound peers: {err}");
+                0
+            }
+        };
+
         let mut specs: Vec<(String, String, ConsentMode)> = Vec::new();
         for raw in &http.peers {
             match http_mcp::parse_http_peer(raw, agent_consent) {
@@ -821,51 +870,47 @@ fn run_gui_app(
                 Err(err) => eprintln!("warning: ignoring --http-peer {raw:?}: {err}"),
             }
         }
-        if specs.is_empty() {
-            let token = match http.token {
-                Some(token) => token,
-                None => match http_mcp::generate_token() {
-                    Ok(token) => {
-                        eprintln!("mutiny: HTTP MCP pairing token: {token}");
-                        token
-                    }
-                    Err(err) => {
-                        // An empty token is refused by validate_peers, so a
-                        // failed CSPRNG read leaves the listener down, not open.
-                        eprintln!("warning: could not generate a pairing token: {err}");
-                        String::new()
-                    }
-                },
-            };
+        if let Some(token) = http.token {
             specs.push((String::from("http-peer"), token, agent_consent));
-        }
-
-        let agent_base = agent_socket_path(&socket_path);
-        let mut peers = Vec::new();
-        for (index, (label, token, mode)) in specs.iter().enumerate() {
-            let path = http_peer_socket_path(&agent_base, index);
-            match controller.start_http_peer_listener(&path, token, label, *mode) {
-                Ok(()) => peers.push(HttpPeer {
-                    label: label.clone(),
-                    token: token.clone(),
-                    socket: path,
-                }),
-                Err(err) => eprintln!("warning: HTTP peer {label:?} not started: {err}"),
+        } else if specs.is_empty() && durable_count == 0 && http.no_pair {
+            match http_mcp::generate_token() {
+                Ok(token) => {
+                    eprintln!("mutiny: HTTP MCP pairing token: {token}");
+                    specs.push((String::from("http-peer"), token, agent_consent));
+                }
+                Err(err) => {
+                    eprintln!("warning: could not generate a pairing token: {err}");
+                }
             }
         }
-        let labels: Vec<String> = specs
-            .iter()
-            .map(|(label, _, mode)| format!("{label}({})", http_mcp::mode_label(*mode)))
-            .collect();
-        match http_mcp::spawn(HttpMcpConfig {
-            bind: http.bind,
-            peers,
-        }) {
+
+        for (index, (label, token, mode)) in specs.iter().enumerate() {
+            let path = http_peer_socket_path(&agent_base, index);
+            if let Err(err) = controller.start_http_peer_listener(&path, token, label, *mode) {
+                eprintln!("warning: HTTP peer {label:?} not started: {err}");
+            }
+        }
+
+        let pairing_gate = if http.no_pair {
+            None
+        } else {
+            let (gate, rx) = http_mcp::new_pairing_gate();
+            controller.attach_pairing_receiver(rx);
+            Some(gate)
+        };
+
+        match http_mcp::spawn_pairable(http.bind, controller.inbound_peer_table(), pairing_gate) {
             Ok(handle) => {
+                let total_peers = controller
+                    .inbound_peer_table()
+                    .read()
+                    .map(|t| t.len())
+                    .unwrap_or(0);
                 eprintln!(
-                    "mutiny: HTTP MCP listening on {} for peers: {}",
+                    "mutiny: HTTP MCP listening on {} ({} paired peers, tap-to-pair {})",
                     handle.local_addr,
-                    labels.join(", ")
+                    total_peers,
+                    if http.no_pair { "disabled" } else { "enabled" }
                 );
                 http_handle = Some(handle);
             }

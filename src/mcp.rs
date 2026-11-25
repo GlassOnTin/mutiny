@@ -17,6 +17,20 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 /// set instead of echoing whatever the client asked for.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
+/// Negotiates an MCP protocol revision against the set Mutiny implements.
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    let ver = requested.unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&ver) {
+        SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|&v| v == ver)
+            .unwrap_or(DEFAULT_PROTOCOL_VERSION)
+    } else {
+        DEFAULT_PROTOCOL_VERSION
+    }
+}
+
 /// Resource URIs that exist regardless of workspace contents. Single source
 /// for `resources/list`, `resources/read`, and the parity test.
 pub const STATIC_RESOURCES: &[&str] = &[
@@ -70,6 +84,9 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::ListPolicies => Some(McpSurface::Tool("list_policies")),
         IpcRequest::InstallPolicy { .. } => Some(McpSurface::Tool("install_policy")),
         IpcRequest::RevokePolicy { .. } => Some(McpSurface::Tool("revoke_policy")),
+        IpcRequest::ListPeers => Some(McpSurface::Tool("list_peers")),
+        IpcRequest::PairHaven { .. } => Some(McpSurface::Tool("pair_haven")),
+        IpcRequest::RevokePeer { .. } => Some(McpSurface::Tool("revoke_peer")),
         IpcRequest::EndSession { .. } => Some(McpSurface::Tool("end_session")),
         IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
         IpcRequest::CloseTab { .. } => Some(McpSurface::Tool("close_tab")),
@@ -207,6 +224,7 @@ impl McpBridge {
         {
             let label = match request.consent_tier() {
                 crate::action::ConsentTier::Irreversible => "Tier-4 Irreversible",
+                crate::action::ConsentTier::PolicyChange => "PolicyChange",
                 _ => "Tier-2 Act",
             };
             return Ok(IpcResponse::err(format!(
@@ -245,15 +263,9 @@ impl McpBridge {
                 }
                 // Negotiate: honour a revision we implement, otherwise answer
                 // with our own latest. Never echo an unsupported version back.
-                let requested_version = params
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .unwrap_or(DEFAULT_PROTOCOL_VERSION);
-                let negotiated = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested_version) {
-                    requested_version
-                } else {
-                    DEFAULT_PROTOCOL_VERSION
-                };
+                let negotiated = negotiate_protocol_version(
+                    params.get("protocolVersion").and_then(Value::as_str),
+                );
                 Ok(json!({
                     "protocolVersion": negotiated,
                     "capabilities": {
@@ -620,6 +632,41 @@ impl McpBridge {
                 },
                 Duration::from_secs(10),
             ),
+            "list_peers" => (IpcRequest::ListPeers, Duration::from_secs(5)),
+            "pair_haven" => {
+                let label = args
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`label` is required")))?
+                    .to_owned();
+                let url = args
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`url` is required")))?
+                    .to_owned();
+                let token = args
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_owned);
+                let timeout = if token.is_some() {
+                    Duration::from_secs(20)
+                } else {
+                    Duration::from_secs(70)
+                };
+                (IpcRequest::PairHaven { label, url, token }, timeout)
+            }
+            "revoke_peer" => {
+                let id_or_label = args
+                    .get("id_or_label")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`id_or_label` is required")))?
+                    .to_owned();
+                (
+                    IpcRequest::RevokePeer { id_or_label },
+                    Duration::from_secs(30),
+                )
+            }
             "propose_policy" => {
                 let description = args
                     .get("description")
@@ -1074,11 +1121,40 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "revoke_policy",
-            "description": "Tier-2 Act: revoke a standing policy. Takes effect immediately; subsequent calls fall back to per-action consent.",
+            "description": "PolicyChange: revoke a standing policy. Takes effect immediately; subsequent calls fall back to per-action consent.",
             "inputSchema": {
                 "type": "object",
                 "required": ["id"],
                 "properties": { "id": { "type": "integer" } }
+            }
+        },
+        {
+            "name": "list_peers",
+            "description": "Tier-1 Observe: list paired inbound HTTP MCP peers (redacted, never token hashes or bearer secrets) and paired outbound Haven limbs with live connection status.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "pair_haven",
+            "description": "PolicyChange: pair an outbound Haven HTTP MCP limb over loopback or a WireGuard/Yggdrasil/private tunnel. Omit token to run symmetric initialize tap-to-pair. Always requires explicit operator confirmation on non-Operator carriers.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["label", "url"],
+                "properties": {
+                    "label": { "type": "string", "description": "Short human label for this Haven limb (for example pixel)" },
+                    "url": { "type": "string", "description": "HTTP MCP URL over loopback or tunnel, e.g. http://127.0.0.1:8740/mcp" },
+                    "token": { "type": "string", "description": "Optional pre-shared Bearer token; omit for interactive tap-to-pair" }
+                }
+            }
+        },
+        {
+            "name": "revoke_peer",
+            "description": "PolicyChange: revoke an inbound or outbound paired peer by id or label immediately in memory and in peers.json. Never covered by session grants or standing policies.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id_or_label"],
+                "properties": {
+                    "id_or_label": { "type": "string", "description": "Peer id or label from list_peers" }
+                }
             }
         },
         {

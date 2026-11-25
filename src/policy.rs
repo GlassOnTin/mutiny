@@ -261,6 +261,9 @@ mod tests {
             "list-policies",
             "install-policy",
             "revoke-policy",
+            "list-peers",
+            "pair-haven",
+            "revoke-peer",
             "*",
             "not-a-real-verb",
         ] {

@@ -1,11 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::{Rc, Weak};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gtk4::gdk;
@@ -13,13 +15,15 @@ use gtk4::prelude::*;
 
 use crate::action::ActionId;
 use crate::config::{self, Overrides, RELOAD_CHECK_INTERVAL, ResolvedConfig};
+use crate::crypto;
 use crate::engine::{
     EngineNotification, GridSize, PaneEngine, SEARCH_LINES_PER_TICK, ScrollbackSearch,
     parse_named_key,
 };
+use crate::http_mcp::{PAIRING_TIMEOUT, PairingOutcome, PairingRequest};
 use crate::ipc::{
-    AuditDecision, AuditEntry, ConsentMode, ConsentOutcome, IpcEnvelope, IpcRequest, IpcResponse,
-    PeerIdentity, action_catalog, bind_socket, carrier_permits_peer, consent_outcome,
+    AuditDecision, AuditEntry, CarrierRole, ConsentMode, ConsentOutcome, IpcEnvelope, IpcRequest,
+    IpcResponse, PeerIdentity, action_catalog, bind_socket, carrier_permits_peer, consent_outcome,
     default_audit_path, peer_credentials, read_envelope, server_uid, write_response,
 };
 use crate::mux::{
@@ -27,6 +31,13 @@ use crate::mux::{
     MuxHostStatus, MuxInventory, MuxKind, MuxSession,
 };
 use crate::notify::{DBusNotifier, DesktopNotifier};
+use crate::peer_client::{
+    HavenPeerClientHandle, PeerClientEvent, PeerPollConfig, parse_and_validate_peer_url,
+};
+use crate::peers::{
+    self, InboundPeer, InboundPeerTable, LiveInboundPeer, OutboundLimbStatus, OutboundPeerSummary,
+    PeerStore, PeersListing, unix_now_secs,
+};
 use crate::session::{self, SessionState};
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
 use crate::ui::window::MutinyWindow;
@@ -133,16 +144,24 @@ struct PendingDiscovery {
 }
 
 /// One relay carrier for an HTTP peer token. The identity is assigned when the
-/// operator configures the peer, not by anything the remote client sends.
+/// operator configures or pairs the peer, not by anything the remote client sends.
 struct HttpPeerCarrier {
     listener: UnixListener,
     path: PathBuf,
     identity: PeerIdentity,
+    peer_id: String,
     label: String,
-    /// Mode this peer's carrier assigns. Pinned per peer at launch, so one peer
-    /// can be paired while another is observe-only. Never `Operator`: the only
-    /// way in is `ConsentMode::parse_peer_mode`, which refuses it.
+    /// Mode this peer's carrier assigns. Pinned per peer at launch or pairing,
+    /// never `Operator`.
     mode: ConsentMode,
+}
+
+pub struct PendingInboundPairing {
+    pub id: u64,
+    pub client_name: String,
+    pub remote_addr: SocketAddr,
+    pub deadline: Instant,
+    reply_tx: std::sync::mpsc::SyncSender<PairingOutcome>,
 }
 
 pub struct AppController {
@@ -156,6 +175,20 @@ pub struct AppController {
     /// One relay carrier per HTTP peer token, each assigning a distinct
     /// token-derived identity. Empty unless the HTTP listener is enabled.
     http_peers: RefCell<Vec<HttpPeerCarrier>>,
+    peers_path: RefCell<PathBuf>,
+    peer_store: RefCell<PeerStore>,
+    inbound_peer_table: Arc<RwLock<InboundPeerTable>>,
+    pairing_rx: RefCell<Option<std::sync::mpsc::Receiver<PairingRequest>>>,
+    pending_pairing: RefCell<Option<PendingInboundPairing>>,
+    next_pairing_id: Cell<u64>,
+    allow_headless_pairing: Cell<bool>,
+    peer_poll_config: RefCell<PeerPollConfig>,
+    peer_client: RefCell<Option<HavenPeerClientHandle>>,
+    outbound_statuses: RefCell<HashMap<String, OutboundLimbStatus>>,
+    pairing_outbound_label: RefCell<Option<String>>,
+    pending_pair_replies: RefCell<HashMap<u64, UnixStream>>,
+    next_pair_req_id: Cell<u64>,
+    next_peer_sock_seq: Cell<usize>,
     discovery_jobs: RefCell<Vec<PendingDiscovery>>,
     discovery_queue: RefCell<VecDeque<(Option<String>, MuxKind)>>,
     session_cache: RefCell<MuxInventory>,
@@ -253,6 +286,26 @@ impl AppController {
         };
         let resolved = config::resolve(&loaded, &overrides);
         let mtime = config::file_mtime(&config_path);
+        let default_peers_path = config_path
+            .parent()
+            .map(|p| p.join("peers.json"))
+            .unwrap_or_else(peers::peers_path);
+        let initial_peers = match peers::load(&default_peers_path) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("warning: peers.json not loaded, starting with empty peer store: {err}");
+                PeerStore::default()
+            }
+        };
+        let poll_cfg = PeerPollConfig::default();
+        let initial_client = if initial_peers.outbound_peers.is_empty() {
+            None
+        } else {
+            Some(HavenPeerClientHandle::spawn(
+                initial_peers.outbound_peers.clone(),
+                poll_cfg.clone(),
+            ))
+        };
         Rc::new(Self {
             workspace: RefCell::new(Workspace::new()),
             gtk_app: RefCell::new(None),
@@ -261,6 +314,20 @@ impl AppController {
             socket_path: RefCell::new(None),
             agent_listener: RefCell::new(None),
             http_peers: RefCell::new(Vec::new()),
+            peers_path: RefCell::new(default_peers_path),
+            peer_store: RefCell::new(initial_peers),
+            inbound_peer_table: Arc::new(RwLock::new(InboundPeerTable::new())),
+            pairing_rx: RefCell::new(None),
+            pending_pairing: RefCell::new(None),
+            next_pairing_id: Cell::new(1),
+            allow_headless_pairing: Cell::new(false),
+            peer_poll_config: RefCell::new(poll_cfg),
+            peer_client: RefCell::new(initial_client),
+            outbound_statuses: RefCell::new(HashMap::new()),
+            pairing_outbound_label: RefCell::new(None),
+            pending_pair_replies: RefCell::new(HashMap::new()),
+            next_pair_req_id: Cell::new(1),
+            next_peer_sock_seq: Cell::new(1000),
             discovery_jobs: RefCell::new(Vec::new()),
             discovery_queue: RefCell::new(VecDeque::new()),
             session_cache: RefCell::new(MuxInventory::default()),
@@ -507,23 +574,548 @@ impl AppController {
         label: &str,
         mode: ConsentMode,
     ) -> io::Result<()> {
-        // Defensive: the parse boundary already refuses Operator, and a carrier
-        // that granted it over the network would break the whole model.
-        if mode == ConsentMode::Operator {
+        if mode.carrier_role() != CarrierRole::Peer {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "a network peer carrier can never assign Operator",
             ));
         }
         let listener = bind_socket(path)?;
+        let peer_id = format!("cli-{label}");
         self.http_peers.borrow_mut().push(HttpPeerCarrier {
             listener,
             path: path.to_path_buf(),
             identity: PeerIdentity::for_token(token, server_uid()),
+            peer_id: peer_id.clone(),
             label: label.to_owned(),
             mode,
         });
+        if let Ok(mut table) = self.inbound_peer_table.write() {
+            let _ = table.insert(LiveInboundPeer {
+                id: peer_id,
+                label: label.to_owned(),
+                client_name: label.to_owned(),
+                token_sha256: crypto::sha256(token.as_bytes()),
+                socket: path.to_path_buf(),
+                consent_mode: mode,
+                ephemeral: true,
+                paired_at: unix_now_secs(),
+                last_seen_at: None,
+            });
+        }
         Ok(())
+    }
+
+    pub fn inbound_peer_table(&self) -> Arc<RwLock<InboundPeerTable>> {
+        Arc::clone(&self.inbound_peer_table)
+    }
+
+    pub fn attach_pairing_receiver(&self, rx: std::sync::mpsc::Receiver<PairingRequest>) {
+        *self.pairing_rx.borrow_mut() = Some(rx);
+    }
+
+    pub fn set_allow_headless_pairing_for_test(&self, allow: bool) {
+        self.allow_headless_pairing.set(allow);
+    }
+
+    pub fn set_allow_lan_peer(&self, allow_lan: bool) {
+        self.peer_poll_config.borrow_mut().allow_lan = allow_lan;
+        let outbound = self.peer_store.borrow().outbound_peers.clone();
+        if !outbound.is_empty() {
+            if let Some(mut prev) = self.peer_client.borrow_mut().take() {
+                prev.stop();
+            }
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(outbound, cfg));
+        }
+    }
+
+    pub fn set_peer_poll_config(&self, cfg: PeerPollConfig) {
+        *self.peer_poll_config.borrow_mut() = cfg.clone();
+        let outbound = self.peer_store.borrow().outbound_peers.clone();
+        if let Some(mut prev) = self.peer_client.borrow_mut().take() {
+            prev.stop();
+        }
+        if !outbound.is_empty() {
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(outbound, cfg));
+        }
+    }
+
+    pub fn set_peers_path(&self, path: PathBuf) -> Result<(), String> {
+        let store = peers::load(&path)?;
+        *self.peers_path.borrow_mut() = path;
+        *self.peer_store.borrow_mut() = store.clone();
+        if let Some(mut prev) = self.peer_client.borrow_mut().take() {
+            prev.stop();
+        }
+        if !store.outbound_peers.is_empty() {
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() =
+                Some(HavenPeerClientHandle::spawn(store.outbound_peers, cfg));
+        }
+        Ok(())
+    }
+
+    /// Binds per-peer Unix relay sockets for all durable inbound peers loaded
+    /// from `peers.json` and registers them in `inbound_peer_table`.
+    pub fn bind_durable_inbound_peers(&self, base_agent_sock: &Path) -> io::Result<usize> {
+        let durable = self.peer_store.borrow().inbound_peers.clone();
+        let mut count = 0usize;
+        for peer in durable {
+            if peer.consent_mode.carrier_role() != CarrierRole::Peer {
+                continue;
+            }
+            let Ok(sha_bytes) = crypto::hex_decode_32(&peer.token_sha256) else {
+                continue;
+            };
+            let sock = self.allocate_peer_relay_socket(Some(base_agent_sock));
+            let listener = bind_socket(&sock)?;
+            self.http_peers.borrow_mut().push(HttpPeerCarrier {
+                listener,
+                path: sock.clone(),
+                identity: PeerIdentity::for_token_sha256(&peer.token_sha256, server_uid()),
+                peer_id: peer.id.clone(),
+                label: peer.label.clone(),
+                mode: peer.consent_mode,
+            });
+            if let Ok(mut table) = self.inbound_peer_table.write() {
+                let _ = table.insert(LiveInboundPeer {
+                    id: peer.id,
+                    label: peer.label,
+                    client_name: peer.client_name,
+                    token_sha256: sha_bytes,
+                    socket: sock,
+                    consent_mode: peer.consent_mode,
+                    ephemeral: false,
+                    paired_at: peer.paired_at,
+                    last_seen_at: peer.last_seen_at,
+                });
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn allocate_peer_relay_socket(&self, base_override: Option<&Path>) -> PathBuf {
+        let seq = self.next_peer_sock_seq.get();
+        self.next_peer_sock_seq.set(seq + 1);
+        let base_opt = base_override
+            .map(Path::to_path_buf)
+            .or_else(|| self.agent_socket_path.borrow().clone())
+            .or_else(|| self.socket_path.borrow().clone());
+        match base_opt {
+            Some(base) => {
+                let stem = base
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| String::from("mutiny-agent"));
+                let name = format!("{stem}-paired-{seq}.sock");
+                match base.parent() {
+                    Some(parent) => parent.join(name),
+                    None => PathBuf::from(name),
+                }
+            }
+            None => std::env::temp_dir()
+                .join(format!("mutiny-paired-{}-{seq}.sock", std::process::id())),
+        }
+    }
+
+    pub fn pending_pairing_prompt(&self) -> Option<(u64, String, SocketAddr)> {
+        let guard = self.pending_pairing.borrow();
+        let p = guard.as_ref()?;
+        Some((p.id, p.client_name.clone(), p.remote_addr))
+    }
+
+    pub fn resolve_inbound_pairing(
+        &self,
+        id: u64,
+        approved_mode: Option<ConsentMode>,
+    ) -> Result<Option<String>, String> {
+        let maybe_item = {
+            let mut slot = self.pending_pairing.borrow_mut();
+            if slot.as_ref().is_some_and(|p| p.id == id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(item) = maybe_item else {
+            return Err(format!("no pending pairing prompt {id}"));
+        };
+
+        let Some(mode) = approved_mode else {
+            let _ = item.reply_tx.send(PairingOutcome::Denied);
+            self.refresh_all_window_chromes();
+            return Ok(None);
+        };
+
+        if mode.carrier_role() != CarrierRole::Peer {
+            let _ = item.reply_tx.send(PairingOutcome::Denied);
+            self.refresh_all_window_chromes();
+            return Err(String::from(
+                "inbound HTTP peer can never be assigned Operator consent mode",
+            ));
+        }
+
+        let token = match crypto::generate_pairing_token() {
+            Ok(t) => t,
+            Err(err) => {
+                let _ = item.reply_tx.send(PairingOutcome::Denied);
+                self.refresh_all_window_chromes();
+                return Err(format!("failed to generate pairing token: {err}"));
+            }
+        };
+        let sha_bytes = crypto::sha256(token.as_bytes());
+        let sha_hex = crypto::hex_encode(&sha_bytes);
+
+        let mut raw_id = [0u8; 4];
+        let _ = crypto::fill_random(&mut raw_id);
+        let peer_id = format!("in-{}", crypto::hex_encode(&raw_id));
+
+        let label = self.deduplicate_inbound_label(&item.client_name);
+        let sock = self.allocate_peer_relay_socket(None);
+        let listener = match bind_socket(&sock) {
+            Ok(l) => l,
+            Err(err) => {
+                let _ = item.reply_tx.send(PairingOutcome::Denied);
+                self.refresh_all_window_chromes();
+                return Err(format!("failed to bind relay socket: {err}"));
+            }
+        };
+
+        let now = unix_now_secs();
+        let record = InboundPeer {
+            id: peer_id.clone(),
+            label: label.clone(),
+            client_name: item.client_name.clone(),
+            token_sha256: sha_hex.clone(),
+            consent_mode: mode,
+            paired_at: now,
+            last_seen_at: Some(now),
+        };
+        {
+            let mut store = self.peer_store.borrow_mut();
+            store.inbound_peers.push(record);
+            if let Err(err) = peers::save(&self.peers_path.borrow(), &store) {
+                store.inbound_peers.pop();
+                let _ = std::fs::remove_file(&sock);
+                let _ = item.reply_tx.send(PairingOutcome::Denied);
+                self.refresh_all_window_chromes();
+                return Err(format!("failed to persist peers.json: {err}"));
+            }
+        }
+
+        self.http_peers.borrow_mut().push(HttpPeerCarrier {
+            listener,
+            path: sock.clone(),
+            identity: PeerIdentity::for_token_sha256(&sha_hex, server_uid()),
+            peer_id: peer_id.clone(),
+            label: label.clone(),
+            mode,
+        });
+        if let Ok(mut table) = self.inbound_peer_table.write() {
+            let _ = table.insert(LiveInboundPeer {
+                id: peer_id.clone(),
+                label,
+                client_name: item.client_name,
+                token_sha256: sha_bytes,
+                socket: sock,
+                consent_mode: mode,
+                ephemeral: false,
+                paired_at: now,
+                last_seen_at: Some(now),
+            });
+        }
+
+        let _ = item.reply_tx.send(PairingOutcome::Approved {
+            peer_id: peer_id.clone(),
+            plaintext_token: token,
+        });
+        self.refresh_all_window_chromes();
+        Ok(Some(peer_id))
+    }
+
+    fn deduplicate_inbound_label(&self, desired: &str) -> String {
+        let base_raw: String = desired
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let base = base_raw.trim_matches('-');
+        let stem = if base.is_empty() { "peer" } else { base };
+        let taken = |candidate: &str| -> bool {
+            let in_store = self
+                .peer_store
+                .borrow()
+                .inbound_peers
+                .iter()
+                .any(|p| p.label == candidate);
+            let in_table = self
+                .inbound_peer_table
+                .read()
+                .map(|t| t.entries().iter().any(|e| e.label == candidate))
+                .unwrap_or(false);
+            in_store || in_table
+        };
+        if !taken(stem) {
+            return stem.to_owned();
+        }
+        for n in 2..1000 {
+            let cand = format!("{stem}-{n}");
+            if !taken(&cand) {
+                return cand;
+            }
+        }
+        format!("{stem}-{}", unix_now_secs())
+    }
+
+    pub fn list_peers(&self) -> PeersListing {
+        let mut inbound = self
+            .inbound_peer_table
+            .read()
+            .map(|t| t.summaries())
+            .unwrap_or_default();
+        let store = self.peer_store.borrow();
+        for p in &store.inbound_peers {
+            if !inbound.iter().any(|s| s.id == p.id || s.label == p.label) {
+                inbound.push(peers::InboundPeerSummary {
+                    id: p.id.clone(),
+                    label: p.label.clone(),
+                    client_name: p.client_name.clone(),
+                    consent_mode: p.consent_mode,
+                    ephemeral: false,
+                    paired_at: p.paired_at,
+                    last_seen_at: p.last_seen_at,
+                });
+            }
+        }
+        let statuses = self.outbound_statuses.borrow();
+        peers::build_listing(&inbound, &store.outbound_peers, &statuses)
+    }
+
+    pub fn pairing_outbound_label(&self) -> Option<String> {
+        self.pairing_outbound_label.borrow().clone()
+    }
+
+    /// Computes `(pill_label, tooltip)` for the HeaderBar Limb Status Pill, or
+    /// `None` when zero inbound/outbound peers exist and no outbound pairing is
+    /// in flight.
+    pub fn limb_pill_summary(&self) -> Option<(String, String)> {
+        if let Some(lbl) = self.pairing_outbound_label.borrow().clone() {
+            return Some((
+                String::from("◐ pairing…"),
+                format!("Pairing outbound Haven limb '{lbl}'…"),
+            ));
+        }
+        let listing = self.list_peers();
+        if let Some(primary) = listing
+            .outbound
+            .iter()
+            .find(|p| matches!(p.status, OutboundLimbStatus::Connected { .. }))
+            .or_else(|| listing.outbound.first())
+        {
+            return match &primary.status {
+                OutboundLimbStatus::Connected {
+                    label,
+                    remote_version,
+                    rtt_ms,
+                    ..
+                } => {
+                    let ver = remote_version
+                        .as_deref()
+                        .map(|v| format!(" v{v}"))
+                        .unwrap_or_default();
+                    Some((
+                        format!("● haven:{label}"),
+                        format!("Haven limb '{label}'{ver} connected ({rtt_ms} ms RTT)"),
+                    ))
+                }
+                OutboundLimbStatus::Pairing { label } => Some((
+                    String::from("◐ pairing…"),
+                    format!("Pairing Haven limb '{label}'…"),
+                )),
+                OutboundLimbStatus::Offline {
+                    label, last_error, ..
+                } => {
+                    let detail = last_error.as_deref().unwrap_or("unreachable");
+                    Some((
+                        format!("◌ haven:{label}"),
+                        format!("Haven limb '{label}' offline: {detail}"),
+                    ))
+                }
+            };
+        }
+        if !listing.inbound.is_empty() {
+            let first = &listing.inbound[0];
+            if listing.inbound.len() == 1 {
+                return Some((
+                    format!("● limb:{}", first.label),
+                    format!(
+                        "Inbound paired peer '{}' ({:?})",
+                        first.label, first.consent_mode
+                    ),
+                ));
+            }
+            return Some((
+                format!("● limbs:{}", listing.inbound.len()),
+                format!("{} inbound paired peers", listing.inbound.len()),
+            ));
+        }
+        None
+    }
+
+    pub fn begin_pair_haven(
+        &self,
+        label: String,
+        url: String,
+        token: Option<String>,
+        reply: Option<UnixStream>,
+    ) -> Result<(), String> {
+        let clean_label = mux::sanitize_text(label.trim(), 48);
+        if clean_label.is_empty() {
+            return Err(String::from("peer label must not be empty"));
+        }
+        let allow_lan = self.peer_poll_config.borrow().allow_lan;
+        parse_and_validate_peer_url(&url, allow_lan)?;
+
+        if self.peer_client.borrow().is_none() {
+            let initial = self.peer_store.borrow().outbound_peers.clone();
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+        }
+        let req_id = self.next_pair_req_id.get();
+        self.next_pair_req_id.set(req_id + 1);
+        *self.pairing_outbound_label.borrow_mut() = Some(clean_label.clone());
+        if let Some(stream) = reply {
+            self.pending_pair_replies
+                .borrow_mut()
+                .insert(req_id, stream);
+        }
+        let send_res = self
+            .peer_client
+            .borrow()
+            .as_ref()
+            .expect("peer client spawned")
+            .pair_outbound(req_id, clean_label, url, token);
+        if let Err(err) = send_res {
+            *self.pairing_outbound_label.borrow_mut() = None;
+            self.pending_pair_replies.borrow_mut().remove(&req_id);
+            self.refresh_all_window_chromes();
+            return Err(err);
+        }
+        self.refresh_all_window_chromes();
+        Ok(())
+    }
+
+    pub fn revoke_peer(&self, id_or_label: &str) -> Result<(), String> {
+        let target = id_or_label.trim();
+        if target.is_empty() {
+            return Err(String::from("peer id or label must not be empty"));
+        }
+
+        let mut removed_any = false;
+        let removed_live = self
+            .inbound_peer_table
+            .write()
+            .map(|mut t| t.revoke(target))
+            .unwrap_or_default();
+        if !removed_live.is_empty() {
+            removed_any = true;
+        }
+        let removed_ids: Vec<String> = removed_live.iter().map(|e| e.id.clone()).collect();
+
+        // Tear down matching per-peer Unix relay sockets and purge any standing
+        // grants/policies keyed on that peer's token identity.
+        let mut revoked_identities = Vec::new();
+        {
+            let mut carriers = self.http_peers.borrow_mut();
+            let mut kept = Vec::with_capacity(carriers.len());
+            for carrier in carriers.drain(..) {
+                if carrier.peer_id == target
+                    || carrier.label == target
+                    || removed_ids.contains(&carrier.peer_id)
+                {
+                    let _ = std::fs::remove_file(&carrier.path);
+                    revoked_identities.push(carrier.identity);
+                    removed_any = true;
+                } else {
+                    kept.push(carrier);
+                }
+            }
+            *carriers = kept;
+        }
+        for ident in revoked_identities {
+            self.session_approved_clients.borrow_mut().remove(&ident);
+            self.session_grant_labels.borrow_mut().remove(&ident);
+            self.policies.borrow_mut().retain(|p| p.peer != ident);
+            self.pending_policies
+                .borrow_mut()
+                .retain(|p| p.peer != ident);
+        }
+
+        let mut store_changed = false;
+        let mut removed_outbound_ids = Vec::new();
+        {
+            let mut store = self.peer_store.borrow_mut();
+            let in_before = store.inbound_peers.len();
+            store
+                .inbound_peers
+                .retain(|p| p.id != target && p.label != target);
+            if store.inbound_peers.len() != in_before {
+                removed_any = true;
+                store_changed = true;
+            }
+            let mut kept_out = Vec::with_capacity(store.outbound_peers.len());
+            for p in store.outbound_peers.drain(..) {
+                if p.id == target || p.label == target {
+                    removed_outbound_ids.push(p.id);
+                    removed_any = true;
+                    store_changed = true;
+                } else {
+                    kept_out.push(p);
+                }
+            }
+            store.outbound_peers = kept_out;
+            if store_changed {
+                peers::save(&self.peers_path.borrow(), &store)
+                    .map_err(|e| format!("failed to save peers.json: {e}"))?;
+            }
+        }
+
+        for out_id in &removed_outbound_ids {
+            self.outbound_statuses.borrow_mut().remove(out_id);
+        }
+        if !removed_outbound_ids.is_empty()
+            && let Some(client) = self.peer_client.borrow().as_ref()
+        {
+            let remaining = self.peer_store.borrow().outbound_peers.clone();
+            let _ = client.set_peers(remaining);
+        }
+
+        if !removed_any {
+            return Err(format!("no paired peer matching {target:?}"));
+        }
+        self.refresh_all_window_chromes();
+        Ok(())
+    }
+
+    pub fn call_outbound_haven_tool(
+        &self,
+        peer_id_or_label: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        let guard = self.peer_client.borrow();
+        let Some(client) = guard.as_ref() else {
+            return Err(String::from("no outbound Haven peer client active"));
+        };
+        client.call_tool(peer_id_or_label, tool_name, arguments, timeout)
     }
 
     /// Binds the agent carrier and pins the mode it assigns. Separate from the
@@ -548,6 +1140,15 @@ impl AppController {
         }
         for peer in self.http_peers.borrow_mut().drain(..) {
             let _ = std::fs::remove_file(peer.path);
+        }
+        if let Some(pending) = self.pending_pairing.borrow_mut().take() {
+            let _ = pending.reply_tx.send(PairingOutcome::Denied);
+        }
+        for (_, mut stream) in self.pending_pair_replies.borrow_mut().drain() {
+            let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
+        }
+        if let Some(mut client) = self.peer_client.borrow_mut().take() {
+            client.stop();
         }
         self.shutdown_discoveries();
     }
@@ -2070,6 +2671,13 @@ impl AppController {
                     ui_win.show_new_session_dialog();
                 }
             }
+            ActionId::PairHaven => {
+                if let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.show_pair_haven_dialog();
+                }
+            }
             ActionId::SessionPicker => {
                 if let Some(win_id) = active_win
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
@@ -2259,6 +2867,8 @@ impl AppController {
         self.advance_searches();
         self.advance_discoveries();
         self.advance_mux_commands();
+        self.poll_inbound_pairing();
+        self.poll_peer_client();
         self.refresh_agent_icon();
         self.refresh_sessions_periodically();
         self.expire_pending_consents();
@@ -2284,18 +2894,26 @@ impl AppController {
     /// token was verified for, so two peers are distinct in the audit trail and
     /// in the grant set. The mode is the agent carrier's, never `Operator`.
     fn accept_http_peer_carriers(self: &Rc<Self>) {
-        let peers = self.http_peers.borrow();
-        for peer in peers.iter() {
-            loop {
-                let accepted = peer.listener.accept();
-                match accepted {
-                    Ok((stream, _)) => {
-                        self.handle_accepted(stream, peer.mode, &peer.label, Some(peer.identity))
+        let mut accepted_streams = Vec::new();
+        {
+            let peers = self.http_peers.borrow();
+            for peer in peers.iter() {
+                loop {
+                    match peer.listener.accept() {
+                        Ok((stream, _)) => accepted_streams.push((
+                            stream,
+                            peer.mode,
+                            peer.label.clone(),
+                            peer.identity,
+                        )),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
                 }
             }
+        }
+        for (stream, mode, label, identity) in accepted_streams {
+            self.handle_accepted(stream, mode, &label, Some(identity));
         }
     }
 
@@ -2457,25 +3075,22 @@ impl AppController {
             self.record_audit(&client_label, &env_req.request, decision, carrier, peer);
             return self.execute_ipc_request(env_req.request, raw_stream);
         }
-        // Policy-management verbs never ride on a session grant, so an agent on
-        // an `ask` carrier cannot use an earlier Allow Session tap to install
-        // or revoke standing policies silently.
-        let empty_grants = HashSet::new();
-        let grants = if matches!(
-            env_req.request,
-            IpcRequest::InstallPolicy { .. } | IpcRequest::RevokePolicy { .. }
-        ) {
-            &empty_grants
-        } else {
-            &*self.session_approved_clients.borrow()
+        let outcome = {
+            let empty_grants = HashSet::new();
+            let guard = self.session_approved_clients.borrow();
+            let grants = if env_req.request.consent_tier() == crate::action::ConsentTier::Act {
+                &*guard
+            } else {
+                &empty_grants
+            };
+            consent_outcome(
+                env_req.request.consent_tier(),
+                carrier,
+                peer,
+                grants,
+                gui_present,
+            )
         };
-        let outcome = consent_outcome(
-            env_req.request.consent_tier(),
-            carrier,
-            peer,
-            grants,
-            gui_present,
-        );
 
         match outcome {
             ConsentOutcome::Allow(decision) => {
@@ -2675,6 +3290,26 @@ impl AppController {
                     Some(IpcResponse::err(format!("no such policy {id}")))
                 }
             }
+            IpcRequest::ListPeers => {
+                let mut resp = IpcResponse::empty_ok();
+                if let IpcResponse::Ok { peers, .. } = &mut resp {
+                    *peers = Some(self.list_peers());
+                }
+                Some(resp)
+            }
+            IpcRequest::PairHaven { label, url, token } => {
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                match self.begin_pair_haven(label, url, token, Some(cloned)) {
+                    Ok(()) => None,
+                    Err(err) => Some(IpcResponse::err(err)),
+                }
+            }
+            IpcRequest::RevokePeer { id_or_label } => match self.revoke_peer(&id_or_label) {
+                Ok(()) => Some(IpcResponse::empty_ok()),
+                Err(err) => Some(IpcResponse::err(err)),
+            },
             IpcRequest::EndSession { kind, name, host } => {
                 let Ok(cloned) = raw_stream.try_clone() else {
                     return Some(IpcResponse::err("could not clone the request stream"));
@@ -3375,6 +4010,147 @@ impl AppController {
             self.refresh_all_window_chromes();
         }
     }
+
+    fn poll_inbound_pairing(&self) {
+        let now = Instant::now();
+        let expired = {
+            let mut slot = self.pending_pairing.borrow_mut();
+            if slot.as_ref().is_some_and(|p| now >= p.deadline) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(item) = expired {
+            let _ = item.reply_tx.send(PairingOutcome::Denied);
+            self.refresh_all_window_chromes();
+        }
+
+        if self.pending_pairing.borrow().is_some() {
+            return;
+        }
+        let next_req = self
+            .pairing_rx
+            .borrow()
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        let Some(req) = next_req else {
+            return;
+        };
+
+        let can_prompt = !self.ui_windows.borrow().is_empty() || self.allow_headless_pairing.get();
+        if !can_prompt {
+            let _ = req.reply_tx.send(PairingOutcome::Denied);
+            return;
+        }
+
+        let id = self.next_pairing_id.get();
+        self.next_pairing_id.set(id + 1);
+        *self.pending_pairing.borrow_mut() = Some(PendingInboundPairing {
+            id,
+            client_name: req.client_name,
+            remote_addr: req.remote_addr,
+            deadline: now + PAIRING_TIMEOUT,
+            reply_tx: req.reply_tx,
+        });
+        self.refresh_all_window_chromes();
+    }
+
+    fn poll_peer_client(&self) {
+        let mut events = Vec::new();
+        if let Some(client) = self.peer_client.borrow().as_ref() {
+            while let Some(ev) = client.try_recv() {
+                events.push(ev);
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let mut refresh_ui = false;
+        for ev in events {
+            match ev {
+                PeerClientEvent::StatusChanged {
+                    peer_id,
+                    status,
+                    connected_at,
+                } => {
+                    if let Some(pid) = peer_id {
+                        self.outbound_statuses
+                            .borrow_mut()
+                            .insert(pid.clone(), status);
+                        if let Some(ts) = connected_at
+                            && let Some(entry) = self
+                                .peer_store
+                                .borrow_mut()
+                                .outbound_peers
+                                .iter_mut()
+                                .find(|p| p.id == pid)
+                        {
+                            entry.last_connected_at = Some(ts);
+                        }
+                    }
+                    refresh_ui = true;
+                }
+                PeerClientEvent::PairCompleted { req_id, result } => {
+                    *self.pairing_outbound_label.borrow_mut() = None;
+                    let reply_stream = self.pending_pair_replies.borrow_mut().remove(&req_id);
+                    match result {
+                        Ok((peer, status)) => {
+                            let summary = OutboundPeerSummary {
+                                id: peer.id.clone(),
+                                label: peer.label.clone(),
+                                url: peer.url.clone(),
+                                inbound_notify_scope: peer.inbound_notify_scope,
+                                paired_at: peer.paired_at,
+                                last_connected_at: peer.last_connected_at,
+                                status: status.clone(),
+                            };
+                            let save_res = {
+                                let mut store = self.peer_store.borrow_mut();
+                                store
+                                    .outbound_peers
+                                    .retain(|p| p.label != peer.label && p.id != peer.id);
+                                store.outbound_peers.push(peer.clone());
+                                peers::save(&self.peers_path.borrow(), &store)
+                            };
+                            match save_res {
+                                Ok(()) => {
+                                    self.outbound_statuses.borrow_mut().insert(peer.id, status);
+                                    if let Some(mut stream) = reply_stream {
+                                        let mut resp = IpcResponse::empty_ok();
+                                        if let IpcResponse::Ok { outbound_peer, .. } = &mut resp {
+                                            *outbound_peer = Some(summary);
+                                        }
+                                        let _ = write_response(&mut stream, &resp);
+                                    }
+                                }
+                                Err(err) => {
+                                    let msg = format!("failed to persist peers.json: {err}");
+                                    if let Some(mut stream) = reply_stream {
+                                        let _ = write_response(&mut stream, &IpcResponse::err(msg));
+                                    } else {
+                                        eprintln!("warning: {msg}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(mut stream) = reply_stream {
+                                let _ = write_response(&mut stream, &IpcResponse::err(err));
+                            } else {
+                                eprintln!("warning: outbound Haven pairing failed: {err}");
+                            }
+                        }
+                    }
+                    refresh_ui = true;
+                }
+                PeerClientEvent::ToolCallCompleted { .. } => {}
+            }
+        }
+        if refresh_ui {
+            self.refresh_all_window_chromes();
+        }
+    }
 }
 
 /// Appends one redacted entry to the durable trail. Best-effort: a failing
@@ -3449,6 +4225,8 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         policy_id: None,
         policies: None,
         pending_policies: None,
+        peers: None,
+        outbound_peer: None,
         visible: None,
     }
 }

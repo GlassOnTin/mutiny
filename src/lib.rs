@@ -1,6 +1,7 @@
 pub mod action;
 pub mod app;
 pub mod config;
+pub mod crypto;
 pub mod desktop;
 pub mod engine;
 pub mod graphics;
@@ -9,6 +10,8 @@ pub mod ipc;
 pub mod mcp;
 pub mod mux;
 pub mod notify;
+pub mod peer_client;
+pub mod peers;
 pub mod policy;
 pub mod session;
 pub mod shell_integration;

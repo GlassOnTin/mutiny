@@ -37,7 +37,12 @@ struct MutinyWindowInner {
     /// lost its widget path and the action could not resolve. The terminal
     /// view's menu has always used this parent-once pattern.
     tab_menu: gtk4::PopoverMenu,
+    limb_pill_btn: gtk4::MenuButton,
     agent_badge_btn: gtk4::Button,
+    pairing_bar: gtk4::Box,
+    pairing_label: gtk4::Label,
+    pairing_mode_dropdown: gtk4::DropDown,
+    active_pairing_id: Cell<Option<u64>>,
     consent_bar: gtk4::Box,
     consent_label: gtk4::Label,
     allow_sess_btn: gtk4::Button,
@@ -112,6 +117,21 @@ impl MutinyWindow {
             .build();
         chrome_bar.append(&tab_scroller);
 
+        let limb_popover = gtk4::Popover::new();
+        let limb_popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        limb_popover_box.set_margin_top(8);
+        limb_popover_box.set_margin_bottom(8);
+        limb_popover_box.set_margin_start(10);
+        limb_popover_box.set_margin_end(10);
+        limb_popover.set_child(Some(&limb_popover_box));
+
+        let limb_pill_btn = gtk4::MenuButton::new();
+        limb_pill_btn.set_label("● haven");
+        limb_pill_btn.set_popover(Some(&limb_popover));
+        limb_pill_btn.set_can_focus(false);
+        limb_pill_btn.set_visible(false);
+        chrome_bar.append(&limb_pill_btn);
+
         let agent_badge_btn = make_action_button(
             "Agent: idle",
             "win.agent-audit",
@@ -150,6 +170,36 @@ impl MutinyWindow {
             toolbar_box.append(&btn);
         }
         chrome_bar.append(&toolbar_box);
+
+        // Symmetric inbound `initialize` tap-to-pair bar
+        let pairing_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        pairing_bar.set_margin_start(8);
+        pairing_bar.set_margin_end(8);
+        pairing_bar.set_margin_top(4);
+        pairing_bar.set_margin_bottom(4);
+        pairing_bar.set_visible(false);
+
+        let pairing_label = gtk4::Label::new(None);
+        pairing_label.set_hexpand(true);
+        pairing_label.set_xalign(0.0);
+        pairing_bar.append(&pairing_label);
+
+        let pairing_mode_dropdown = gtk4::DropDown::from_strings(&[
+            "Prompt / Standing Policy",
+            "Session Trusted (Paired)",
+            "Observe Only",
+        ]);
+        pairing_mode_dropdown.set_selected(0);
+        pairing_mode_dropdown.set_can_focus(false);
+        pairing_bar.append(&pairing_mode_dropdown);
+
+        let pair_approve_btn = gtk4::Button::with_label("Pair");
+        pair_approve_btn.add_css_class("suggested-action");
+        pair_approve_btn.set_can_focus(false);
+        let pair_deny_btn = gtk4::Button::with_label("Deny");
+        pair_deny_btn.set_can_focus(false);
+        pairing_bar.append(&pair_approve_btn);
+        pairing_bar.append(&pair_deny_btn);
 
         // Non-injectable Consent Bar for Tier-2 agent actions in `ask` mode
         let consent_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -255,6 +305,7 @@ impl MutinyWindow {
         let root_vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root_vbox.append(&menubar);
         root_vbox.append(&chrome_bar);
+        root_vbox.append(&pairing_bar);
         root_vbox.append(&consent_bar);
         root_vbox.append(&notice_bar);
         root_vbox.append(&search_bar);
@@ -271,7 +322,12 @@ impl MutinyWindow {
                 tab_scroller,
                 toolbar_box,
                 tab_menu,
+                limb_pill_btn,
                 agent_badge_btn,
+                pairing_bar,
+                pairing_label,
+                pairing_mode_dropdown,
+                active_pairing_id: Cell::new(None),
                 consent_bar,
                 consent_label,
                 allow_sess_btn: allow_sess_btn.clone(),
@@ -291,6 +347,12 @@ impl MutinyWindow {
         };
 
         this.wire_banner_buttons(&allow_once_btn, &allow_sess_btn, &deny_btn, &ack_btn);
+        this.wire_pairing_and_limb_ui(
+            &pair_approve_btn,
+            &pair_deny_btn,
+            &limb_popover,
+            &limb_popover_box,
+        );
         this.wire_search_bar(&search_prev, &search_next, &search_close);
         this.register_window_actions(&controller);
 
@@ -494,6 +556,23 @@ impl MutinyWindow {
                 }
             });
             self.inner.gtk_window.add_action(&action);
+        }
+
+        // Keyboard-accessible actions for the inline tap-to-pair bar.
+        {
+            let approve = gio::SimpleAction::new("approve-pairing", None);
+            let this_approve = self.clone();
+            approve.connect_activate(move |_, _| {
+                this_approve.finish_active_pairing(true);
+            });
+            self.inner.gtk_window.add_action(&approve);
+
+            let deny = gio::SimpleAction::new("deny-pairing", None);
+            let this_deny = self.clone();
+            deny.connect_activate(move |_, _| {
+                this_deny.finish_active_pairing(false);
+            });
+            self.inner.gtk_window.add_action(&deny);
         }
 
         // Parameterised action for the Sessions submenu: the target names a
@@ -1028,6 +1107,28 @@ impl MutinyWindow {
     }
 
     fn sync_banners(&self, ctrl: &Rc<AppController>) {
+        if let Some((pill_label, pill_tip)) = ctrl.limb_pill_summary() {
+            self.inner.limb_pill_btn.set_label(&pill_label);
+            self.inner.limb_pill_btn.set_tooltip_text(Some(&pill_tip));
+            self.inner.limb_pill_btn.set_visible(true);
+        } else {
+            self.inner.limb_pill_btn.set_visible(false);
+        }
+
+        if let Some((pid, client_name, remote_addr)) = ctrl.pending_pairing_prompt() {
+            if self.inner.active_pairing_id.get() != Some(pid) {
+                self.inner.active_pairing_id.set(Some(pid));
+                self.inner.pairing_mode_dropdown.set_selected(0);
+            }
+            self.inner.pairing_label.set_text(&format!(
+                "Pair inbound MCP client '{client_name}' from {remote_addr}?"
+            ));
+            self.inner.pairing_bar.set_visible(true);
+        } else {
+            self.inner.active_pairing_id.set(None);
+            self.inner.pairing_bar.set_visible(false);
+        }
+
         if let Some(agent_name) = ctrl.active_agent_badge() {
             self.inner
                 .agent_badge_btn
@@ -1039,12 +1140,15 @@ impl MutinyWindow {
 
         if let Some((cid, client, verb, detail, tier)) = ctrl.pending_consent_prompt() {
             self.inner.active_consent_id.set(Some(cid));
-            let irreversible = tier == crate::action::ConsentTier::Irreversible;
-            self.inner.allow_sess_btn.set_visible(!irreversible);
-            let tier_label = if irreversible {
-                "Tier-4 irreversible"
-            } else {
-                "Tier-2"
+            let no_session_grant = matches!(
+                tier,
+                crate::action::ConsentTier::Irreversible | crate::action::ConsentTier::PolicyChange
+            );
+            self.inner.allow_sess_btn.set_visible(!no_session_grant);
+            let tier_label = match tier {
+                crate::action::ConsentTier::Irreversible => "Tier-4 irreversible",
+                crate::action::ConsentTier::PolicyChange => "PolicyChange",
+                _ => "Tier-2",
             };
             self.inner.consent_label.set_text(&format!(
                 "Agent '{client}' requests {tier_label} '{verb}' {detail}"
@@ -2303,6 +2407,303 @@ impl MutinyWindow {
 
         attach_escape_to_close(&dialog);
         dialog.present();
+    }
+
+    fn wire_pairing_and_limb_ui(
+        &self,
+        approve_btn: &gtk4::Button,
+        deny_btn: &gtk4::Button,
+        limb_popover: &gtk4::Popover,
+        limb_box: &gtk4::Box,
+    ) {
+        {
+            let this = self.clone();
+            approve_btn.connect_clicked(move |_| {
+                this.finish_active_pairing(true);
+            });
+        }
+        {
+            let this = self.clone();
+            deny_btn.connect_clicked(move |_| {
+                this.finish_active_pairing(false);
+            });
+        }
+        {
+            let this = self.clone();
+            let pop = limb_popover.clone();
+            let container = limb_box.clone();
+            limb_popover.connect_show(move |_| {
+                this.rebuild_limb_popover(&pop, &container);
+            });
+        }
+    }
+
+    fn selected_pairing_mode(&self) -> crate::ipc::ConsentMode {
+        match self.inner.pairing_mode_dropdown.selected() {
+            1 => crate::ipc::ConsentMode::Paired,
+            2 => crate::ipc::ConsentMode::ObserveOnly,
+            _ => crate::ipc::ConsentMode::Ask,
+        }
+    }
+
+    fn finish_active_pairing(&self, approve: bool) {
+        let Some(pid) = self.inner.active_pairing_id.get() else {
+            return;
+        };
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let decision = if approve {
+            Some(self.selected_pairing_mode())
+        } else {
+            None
+        };
+        if let Err(err) = ctrl.resolve_inbound_pairing(pid, decision) {
+            eprintln!("warning: pairing resolution failed: {err}");
+        }
+    }
+
+    fn rebuild_limb_popover(&self, popover: &gtk4::Popover, container: &gtk4::Box) {
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+
+        let heading = gtk4::Label::new(None);
+        heading.set_markup("<b>Paired Limbs</b>");
+        heading.set_xalign(0.0);
+        container.append(&heading);
+
+        if let Some(pairing_lbl) = ctrl.pairing_outbound_label() {
+            let row =
+                gtk4::Label::new(Some(&format!("◐ haven:{pairing_lbl} (awaiting approval…)")));
+            row.set_xalign(0.0);
+            container.append(&row);
+        }
+
+        let listing = ctrl.list_peers();
+        if listing.outbound.is_empty() && listing.inbound.is_empty() {
+            let empty = gtk4::Label::new(Some("No paired peers."));
+            empty.add_css_class("dim-label");
+            empty.set_xalign(0.0);
+            container.append(&empty);
+        }
+
+        for out in listing.outbound {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let status_text = match &out.status {
+                crate::peers::OutboundLimbStatus::Connected {
+                    remote_version,
+                    rtt_ms,
+                    ..
+                } => {
+                    let ver = remote_version
+                        .as_deref()
+                        .map(|v| format!(" v{v}"))
+                        .unwrap_or_default();
+                    format!("● haven:{}{} ({} ms) {}", out.label, ver, rtt_ms, out.url)
+                }
+                crate::peers::OutboundLimbStatus::Pairing { .. } => {
+                    format!("◐ haven:{} (pairing…) {}", out.label, out.url)
+                }
+                crate::peers::OutboundLimbStatus::Offline { last_error, .. } => {
+                    let err = last_error.as_deref().unwrap_or("offline");
+                    format!(
+                        "◌ haven:{} ({}) {}",
+                        out.label,
+                        truncate_label(err, 36),
+                        out.url
+                    )
+                }
+            };
+            let lbl = gtk4::Label::new(Some(&status_text));
+            lbl.set_xalign(0.0);
+            lbl.set_hexpand(true);
+            row.append(&lbl);
+
+            let revoke_btn = gtk4::Button::with_label("Revoke");
+            revoke_btn.add_css_class("destructive-action");
+            let ctrl_weak = Rc::downgrade(&ctrl);
+            let pop_clone = popover.clone();
+            let target_id = out.id.clone();
+            revoke_btn.connect_clicked(move |_| {
+                pop_clone.popdown();
+                if let Some(c) = ctrl_weak.upgrade()
+                    && let Err(e) = c.revoke_peer(&target_id)
+                {
+                    eprintln!("warning: revoke failed: {e}");
+                }
+            });
+            row.append(&revoke_btn);
+            container.append(&row);
+        }
+
+        for inb in listing.inbound {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let mode = crate::http_mcp::mode_label(inb.consent_mode);
+            let eph = if inb.ephemeral { ", cli" } else { "" };
+            let lbl = gtk4::Label::new(Some(&format!(
+                "● inbound:{} ({}, {}{})",
+                inb.label, inb.client_name, mode, eph
+            )));
+            lbl.set_xalign(0.0);
+            lbl.set_hexpand(true);
+            row.append(&lbl);
+
+            let revoke_btn = gtk4::Button::with_label("Revoke");
+            revoke_btn.add_css_class("destructive-action");
+            let ctrl_weak = Rc::downgrade(&ctrl);
+            let pop_clone = popover.clone();
+            let target_id = inb.id.clone();
+            revoke_btn.connect_clicked(move |_| {
+                pop_clone.popdown();
+                if let Some(c) = ctrl_weak.upgrade()
+                    && let Err(e) = c.revoke_peer(&target_id)
+                {
+                    eprintln!("warning: revoke failed: {e}");
+                }
+            });
+            row.append(&revoke_btn);
+            container.append(&row);
+        }
+
+        container.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        let pair_btn = gtk4::Button::with_label("Pair Haven Limb…");
+        let this = self.clone();
+        let pop_clone = popover.clone();
+        pair_btn.connect_clicked(move |_| {
+            pop_clone.popdown();
+            this.show_pair_haven_dialog();
+        });
+        container.append(&pair_btn);
+    }
+
+    pub fn show_pair_haven_dialog(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("Pair Haven Limb")
+            .default_width(460)
+            .build();
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        vbox.set_margin_top(12);
+        vbox.set_margin_bottom(12);
+        vbox.set_margin_start(12);
+        vbox.set_margin_end(12);
+
+        let grid = gtk4::Grid::builder()
+            .column_spacing(10)
+            .row_spacing(8)
+            .build();
+
+        let lbl_name = gtk4::Label::new(Some("Label"));
+        lbl_name.set_xalign(0.0);
+        let entry_name = gtk4::Entry::new();
+        entry_name.set_text("haven");
+        entry_name.set_hexpand(true);
+        grid.attach(&lbl_name, 0, 0, 1, 1);
+        grid.attach(&entry_name, 1, 0, 1, 1);
+
+        let lbl_url = gtk4::Label::new(Some("Haven MCP URL"));
+        lbl_url.set_xalign(0.0);
+        let entry_url = gtk4::Entry::new();
+        entry_url.set_text("http://127.0.0.1:8740/mcp");
+        entry_url.set_hexpand(true);
+        entry_url.set_activates_default(true);
+        grid.attach(&lbl_url, 0, 1, 1, 1);
+        grid.attach(&entry_url, 1, 1, 1, 1);
+
+        let lbl_tok = gtk4::Label::new(Some("Bearer Token (optional)"));
+        lbl_tok.set_xalign(0.0);
+        let entry_tok = gtk4::Entry::new();
+        entry_tok.set_placeholder_text(Some("Leave empty for interactive tap-to-pair"));
+        entry_tok.set_visibility(false);
+        entry_tok.set_hexpand(true);
+        grid.attach(&lbl_tok, 0, 2, 1, 1);
+        grid.attach(&entry_tok, 1, 2, 1, 1);
+
+        vbox.append(&grid);
+
+        let hint = gtk4::Label::new(Some(
+            "Use a loopback SSH forward (127.0.0.1) or an encrypted WireGuard/Yggdrasil tunnel address.",
+        ));
+        hint.add_css_class("dim-label");
+        hint.set_xalign(0.0);
+        hint.set_wrap(true);
+        vbox.append(&hint);
+
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let pair = gtk4::Button::with_label("Pair");
+        pair.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&pair);
+        vbox.append(&buttons);
+
+        dialog.set_child(Some(&vbox));
+        dialog.set_default_widget(Some(&pair));
+
+        {
+            let d = dialog.clone();
+            cancel.connect_clicked(move |_| d.close());
+        }
+        {
+            let d = dialog.clone();
+            let ctrl_weak = Rc::downgrade(&ctrl);
+            pair.connect_clicked(move |_| {
+                let label = entry_name.text().to_string();
+                let url = entry_url.text().to_string();
+                let tok = {
+                    let raw = entry_tok.text().to_string();
+                    if raw.trim().is_empty() {
+                        None
+                    } else {
+                        Some(raw)
+                    }
+                };
+                d.close();
+                if let Some(c) = ctrl_weak.upgrade()
+                    && let Err(err) = c.begin_pair_haven(label, url, tok, None)
+                {
+                    eprintln!("warning: could not start Haven pairing: {err}");
+                }
+            });
+        }
+
+        attach_escape_to_close(&dialog);
+        dialog.present();
+    }
+
+    pub fn is_pairing_bar_visible(&self) -> bool {
+        self.inner.pairing_bar.is_visible()
+    }
+
+    pub fn pairing_bar_text(&self) -> String {
+        self.inner.pairing_label.text().to_string()
+    }
+
+    pub fn select_pairing_mode_index(&self, idx: u32) {
+        self.inner.pairing_mode_dropdown.set_selected(idx);
+    }
+
+    pub fn is_limb_pill_visible(&self) -> bool {
+        self.inner.limb_pill_btn.is_visible()
+    }
+
+    pub fn limb_pill_label(&self) -> String {
+        self.inner
+            .limb_pill_btn
+            .label()
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     }
 }
 

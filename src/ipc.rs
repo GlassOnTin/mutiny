@@ -19,6 +19,16 @@ fn default_ipc_version() -> u32 {
     IPC_PROTOCOL_VERSION
 }
 
+/// Trust domain of the carrier that accepted a call. Every remote HTTP peer
+/// (CLI `--http-peer` or durable `peers.json`) resolves strictly to `Peer`,
+/// never `Operator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CarrierRole {
+    Operator,
+    Peer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConsentMode {
@@ -37,6 +47,13 @@ pub enum ConsentMode {
 }
 
 impl ConsentMode {
+    pub const fn carrier_role(self) -> CarrierRole {
+        match self {
+            Self::Operator => CarrierRole::Operator,
+            Self::Paired | Self::Ask | Self::ObserveOnly => CarrierRole::Peer,
+        }
+    }
+
     /// Parses a mode an operator may assign to an agent or network peer.
     ///
     /// `Operator` is deliberately unparseable here. It belongs to the operator
@@ -183,6 +200,23 @@ pub enum IpcRequest {
     RevokePolicy {
         id: u64,
     },
+    /// Lists inbound paired peers (never token material or hashes) and outbound
+    /// Haven limbs with live connection status.
+    ListPeers,
+    /// Pairs an outbound Haven HTTP MCP limb over loopback or an encrypted
+    /// tunnel, optionally running symmetric `initialize` tap-to-pair when
+    /// `token` is omitted.
+    PairHaven {
+        label: String,
+        url: String,
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Revokes an inbound or outbound paired peer immediately in memory and in
+    /// `peers.json`.
+    RevokePeer {
+        id_or_label: String,
+    },
     /// ENDS a multiplexer session. Destructive: everything running inside it
     /// stops, on every device. Distinct from closing a tab, which only ends
     /// this client and leaves the session running. Tier-4 Irreversible: never
@@ -327,8 +361,11 @@ impl IpcRequest {
             IpcRequest::RenameSession { .. } => ConsentTier::Act,
             IpcRequest::ProposePolicy { .. } => ConsentTier::Observe,
             IpcRequest::ListPolicies => ConsentTier::Observe,
-            IpcRequest::InstallPolicy { .. } => ConsentTier::Act,
-            IpcRequest::RevokePolicy { .. } => ConsentTier::Act,
+            IpcRequest::InstallPolicy { .. } => ConsentTier::PolicyChange,
+            IpcRequest::RevokePolicy { .. } => ConsentTier::PolicyChange,
+            IpcRequest::ListPeers => ConsentTier::Observe,
+            IpcRequest::PairHaven { .. } => ConsentTier::PolicyChange,
+            IpcRequest::RevokePeer { .. } => ConsentTier::PolicyChange,
             IpcRequest::EndSession { .. } => ConsentTier::Irreversible,
             IpcRequest::ClosePane { .. } => ConsentTier::Act,
             IpcRequest::CloseTab { .. } => ConsentTier::Act,
@@ -409,6 +446,9 @@ impl IpcRequest {
             IpcRequest::ListPolicies => "list-policies",
             IpcRequest::InstallPolicy { .. } => "install-policy",
             IpcRequest::RevokePolicy { .. } => "revoke-policy",
+            IpcRequest::ListPeers => "list-peers",
+            IpcRequest::PairHaven { .. } => "pair-haven",
+            IpcRequest::RevokePeer { .. } => "revoke-peer",
             IpcRequest::EndSession { .. } => "end-session",
             IpcRequest::ClosePane { .. } => "close-pane",
             IpcRequest::CloseTab { .. } => "close-tab",
@@ -508,6 +548,15 @@ impl IpcRequest {
             }
             IpcRequest::InstallPolicy { id } | IpcRequest::RevokePolicy { id } => {
                 format!("id={id}")
+            }
+            IpcRequest::PairHaven { label, url, token } => format!(
+                "label={:?} url={:?} has_token={}",
+                crate::mux::sanitize_text(label, 48),
+                crate::mux::sanitize_text(url, 96),
+                token.is_some()
+            ),
+            IpcRequest::RevokePeer { id_or_label } => {
+                format!("target={:?}", crate::mux::sanitize_text(id_or_label, 64))
             }
             IpcRequest::EndSession { kind, name, host } => format!(
                 "kind={kind:?} host={host:?} name={:?}",
@@ -645,6 +694,10 @@ pub enum IpcResponse {
         policies: Option<Vec<crate::policy::StandingPolicy>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pending_policies: Option<Vec<crate::policy::StandingPolicy>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peers: Option<crate::peers::PeersListing>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outbound_peer: Option<crate::peers::OutboundPeerSummary>,
         /// Whether a toggled window is now showing rather than dismissed.
         #[serde(skip_serializing_if = "Option::is_none")]
         visible: Option<bool>,
@@ -678,6 +731,8 @@ impl IpcResponse {
             policy_id: None,
             policies: None,
             pending_policies: None,
+            peers: None,
+            outbound_peer: None,
             visible: None,
         }
     }
@@ -879,6 +934,24 @@ impl PeerIdentity {
         }
     }
 
+    /// Identity for a durable peer stored in `peers.json`, where only the
+    /// SHA-256 hex digest of the token exists at rest.
+    pub fn for_token_sha256(token_sha256_hex: &str, uid: u32) -> Self {
+        let fp = match crate::crypto::hex_decode_32(token_sha256_hex) {
+            Ok(digest) => u64::from_be_bytes([
+                digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6],
+                digest[7],
+            ]),
+            Err(_) => token_fingerprint(&token_sha256_hex.to_ascii_lowercase()),
+        };
+        Self {
+            uid,
+            pid: 0,
+            start_time: 0,
+            token_peer: Some(fp),
+        }
+    }
+
     /// True when this identity came from a pairing token rather than the kernel.
     pub fn is_token_peer(&self) -> bool {
         self.token_peer.is_some()
@@ -960,6 +1033,24 @@ pub fn consent_outcome(
                 ConsentOutcome::Park
             }
         }
+        // PolicyChange: mutates trust boundaries (standing policies or paired
+        // peers). Never auto-approved by session grants, standing policies, or
+        // paired agent carriers; only the operator carrier is self-consenting.
+        (ConsentTier::PolicyChange, ConsentMode::Operator) => {
+            ConsentOutcome::Allow(AuditDecision::Allowed)
+        }
+        (ConsentTier::PolicyChange, ConsentMode::ObserveOnly) => ConsentOutcome::Deny(
+            String::from("observe-only session cannot execute PolicyChange verbs"),
+        ),
+        (ConsentTier::PolicyChange, ConsentMode::Ask | ConsentMode::Paired) => {
+            if !gui_present {
+                ConsentOutcome::Deny(String::from(
+                    "consent prompt requires an open Mutiny GUI window",
+                ))
+            } else {
+                ConsentOutcome::Park
+            }
+        }
         // Tier 4: destroys state the operator cannot recover. Always per-action,
         // never standing: neither a session grant, a standing policy, nor a
         // paired agent carrier bypasses explicit confirmation. Only the human
@@ -992,22 +1083,19 @@ pub enum PolicyVerbScope {
 }
 
 /// Checks whether a verb slug may appear in a Tier-3 standing policy. Policy
-/// management verbs and Tier-4 irreversible verbs are never coverable; Tier-4
-/// membership is derived from `verb_samples()` so a newly added irreversible
-/// verb cannot be forgotten here.
+/// and peer management verbs and Tier-4 irreversible verbs are never coverable;
+/// membership is derived from `verb_samples()` so newly added `PolicyChange` or
+/// `Irreversible` verbs cannot be forgotten here.
 pub fn classify_policy_verb(verb: &str) -> PolicyVerbScope {
-    if matches!(
-        verb,
-        "propose-policy" | "list-policies" | "install-policy" | "revoke-policy"
-    ) {
+    if matches!(verb, "propose-policy" | "list-policies" | "list-peers") {
         return PolicyVerbScope::PolicyManagement;
     }
     for sample in verb_samples() {
         if sample.verb_name() == verb {
-            return if sample.consent_tier() == ConsentTier::Irreversible {
-                PolicyVerbScope::Irreversible
-            } else {
-                PolicyVerbScope::Allowed
+            return match sample.consent_tier() {
+                ConsentTier::Irreversible => PolicyVerbScope::Irreversible,
+                ConsentTier::PolicyChange => PolicyVerbScope::PolicyManagement,
+                ConsentTier::Observe | ConsentTier::Act => PolicyVerbScope::Allowed,
             };
         }
     }
@@ -1205,6 +1293,15 @@ pub fn verb_samples() -> Vec<IpcRequest> {
         },
         IpcRequest::CloseWindow { window: None },
         IpcRequest::Quit,
+        IpcRequest::ListPeers,
+        IpcRequest::PairHaven {
+            label: String::from("haven-probe"),
+            url: String::from("http://127.0.0.1:1/mcp"),
+            token: Some(String::from("probe")),
+        },
+        IpcRequest::RevokePeer {
+            id_or_label: String::from("absent-peer"),
+        },
     ]
 }
 
@@ -1246,6 +1343,9 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::ListPolicies => 33,
         IpcRequest::InstallPolicy { .. } => 34,
         IpcRequest::RevokePolicy { .. } => 35,
+        IpcRequest::ListPeers => 37,
+        IpcRequest::PairHaven { .. } => 38,
+        IpcRequest::RevokePeer { .. } => 39,
         IpcRequest::EndSession { .. } => 31,
         IpcRequest::ClosePane { .. } => 25,
         IpcRequest::CloseTab { .. } => 27,

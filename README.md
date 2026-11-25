@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener (with per-peer identity and per-peer consent mode), the tmux/zellij session picker, the Settings dialog, Tier-3 standing policies, Tier-4 irreversible per-action gating, and the summonable scratch quick terminal are shipped; a system-wide global shortcut is not scheduled. The engine, pane mobility, and agent surface are covered by 208 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, M1, and M2 (save for an unscheduled system-wide global shortcut) are shipped, and M3.1 bilateral peer pairing (`0.2.0` cycle) is shipped: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair and durable `peers.json` (`0600`, SHA-256 inbound hashes only), the outbound `HavenPeerClient` and chrome Limb Status Pill, the tmux/zellij session picker, the Settings dialog, Tier-3 standing policies, `PolicyChange` and Tier-4 irreversible per-action gating, and the summonable scratch quick terminal all work today. The engine, pane mobility, peer pairing, and agent surface are covered by 217 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
 
 Working today:
 
@@ -22,9 +22,9 @@ Working today:
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
 - Mouse reporting: when a program asks for mouse events (tmux with `mouse on`, vim, less), the wheel and clicks go to it instead of mutiny's scrollback and selection. Hold Shift to override back to local scrollback and selection.
-- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 37 IPC verbs, 33 MCP tools, 25 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
-- Carrier-assigned consent across Tiers 1 through 4 with kernel-verified peer identity, Tier-3 standing policies, per-action Tier-4 gating (`end-session`, `quit`), and a durable redacted audit trail.
-- An authenticated HTTP MCP listener, off by default, so a peer such as Haven can drive the desktop terminal from a phone. It refuses an unpaired client and can never assign Operator. See [Remote agents over HTTP](#remote-agents-over-http).
+- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 40 IPC verbs, 36 MCP tools, 26 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
+- Carrier-assigned consent across Tiers 1 through 4 plus `PolicyChange` with kernel-verified peer identity, Tier-3 standing policies, per-action `PolicyChange` (`install-policy`, `revoke-policy`, `pair-haven`, `revoke-peer`) and Tier-4 (`end-session`, `quit`) gating, and a durable redacted audit trail.
+- Bilateral peer pairing (`peers.json`, mode `0600`): an authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair (inbound tokens stored only as SHA-256 hashes at rest), an outbound stdlib `HavenPeerClient` over loopback or WireGuard/Yggdrasil tunnels, `list-peers` / `pair-haven` / `revoke-peer`, and a chrome Limb Status Pill (hidden when zero peers are paired). See [Remote agents over HTTP](#remote-agents-over-http).
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
@@ -144,11 +144,16 @@ Identifiers are stable regardless of the public product name, which is still ope
 Nothing listens on the network unless you ask for it. `--http-bind` names an explicit interface address, normally a WireGuard or SSH-tunneled IP:
 
 ```sh
-mutiny --http-bind 100.64.0.5:18740 --agent-consent paired
-# mutiny: HTTP MCP pairing token: 9f2c...   (generated once, printed to stderr)
+mutiny --http-bind 100.64.0.5:18740 --agent-consent ask
 ```
 
-A wildcard bind (`0.0.0.0` or `[::]`) is refused, because the listener is meant to sit on a named interface rather than every interface. Pass `--http-token` to supply your own token; otherwise one is generated from the kernel CSPRNG and printed once.
+A wildcard bind (`0.0.0.0` or `[::]`) is refused, because the listener is meant to sit on a named interface rather than every interface. By default `--http-bind` enables symmetric `initialize` tap-to-pair (pass `--no-http-pair` to disable it): an unauthenticated `POST /mcp` carrying `method: "initialize"` raises a single inline Pairing Bar in the window (concurrent requests receive HTTP `429`), lets you pick the peer's `ConsentMode`, mints an `mty_...` bearer token in `result._meta["sh.mutiny/pairingToken"]`, and stores only its SHA-256 digest in `$XDG_CONFIG_HOME/mutiny/peers.json` (`0600`). Any non-`initialize` unauthenticated request fails immediately with `401`. You can also pair an outbound Haven phone endpoint or manage peers from the CLI or Session menu:
+
+```sh
+mutiny ctl pair-haven --label pixel --url http://127.0.0.1:8740/mcp
+mutiny ctl list-peers
+mutiny ctl revoke-peer --id-or-label pixel
+```
 
 Pick a port that is not already taken. Haven's own MCP reverse tunnel binds `127.0.0.1:8730` on the workstation, so that port is a poor choice for the peer it is meant to serve. If the bind fails the listener stays down and the GUI keeps running, with a warning naming the reason.
 
@@ -204,7 +209,7 @@ curl -s http://127.0.0.1:18740/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}'
 ```
 
-What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 33 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
+What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 36 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
 
 Every one of those single-token calls audited against the mutiny process's own pid, which was the shared-identity gap before `--http-peer` added per-token peer identities.
 
@@ -224,7 +229,7 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 
 | Menu | Covers | Actions |
 | --- | --- | --- |
-| **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
+| **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Pair Haven Limb, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
 | **Edit** | the focused pane's content, and settings | Copy, Paste, Search, Previous/Next Command, Settings |
 | **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
 | **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Keybind Cheatsheet |
@@ -443,7 +448,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 208 tests, no display required
+cargo test                    # 217 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub enum ConsentTier {
     Observe,
     Act,
+    /// Mutates trust boundaries or standing grants (policy install/revoke,
+    /// peer pairing/revocation). Always requires explicit operator consent;
+    /// never auto-approved by session grants, standing policies, or paired
+    /// agent carriers.
+    PolicyChange,
     /// Tier 4: destroys state the operator cannot recover. Always per-action,
     /// never covered by a session grant, a standing policy, or a paired agent
     /// carrier.
@@ -33,6 +38,7 @@ pub enum ActionId {
     AgentAudit,
     SessionPicker,
     NewSession,
+    PairHaven,
     QuickTerminal,
     SaveSession,
     CloseTab,
@@ -62,6 +68,7 @@ impl ActionId {
         ActionId::AgentAudit,
         ActionId::SessionPicker,
         ActionId::NewSession,
+        ActionId::PairHaven,
         ActionId::QuickTerminal,
         ActionId::SaveSession,
         ActionId::CloseTab,
@@ -363,6 +370,17 @@ pub const ACTIONS: &[ActionSpec] = &[
         human_chord: "",
         in_context_menu: false,
         summary: "Create a new tmux or zellij session, or a plain shell, with a name you choose",
+    },
+    ActionSpec {
+        id: ActionId::PairHaven,
+        slug: "pair-haven",
+        title: "Pair Haven Limb…",
+        category: MenuCategory::Session,
+        consent_tier: ConsentTier::PolicyChange,
+        default_accel: None,
+        human_chord: "",
+        in_context_menu: false,
+        summary: "Pair an outbound Haven HTTP MCP limb over loopback or an encrypted tunnel",
     },
     ActionSpec {
         id: ActionId::QuickTerminal,

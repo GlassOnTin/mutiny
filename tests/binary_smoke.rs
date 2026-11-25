@@ -319,6 +319,9 @@ fn every_ipc_verb_name_is_accepted_by_the_cli() {
         "close-tab",
         "close-window",
         "quit",
+        "list-peers",
+        "pair-haven",
+        "revoke-peer",
     ] {
         let out = Command::new(BIN)
             .arg("ctl")

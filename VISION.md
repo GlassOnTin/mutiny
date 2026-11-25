@@ -1,6 +1,6 @@
 # Mutiny Product Vision
 
-Status: draft v21, 2026-11-25. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, damage tracking, per-cell glyph layout caching, host-checked OSC 7 working directories, and Tier 3/4 consent enforcement are shipped. **M1 is complete.** M2 is open: session restore (including re-attaching the opened session list in order), the authenticated HTTP MCP listener with per-peer identity and per-peer consent mode, the tmux/zellij session picker, and the in-app Settings dialog are shipped. The quick terminal is shipped as a summonable scratch window rather than a layer-shell drop-down; a system-wide global shortcut is not.
+Status: draft v22, 2026-11-25. Owner: Ian. Public name remains open; internal identifiers are fixed (see "Contracts that must not drift"). The repo is public at `GlassOnTin/mutiny` under AGPL-3.0-or-later; `v0.1.0` is tagged and `0.2.0` opens the M3 Paired-Limb cycle. M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, damage tracking, per-cell glyph layout caching, host-checked OSC 7 working directories, and Tier 3/4 plus `PolicyChange` consent enforcement are shipped. **M1 is complete.** M2 is shipped save for an unscheduled system-wide global shortcut: session restore (including re-attaching the opened session list in order), the authenticated HTTP MCP listener with per-peer identity and per-peer consent mode, the tmux/zellij session picker, the summonable scratch quick terminal, and the in-app Settings dialog are shipped. **M3 is open:** M3.1 bilateral peer pairing (`peers.json` mode `0600` storing only SHA-256 hashes of inbound tokens, symmetric `initialize` tap-to-pair, stdlib outbound `HavenPeerClient` with liveness polling, `list-peers` / `pair-haven` / `revoke-peer`, and the chrome Limb Status Pill) is shipped; M3.2 remote consent/auth forwarding and M3.3 bidirectional notifications remain.
 
 ## Thesis
 
@@ -41,7 +41,7 @@ A Linux desktop power user on Wayland or X11, KDE Plasma or a GTK desktop, runni
 3. **No silent automation, no divergent state.** Agent reads and writes operate on the exact `Workspace` rendered on screen, leave an audit trail, and surface visibly in window chrome.
 4. **Corporate and vendor neutrality.** Any CLI or MCP client speaking standard PTY and JSON-RPC conventions is a first-class peer. Vendor names never appear in product chrome or user-facing documentation. Haven is named in this document as the reference peer, not as a vendor or an endorsement; the rule binds the shipped app and its public docs, not internal design notes.
 5. **Pure Rust, human-understandable code.** Dependencies come from crates.io and standard Linux system libraries (`gtk4`, `pango`, `harfbuzz`, `fontconfig`). Every merged change must be explainable unaided by a human maintainer, which means a change too large to explain is a change to split.
-6. **Local-first.** Plain TOML config with live reload, zero telemetry, zero outbound network calls. Shipped: `$XDG_CONFIG_HOME/mutiny/config.toml`, with CLI flags taking precedence over the file over built-in defaults.
+6. **Local-first.** Plain TOML config with live reload, zero telemetry, zero unsolicited outbound network calls (outbound HTTP MCP polling runs only when the operator explicitly pairs an outbound Haven limb in `$XDG_CONFIG_HOME/mutiny/peers.json`). Shipped: `$XDG_CONFIG_HOME/mutiny/config.toml`, with CLI flags taking precedence over the file over built-in defaults.
 
 ## Presence: the Haven peer contract
 
@@ -65,7 +65,7 @@ Mutiny adopts Haven's consent ladder unchanged, so a peer moving between the two
 
 - **Tier 1 (observe).** Read-only tools and resources. No prompt.
 - **Tier 2 (act once).** One-shot writes. Per-action consent in window chrome, or a scoped session grant.
-- **Tier 3 (standing policy).** A declarative grant the agent proposes and the operator installs once, against a declared scope (which verbs, optionally pinned arguments), a rate ceiling, and an expiry. Revocable from the Agent activity screen; every covered call still audited; beyond the ceiling, calls fall back to per-action prompts. *(Shipped.)*
+- **Tier 3 (standing policy) and PolicyChange.** A declarative grant the agent proposes and the operator installs once, against a declared scope (which verbs, optionally pinned arguments), a rate ceiling, and an expiry. Revocable from the Agent activity screen; every covered call still audited; beyond the ceiling, calls fall back to per-action prompts. Verbs that mutate trust boundaries (`install-policy`, `revoke-policy`, `pair-haven`, `revoke-peer`) carry `ConsentTier::PolicyChange` and are never covered by session grants, standing policies, or paired agent carriers. *(Shipped.)*
 - **Tier 4 (irreversible).** Anything that destroys state the operator cannot recover (`end-session`, `quit`). Always per-action, never covered by a session grant, a standing policy, or a paired agent carrier. *(Shipped.)*
 
 The tier is a property of the **verb, not the caller**. A human running `mutiny ctl` *is* the consent. An agent calling the same verb raises the prompt. Reflexes never escalate themselves.
@@ -102,13 +102,17 @@ Three layers, each small and sharp:
 
 ```text
 mutiny (single Rust binary: GTK4 GUI + `mutiny ctl` CLI + `mutiny mcp` server)
-├── action      Single ActionSpec registry + ConsentTier -> keybinds, GMenuModel, palette, cheatsheet
-├── engine      PaneEngine: alacritty_terminal 0.26 + PTY + OSC 133/7/9;4 + quiescence + named keys
-├── topology    Widget-free Workspace: PaneId arena + SplitNode + urgent_next + 8-slot ExitedPane ring
-├── app         AppController: 4ms tick, IPC dispatch, consent/wait queues, audit ring, window lifecycle
-├── ipc         JSONL over $XDG_RUNTIME_DIR/mutiny.sock + consent modes + redacted AuditEntry ring
-├── mcp         Stdio JSON-RPC 2.0 MCP adapter (`tools/*` + `ui://mutiny/*`) over ipc, no engine access
-└── ui          Pure gtk4-rs (v4_22): MutinyWindow (SSD chrome, consent/notice bars, audit view) + TerminalView
+├── action       Single ActionSpec registry + ConsentTier -> keybinds, GMenuModel, palette, cheatsheet
+├── crypto       Pure-Rust SHA-256, HMAC-SHA256, constant-time compare, getrandom mty_ token minting
+├── peers        Durable $XDG_CONFIG_HOME/mutiny/peers.json (0600, inbound SHA-256 only) + InboundPeerTable
+├── peer_client  Outbound stdlib TcpStream HTTP/1.1 JSON-RPC HavenPeerClient + liveness polling
+├── http_mcp     Inbound POST /mcp bearer auth + symmetric initialize tap-to-pair gate
+├── engine       PaneEngine: alacritty_terminal 0.26 + PTY + OSC 133/7/9;4 + quiescence + named keys
+├── topology     Widget-free Workspace: PaneId arena + SplitNode + urgent_next + 8-slot ExitedPane ring
+├── app          AppController: 4ms tick, IPC dispatch, consent/pairing/wait queues, audit ring
+├── ipc          JSONL over $XDG_RUNTIME_DIR/mutiny.sock + CarrierRole/ConsentMode + AuditEntry ring
+├── mcp          Stdio JSON-RPC 2.0 MCP adapter (`tools/*` + `ui://mutiny/*`) over ipc, no engine access
+└── ui           Pure gtk4-rs (v4_22): MutinyWindow (SSD chrome, limb pill, pairing/consent bars) + TerminalView
 ```
 
 One thread, one 4 ms tick, no async runtime. Deferred replies are queues holding a cloned socket, not futures: a handler returns nothing and the stream is parked until the tick satisfies it. Vocabulary is fixed: the pane store is the `Workspace`, not a separate "PaneArena" type, so a grep for either name finds the same thing.
@@ -120,9 +124,9 @@ A plan needs a diagnosis. Against the M0 bootstrap commit:
 - **Commitment 1, engine: exercising well.** Chunked OSC 133 capture across read boundaries and scrollback rotation, host-checked local OSC 7 cwd, OSC 9;4 progress, quiescence, row-level damage tracking with per-cell Pango layout caching, and named-key encoding are implemented and tested. Two limits remain: `alacritty_terminal` parses OSC 8 hyperlinks and `PaneEngine` tracks OSC 9;4 progress without hover/click link UI or a progress bar in `TerminalView`, and the Kitty keyboard encoder honours disambiguation and report-all-keys rather than all five flags.
 - **Commitment 2, off-widget state: shipped and load-bearing.** Detach and move preserve scrollback and the running child, verified by test. Split geometry is closed: `SplitNode.ratio` is applied to the `GtkPaned`, written back on drag, and carried through tree surgery and session restore. The GTK gesture wiring itself is still not covered by tests; the model operations it calls are.
 - **Commitment 3, desktop citizenship: partly unverified.** SSD is left to KWin by construction and the chrome controls persist. The KDE global menu export has not been checked at runtime on a Plasma session; treat it as unproven until it is.
-- **Commitment 4, presence: shipped across Tiers 1 through 4, trust boundary in place.** Snapshots, search, exited ring, notices, and the audit viewer work. Consent mode is carrier-assigned, peer uid is checked, session grants bind to kernel-verified peer identity, and the audit is durable. The authenticated HTTP carrier reaches per-peer relay sockets only, so a network peer can never hold `Operator`, and each network peer carries its own token-derived identity, grants, and consent mode. The session picker composes with external multiplexers, `rename-session` and `end-session` park IPC replies until the multiplexer command exits so non-zero failures propagate to callers, and remote listing is Act because it spends the operator's credentials. Tier 3 standing policies and Tier 4 irreversible per-action gating (`end-session`, `quit`, with standing policies also forbidden from covering policy-management or Tier-4 verbs) are shipped. Remaining: standing policies live in memory rather than persisting across restarts, and same-uid processes remain mutually trusted on the operator carrier.
-- **Commitment 5, one binary: shipped.** Three entry points, two Unix carriers plus an optional HTTP carrier, MCP as adapter. The envelope carries a version and refuses a mismatch; MCP `initialize` negotiates against a supported revision set instead of echoing.
-- **Commitment 6, parity: test-locked, not generated.** 37 IPC verbs, 33 MCP tools, 25 `ActionSpec` GUI actions, 4 static resources plus a per-pane snapshot resource. `list_actions` and `ui://mutiny/actions` close the slug-discovery hole; `read_screen_text` and `wait_prompt` close the two verbs that previously had no MCP counterpart. Tests assert both directions of the mapping. The four lists are still hand-maintained.
+- **Commitment 4, presence: shipped across Tiers 1 through 4 plus bilateral M3.1 pairing, trust boundary in place.** Snapshots, search, exited ring, notices, and the audit viewer work. Consent mode is carrier-assigned, peer uid is checked, session grants bind to kernel-verified peer identity, and the audit is durable. The authenticated HTTP carrier reaches per-peer relay sockets only, so a network peer resolves strictly to `CarrierRole::Peer` and never `Operator`, and durable inbound peers in `$XDG_CONFIG_HOME/mutiny/peers.json` (`0600`) store only `token_sha256` at rest. Symmetric `initialize` tap-to-pair (rate-capped to 1 active prompt, `429` when busy) and the stdlib outbound `HavenPeerClient` (enforcing loopback/WireGuard/Yggdrasil/private plaintext rules) are shipped alongside the chrome Limb Status Pill. `PolicyChange` (`install-policy`, `revoke-policy`, `pair-haven`, `revoke-peer`) and Tier 4 `Irreversible` (`end-session`, `quit`) never ride on session grants, standing policies, or paired carriers. Remaining: Tier-3 standing policies live in memory rather than persisting across restarts, M3.2/M3.3 remote consent and notification forwarding are not yet built, and same-uid processes remain mutually trusted on the operator carrier.
+- **Commitment 5, one binary: shipped.** Three entry points, two Unix carriers plus an optional HTTP carrier and optional outbound `HavenPeerClient`, MCP as adapter. The envelope carries a version and refuses a mismatch; MCP `initialize` negotiates against a supported revision set instead of echoing.
+- **Commitment 6, parity: test-locked, not generated.** 40 IPC verbs, 36 MCP tools, 26 `ActionSpec` GUI actions, 4 static resources plus a per-pane snapshot resource. `list_actions` and `ui://mutiny/actions` close the slug-discovery hole; `read_screen_text` and `wait_prompt` close the two verbs that previously had no MCP counterpart. Tests assert both directions of the mapping. The four lists are still hand-maintained.
 
 ## Juxtapositions: surfaces that look unified and are not
 
@@ -190,7 +194,7 @@ The rung also found and fixed a real bug: an unrealized view has a 0x0 allocatio
 
 **Shipped rung: Kitty graphics vertical slice.** `src/graphics.rs` holds images and cell-anchored placements as pure data with no GTK dependency, so `PaneEngine` owns the store and the UI decodes bytes into textures. The APC scanner recognizes `ESC _ G ... ST` and supports transmit (chunked), transmit-and-place, place, delete, and query, in PNG or raw RGB/RGBA, with z-index ordering and sanitized OK/error replies that honor `q`. The renderer draws placements as `GtkSnapshot` texture nodes, scrolled with the content they are anchored to, with a texture cache invalidated by a store generation counter.
 
-`present-media` is the desktop peer of Haven's `present_media`: an Act-tier verb that reads an image file and places it inline in a pane, reachable from `mutiny ctl present-media`, the `present_media` MCP tool, and IPC. It is additive: existing request and response shapes are unchanged, the envelope stays version 1, and two optional response fields (`image_id`, `placement_id`) were added. At that rung the surface was 22 verbs, 18 tools, 4 resources (now 37 verbs, 33 tools, 4 static resources), held at parity by test.
+`present-media` is the desktop peer of Haven's `present_media`: an Act-tier verb that reads an image file and places it inline in a pane, reachable from `mutiny ctl present-media`, the `present_media` MCP tool, and IPC. It is additive: existing request and response shapes are unchanged, the envelope stays version 1, and two optional response fields (`image_id`, `placement_id`) were added. At that rung the surface was 22 verbs, 18 tools, 4 resources (now 40 verbs, 36 tools, 4 static resources), held at parity by test.
 
 Evidence: `tests/kitty_graphics.rs` asserts protocol placement and the OK reply, chunked reassembly with `q=1` suppression, sanitized error replies, the present-media verb end to end including a clean missing-file error, and that a presented image produces a texture node in the widget's render-node tree while an empty pane produces none. Both PNG and raw RGBA render. Removing the `append_texture` call makes the render test fail, so it discriminates.
 
@@ -287,6 +291,20 @@ Not verified: a physical `Ctrl+Shift+\`` keypress (the accel parses and the acti
 
 M2's remaining item is a system-wide global shortcut, which needs layer-shell or a per-compositor binding and is not scheduled.
 
+### M3: paired limb (`0.2.0`, in progress)
+
+**Shipped rung (M3.1): bilateral peer pairing and outbound Haven client.** Mutiny and Haven now pair symmetrically in both directions without adding async runtimes or HTTP/TLS crates:
+
+- `src/crypto.rs` implements pure-Rust SHA-256 (FIPS 180-4 / RFC 6234), HMAC-SHA256 (RFC 2104, prepared for M3.2 signed consent envelopes), constant-time comparison, and `libc::getrandom` `"mty_"` + base64url-no-pad token generation, verified against NIST FIPS 180-4 and RFC 4231 vectors.
+- `src/peers.rs` persists `$XDG_CONFIG_HOME/mutiny/peers.json` (`version: 1`) atomically via `.peers.json.tmp` at mode `0600` (`sync_all` + `rename`) and refuses group- or world-accessible files (`mode & 0o077 != 0`) on load. Inbound peers store only `token_sha256` at rest, never plaintext tokens; CLI `--http-peer LABEL=TOKEN[:MODE]` merges into the same `Arc<RwLock<InboundPeerTable>>` SHA-256 lookup path, so newly paired or revoked peers take effect immediately without restarting `--http-bind`.
+- `src/http_mcp.rs` and `src/ui/window.rs` implement symmetric inbound `initialize` tap-to-pair (active by default when `--http-bind` is set; `--no-http-pair` opts out). At most one pairing prompt can be pending at a time (concurrent unauthenticated `initialize` calls receive HTTP `429 Too Many Requests`), non-`initialize` unauthenticated calls fail immediately with `401`, and approval mints an `mty_...` token returned in `result._meta["sh.mutiny/pairingToken"]` while persisting only its SHA-256 hash.
+- `src/peer_client.rs` runs a bounded stdlib `TcpStream` HTTP/1.1 JSON-RPC 2.0 worker thread (`HavenPeerClient`) communicating with `app.rs` exclusively via bounded `mpsc` channels polled on the 4 ms tick. It supports IPv4 and bracketed IPv6 (`[::1]`, Yggdrasil `200::/7`, WireGuard/CGNAT `100.64.0.0/10`, RFC 1918, `fc00::/7`), refuses public internet plaintext HTTP IPs, runs Haven's `_meta["sh.haven/pairingToken"]` tap-to-pair with a 65 s read window, polls `get_app_info` / `ping` liveness (15 s connected, 5 s to 30 s backoff offline), and exposes `call_tool` plumbing for M3.2/M3.3.
+- `list-peers` (`Observe`), `pair-haven` (`PolicyChange`), and `revoke-peer` (`PolicyChange`) are wired across IPC, `mutiny ctl`, `mutiny mcp`, and the chrome Limb Status Pill (hidden when zero peers exist; shows `● haven:<label>`, `◐ pairing…`, `◌ haven:<label>`, or `● limb:<label>` with a revoke/pair popover).
+
+Evidence: `tests/m3_pairing.rs` drives end-to-end inbound tap-to-pair (`401` on non-`initialize`, `429` on concurrent `initialize`, `200` with `_meta["sh.mutiny/pairingToken"]` on approval, `0600` disk persistence with zero plaintext inbound tokens, authenticated `tools/call` audited as `CarrierRole::Peer`, and immediate `401` on live `revoke-peer`), outbound `HavenPeerClient` against a local mock Haven HTTP server (`Pairing` -> `Connected` -> `Offline` -> `Connected` plus public-IP refusal), `PolicyChange` non-bypass against session grants, standing policies, and `Paired` carriers, and real GTK4 Pairing Bar + Limb Status Pill visibility under Xvfb.
+
+Remaining for M3: M3.2 remote consent and auth forwarding (`request_consent` over HMAC-SHA256) and M3.3 bidirectional notification bridge.
+
 ## Contracts that must not drift
 
 These are cheap to state now and expensive to retrofit.
@@ -308,7 +326,7 @@ A tight scope is how a small project stays coherent. Mutiny deliberately does no
 - **Depend on libadwaita or force client-side decorations.** No GNOME-only chrome assumptions.
 - **Carry Ghostty code, Zig build steps, or C-ABI core bindings.** One pure-Rust VT engine, no facade.
 - **Support Sixel.** Kitty graphics is the image path.
-- **Target macOS or Windows, ship telemetry, or keep a second GUI config store.** One platform family, one config file, no outbound calls.
+- **Target macOS or Windows, ship telemetry, or keep a second GUI config store.** One platform family, one config file, no unsolicited outbound calls.
 
 ---
 

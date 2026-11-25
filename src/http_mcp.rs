@@ -1,51 +1,55 @@
 //! Authenticated streamable-HTTP MCP carrier, so a peer such as Haven can drive
-//! the desktop terminal from another device.
+//! the desktop terminal from another device, with optional symmetric
+//! `initialize` tap-to-pair.
 //!
-//! Off by default: nothing listens unless an bind address is explicitly
+//! Off by default: nothing listens unless a bind address is explicitly
 //! configured. A wildcard bind is refused, because the listener is meant to sit
-//! on a named WireGuard or SSH-tunneled interface, not on every interface.
+//! on a named WireGuard, Yggdrasil, or SSH-tunneled interface, not on every
+//! interface.
 //!
-//! Every request must carry the pairing token. An unpaired client is refused
-//! before its body is even read.
+//! Authenticated requests present `Authorization: Bearer <token>`, verified via
+//! SHA-256 constant-time lookup against the live `InboundPeerTable`. When
+//! tap-to-pair is enabled (the default on `--http-bind`, disabled by
+//! `--no-http-pair`), an unauthenticated `POST /mcp` whose JSON-RPC method is
+//! `initialize` raises at most one inline operator prompt at a time (returning
+//! HTTP `429 Too Many Requests` if a prompt is already open) and, only if
+//! approved within 60 seconds, mints an `mty_...` token, persists only its
+//! SHA-256 hash to `peers.json`, and returns `_meta["sh.mutiny/pairingToken"]`
+//! in the `initialize` result. Any other unauthenticated request fails
+//! immediately with `401 Unauthorized`.
 //!
 //! Requests are forwarded to a per-peer relay Unix socket, never the operator
 //! socket. Each relay carrier pins its own consent mode (`ask`, `paired`, or
-//! `observe-only`, defaulting to `--agent-consent` from GUI launch), so a
-//! network client can never be assigned `Operator`. That is structural, not a
-//! check that could be forgotten: this module has no path to the operator
-//! socket at all.
+//! `observe-only`), so a network client can never be assigned `Operator`.
 //!
-//! HTTP has no `SO_PEERCRED` equivalent, so the pairing token IS the peer
-//! credential. Each configured peer has its own token and its own relay socket,
-//! and the controller assigns that socket a distinct token-derived identity.
-//! Two peers are therefore distinguishable in the audit trail and in the grant
-//! set: an Allow Session tap for one peer does not cover another. The remote
-//! client cannot choose its identity, only present a token; the token-to-carrier
-//! mapping is fixed by operator configuration at launch.
-//!
-//! Bounded slice: POST /mcp with a JSON response. SSE streaming, session
-//! management, and DELETE are not implemented. Each request is stateless, so
-//! the name a client sends in `initialize` does not persist; calls are audited
-//! under the peer's configured label, with per-peer identity, grants, and
-//! consent mode.
+//! Bounded slice: `POST /mcp` with a JSON response over `40` IPC verbs and `36`
+//! MCP tools. SSE streaming, session management, and `DELETE` are not
+//! implemented.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use serde_json::{Value, json};
+
+use crate::crypto;
 use crate::ipc::ConsentMode;
-use crate::mcp::McpBridge;
+use crate::mcp::{McpBridge, negotiate_protocol_version};
+use crate::mux;
+use crate::peers::{InboundPeerTable, LiveInboundPeer, unix_now_secs};
 
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_PAIRING_BODY_BYTES: usize = 64 * 1024;
+const MAX_HEADER_LINES: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PAIRING_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One paired peer. `socket` is the relay carrier the controller bound for this
-/// token's identity; the operator socket is deliberately not reachable from
-/// here.
+/// One statically configured HTTP peer (used by `HttpMcpConfig` / CLI launch).
 #[derive(Debug, Clone)]
 pub struct HttpPeer {
     /// Display and audit label the operator assigned. Not an identity: the
@@ -61,6 +65,50 @@ pub struct HttpMcpConfig {
     pub peers: Vec<HttpPeer>,
 }
 
+#[derive(Debug)]
+pub enum PairingOutcome {
+    Approved {
+        peer_id: String,
+        plaintext_token: String,
+    },
+    Denied,
+}
+
+#[derive(Debug)]
+pub struct PairingRequest {
+    pub client_name: String,
+    pub protocol_version: Option<String>,
+    pub remote_addr: SocketAddr,
+    pub reply_tx: SyncSender<PairingOutcome>,
+}
+
+/// Shared single-slot gate enforcing at most one pending tap-to-pair prompt at
+/// a time across all HTTP connections.
+#[derive(Clone)]
+pub struct PairingGate {
+    in_flight: Arc<AtomicBool>,
+    tx: SyncSender<PairingRequest>,
+}
+
+pub fn new_pairing_gate() -> (PairingGate, Receiver<PairingRequest>) {
+    let (tx, rx) = mpsc::sync_channel(1);
+    (
+        PairingGate {
+            in_flight: Arc::new(AtomicBool::new(false)),
+            tx,
+        },
+        rx,
+    )
+}
+
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Refuses a wildcard bind. The listener must name an explicit interface.
 pub fn validate_bind(addr: &SocketAddr) -> Result<(), String> {
     if addr.ip().is_unspecified() {
@@ -71,25 +119,10 @@ pub fn validate_bind(addr: &SocketAddr) -> Result<(), String> {
     Ok(())
 }
 
-/// A random pairing token, hex-encoded. Reads the kernel CSPRNG rather than
-/// adding a dependency or using a non-cryptographic hasher.
+/// A random pairing token (`mty_` + base64url-no-pad) generated via
+/// `libc::getrandom`.
 pub fn generate_token() -> io::Result<String> {
-    let mut bytes = [0u8; 24];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Length-independent comparison over equal-length slices, so a wrong token
-/// cannot be recovered by timing byte-by-byte guesses.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    crypto::generate_pairing_token()
 }
 
 pub struct HttpHandle {
@@ -115,11 +148,6 @@ impl Drop for HttpHandle {
 
 /// Parses `LABEL=TOKEN[:MODE]`. Without a MODE the peer inherits
 /// `--agent-consent`, so existing invocations keep working.
-///
-/// The mode suffix is only stripped when it actually names a mode, so a token
-/// containing a colon still works. A token whose final segment happens to be
-/// `ask`, `paired`, or `observe-only` is ambiguous; use `--http-token` for that
-/// case. Generated tokens are hex and cannot collide.
 pub fn parse_http_peer(
     raw: &str,
     default_mode: ConsentMode,
@@ -134,9 +162,6 @@ pub fn parse_http_peer(
     let (token, mode) = match rest.rsplit_once(':') {
         Some((head, suffix)) if !head.is_empty() => match ConsentMode::parse_peer_mode(suffix) {
             Ok(mode) => (head, mode),
-            // Not a mode, so the colon belongs to the token. An explicit
-            // "operator" suffix is still refused rather than silently treated
-            // as part of a token, because it signals a mistaken expectation.
             Err(err) if suffix.trim().eq_ignore_ascii_case("operator") => return Err(err),
             Err(_) => (rest, default_mode),
         },
@@ -158,8 +183,6 @@ pub fn mode_label(mode: ConsentMode) -> &'static str {
 }
 
 /// Refuses an empty peer set, a blank token, or two peers sharing a label.
-/// Duplicate labels would make the trail ambiguous even though the identities
-/// differ, so they are rejected at launch rather than explained later.
 pub fn validate_peers(peers: &[HttpPeer]) -> Result<(), String> {
     if peers.is_empty() {
         return Err(String::from(
@@ -181,38 +204,59 @@ pub fn validate_peers(peers: &[HttpPeer]) -> Result<(), String> {
     Ok(())
 }
 
-/// Finds the peer whose token was presented. Every token is compared, with no
-/// early exit, so the work does not depend on which peer matched.
-fn authenticate<'a>(peers: &'a [HttpPeer], presented: Option<&str>) -> Option<&'a HttpPeer> {
-    let presented = presented?;
-    let mut found = None;
-    for peer in peers {
-        if constant_time_eq(presented.as_bytes(), peer.token.as_bytes()) {
-            found = Some(peer);
-        }
-    }
-    found
-}
-
+/// Spawns an HTTP MCP listener from a fixed `HttpMcpConfig` with tap-to-pair
+/// disabled (every token hashed into an `InboundPeerTable`).
 pub fn spawn(cfg: HttpMcpConfig) -> io::Result<HttpHandle> {
     validate_bind(&cfg.bind).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     validate_peers(&cfg.peers).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let listener = TcpListener::bind(cfg.bind)?;
+    let mut table = InboundPeerTable::new();
+    let now = unix_now_secs();
+    for (idx, peer) in cfg.peers.into_iter().enumerate() {
+        table
+            .insert(LiveInboundPeer {
+                id: format!("cli-{idx}"),
+                label: peer.label.clone(),
+                client_name: peer.label,
+                token_sha256: crypto::sha256(peer.token.as_bytes()),
+                socket: peer.socket,
+                consent_mode: ConsentMode::Paired,
+                ephemeral: true,
+                paired_at: now,
+                last_seen_at: None,
+            })
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
+    spawn_pairable(cfg.bind, Arc::new(RwLock::new(table)), None)
+}
+
+/// Spawns an HTTP MCP listener backed by a hot-updatable `InboundPeerTable` and
+/// an optional symmetric `initialize` tap-to-pair `PairingGate`.
+pub fn spawn_pairable(
+    bind: SocketAddr,
+    peer_table: Arc<RwLock<InboundPeerTable>>,
+    pairing: Option<PairingGate>,
+) -> io::Result<HttpHandle> {
+    validate_bind(&bind).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    if pairing.is_none() && peer_table.read().unwrap().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an HTTP MCP listener with tap-to-pair disabled requires at least one paired peer",
+        ));
+    }
+    let listener = TcpListener::bind(bind)?;
     listener.set_nonblocking(true)?;
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&shutdown);
-    let peers = Arc::new(cfg.peers);
 
     let join = thread::spawn(move || {
         while !flag.load(Ordering::Relaxed) {
             match listener.accept() {
-                Ok((stream, _)) => {
-                    let peers = Arc::clone(&peers);
-                    // A thread per connection with a read timeout, so one slow
-                    // client cannot stall the others.
+                Ok((stream, remote_addr)) => {
+                    let table = Arc::clone(&peer_table);
+                    let gate = pairing.clone();
                     thread::spawn(move || {
-                        let _ = handle_conn(stream, &peers);
+                        let _ = handle_conn(stream, remote_addr, &table, gate.as_ref());
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -237,6 +281,7 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
         401 => "Unauthorized",
         404 => "Not Found",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         _ => "Error",
     };
     let head = format!(
@@ -248,22 +293,39 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     stream.flush()
 }
 
-fn handle_conn(mut stream: TcpStream, peers: &[HttpPeer]) -> io::Result<()> {
+fn respond_unpaired(stream: &mut TcpStream) -> io::Result<()> {
+    respond(
+        stream,
+        401,
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"unpaired client: a valid pairing token is required"}}"#,
+    )
+}
+
+fn handle_conn(
+    mut stream: TcpStream,
+    remote_addr: SocketAddr,
+    peer_table: &RwLock<InboundPeerTable>,
+    pairing: Option<&PairingGate>,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
 
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(());
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
     let path = parts.next().unwrap_or_default().to_owned();
 
     let mut content_length = 0usize;
     let mut authorization: Option<String> = None;
-    loop {
+    for _ in 0..MAX_HEADER_LINES {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
         let line = line.trim_end();
         if line.is_empty() {
             break;
@@ -285,36 +347,137 @@ fn handle_conn(mut stream: TcpStream, peers: &[HttpPeer]) -> io::Result<()> {
         );
     }
 
-    // Authenticate before reading the body, so an unpaired client cannot make
-    // us allocate or forward anything.
-    let presented = authorization
-        .as_deref()
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim);
-    let Some(peer) = authenticate(peers, presented) else {
-        return respond(
-            &mut stream,
-            401,
-            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"unpaired client: a valid pairing token is required"}}"#,
-        );
-    };
+    // If an Authorization header was sent, verify the Bearer token via SHA-256
+    // constant-time lookup before reading any request body.
+    if let Some(auth_val) = authorization.as_deref() {
+        let presented = auth_val.strip_prefix("Bearer ").map(str::trim);
+        let peer = presented.and_then(|tok| {
+            peer_table
+                .write()
+                .ok()
+                .and_then(|mut t| t.authenticate(tok, unix_now_secs()))
+        });
+        let Some(peer) = peer else {
+            return respond_unpaired(&mut stream);
+        };
 
+        if content_length > MAX_BODY_BYTES {
+            return respond(&mut stream, 413, r#"{"error":"request body too large"}"#);
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let text = String::from_utf8_lossy(&body);
+
+        let mut bridge = McpBridge::new(peer.socket, ConsentMode::Paired, peer.label);
+        return match bridge.handle_line(&text) {
+            Some(reply) => respond(&mut stream, 200, &reply),
+            None => respond(&mut stream, 202, ""),
+        };
+    }
+
+    // Unauthenticated POST /mcp: only `initialize` can trigger tap-to-pair, and
+    // only when `pairing` is enabled.
+    let Some(gate) = pairing else {
+        return respond_unpaired(&mut stream);
+    };
     if content_length > MAX_BODY_BYTES {
         return respond(&mut stream, 413, r#"{"error":"request body too large"}"#);
     }
+    if content_length == 0 || content_length > MAX_PAIRING_BODY_BYTES {
+        return respond_unpaired(&mut stream);
+    }
+
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;
-    let text = String::from_utf8_lossy(&body);
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return respond_unpaired(&mut stream),
+    };
+    if parsed.get("method").and_then(Value::as_str) != Some("initialize") {
+        return respond_unpaired(&mut stream);
+    }
+    let Some(req_id) = parsed.get("id").filter(|id| !id.is_null()).cloned() else {
+        return respond_unpaired(&mut stream);
+    };
 
-    // Paired here means "no local ceiling"; the effective mode is whatever the
-    // agent carrier was pinned to at launch, which is never Operator. The socket
-    // is this peer's own relay carrier, so the controller records the identity
-    // that peer's token maps to rather than this process's pid.
-    let mut bridge = McpBridge::new(peer.socket.clone(), ConsentMode::Paired, peer.label.clone());
-    match bridge.handle_line(&text) {
-        Some(reply) => respond(&mut stream, 200, &reply),
-        // A JSON-RPC notification has no reply.
-        None => respond(&mut stream, 202, ""),
+    if gate
+        .in_flight
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let busy = json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32002,
+                "message": "pairing prompt already pending; wait for operator decision"
+            }
+        });
+        return respond(&mut stream, 429, &busy.to_string());
+    }
+    let _guard = InFlightGuard(Arc::clone(&gate.in_flight));
+
+    let params = parsed.get("params").cloned().unwrap_or_else(|| json!({}));
+    let raw_client = params
+        .get("clientInfo")
+        .and_then(|ci| ci.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("mcp-peer");
+    let clean_client = {
+        let s = mux::sanitize_text(raw_client.trim(), 64);
+        if s.is_empty() {
+            String::from("mcp-peer")
+        } else {
+            s
+        }
+    };
+    let requested_proto = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if gate
+        .tx
+        .try_send(PairingRequest {
+            client_name: clean_client,
+            protocol_version: requested_proto.clone(),
+            remote_addr,
+            reply_tx,
+        })
+        .is_err()
+    {
+        return respond_unpaired(&mut stream);
+    }
+
+    match reply_rx.recv_timeout(PAIRING_TIMEOUT) {
+        Ok(PairingOutcome::Approved {
+            peer_id,
+            plaintext_token,
+        }) => {
+            let negotiated = negotiate_protocol_version(requested_proto.as_deref());
+            let ok = json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": negotiated,
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {}
+                    },
+                    "serverInfo": {
+                        "name": "mutiny",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "_meta": {
+                        "sh.mutiny/pairingToken": plaintext_token,
+                        "sh.mutiny/peerId": peer_id
+                    }
+                }
+            });
+            respond(&mut stream, 200, &ok.to_string())
+        }
+        Ok(PairingOutcome::Denied) | Err(_) => respond_unpaired(&mut stream),
     }
 }
 
@@ -335,20 +498,11 @@ mod tests {
     }
 
     #[test]
-    fn token_comparison_is_exact() {
-        assert!(constant_time_eq(b"abc123", b"abc123"));
-        assert!(!constant_time_eq(b"abc123", b"abc124"));
-        assert!(!constant_time_eq(b"abc123", b"abc12"));
-        assert!(!constant_time_eq(b"", b"x"));
-        assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
     fn generated_tokens_are_long_random_and_distinct() {
         let a = generate_token().expect("token");
         let b = generate_token().expect("token");
-        assert_eq!(a.len(), 48, "24 bytes hex-encoded");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(a.starts_with("mty_"));
+        assert_eq!(a.len(), 47, "mty_ + 43 chars base64url");
         assert_ne!(a, b);
     }
 
@@ -399,8 +553,6 @@ mod tests {
 
     #[test]
     fn peer_mode_syntax_defaults_inherits_and_refuses_operator() {
-        use crate::ipc::ConsentMode;
-        // No suffix inherits the launch default, so old invocations still work.
         let (label, token, mode) = parse_http_peer("phone=abc123", ConsentMode::Ask).unwrap();
         assert_eq!((label.as_str(), token.as_str()), ("phone", "abc123"));
         assert_eq!(mode, ConsentMode::Ask);
@@ -415,14 +567,11 @@ mod tests {
             assert_eq!(mode, expected, "{text}");
         }
 
-        // Operator is not assignable, and is refused rather than absorbed into
-        // the token, because it signals a mistaken expectation.
         let err = parse_http_peer("phone=abc123:operator", ConsentMode::Ask).unwrap_err();
         assert!(err.contains("operator"), "{err}");
         assert!(ConsentMode::parse_peer_mode("operator").is_err());
         assert!(ConsentMode::parse_peer_mode("nonsense").is_err());
 
-        // A colon that is not a mode belongs to the token.
         let (_, token, mode) = parse_http_peer("phone=abc:123", ConsentMode::ObserveOnly).unwrap();
         assert_eq!(token, "abc:123");
         assert_eq!(mode, ConsentMode::ObserveOnly);
@@ -434,23 +583,25 @@ mod tests {
 
     #[test]
     fn each_token_selects_its_own_peer_and_nothing_else_does() {
-        let peers = vec![peer("phone", "token-aaa"), peer("laptop", "token-bbb")];
-        assert_eq!(
-            authenticate(&peers, Some("token-aaa")).unwrap().label,
-            "phone"
-        );
-        assert_eq!(
-            authenticate(&peers, Some("token-bbb")).unwrap().label,
-            "laptop"
-        );
-        assert!(authenticate(&peers, Some("token-ccc")).is_none());
-        assert!(
-            authenticate(&peers, Some("token-aa")).is_none(),
-            "prefix is not a match"
-        );
-        assert!(authenticate(&peers, None).is_none());
-        // Each peer routes to its own relay socket, which is what carries its
-        // identity into the audit trail.
-        assert_ne!(peers[0].socket, peers[1].socket);
+        let mut table = InboundPeerTable::new();
+        for (id, label, tok) in [("1", "phone", "token-aaa"), ("2", "laptop", "token-bbb")] {
+            table
+                .insert(LiveInboundPeer {
+                    id: id.to_owned(),
+                    label: label.to_owned(),
+                    client_name: label.to_owned(),
+                    token_sha256: crypto::sha256(tok.as_bytes()),
+                    socket: PathBuf::from(format!("/nonexistent-{label}.sock")),
+                    consent_mode: ConsentMode::Ask,
+                    ephemeral: true,
+                    paired_at: 1,
+                    last_seen_at: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(table.authenticate("token-aaa", 2).unwrap().label, "phone");
+        assert_eq!(table.authenticate("token-bbb", 2).unwrap().label, "laptop");
+        assert!(table.authenticate("token-ccc", 2).is_none());
+        assert!(table.authenticate("token-aa", 2).is_none());
     }
 }
