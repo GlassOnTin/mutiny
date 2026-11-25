@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, M1, and M2 (save for an unscheduled system-wide global shortcut) are shipped, and M3.1 bilateral peer pairing (`0.2.0` cycle) is shipped: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair and durable `peers.json` (`0600`, SHA-256 inbound hashes only), the outbound `HavenPeerClient` and chrome Limb Status Pill, the tmux/zellij session picker, the Settings dialog, Tier-3 standing policies, `PolicyChange` and Tier-4 irreversible per-action gating, and the summonable scratch quick terminal all work today. The engine, pane mobility, peer pairing, and agent surface are covered by 217 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, M1, and M2 (save for an unscheduled system-wide global shortcut) are shipped, and M3.1 bilateral peer pairing plus M3.2 mirrored authentication and HMAC-signed cross-limb consent (`0.2.0` cycle) are shipped: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair and durable `peers.json` (`0600`, SHA-256 inbound hashes only), the outbound `HavenPeerClient` with HMAC-SHA256 cross-limb consent co-signing, the inline Haven stalled SSH Auth Bar, Operator-only `insert-peer-totp` (`Ctrl+Shift+Y`), the chrome Limb Status Pill, the tmux/zellij session picker, the Settings dialog, Tier-3 standing policies, `PolicyChange` and Tier-4 irreversible per-action gating, and the summonable scratch quick terminal all work today. The engine, pane mobility, peer pairing, cross-limb auth/consent, and agent surface are covered by 223 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
 
 Working today:
 
@@ -22,9 +22,9 @@ Working today:
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
 - Mouse reporting: when a program asks for mouse events (tmux with `mouse on`, vim, less), the wheel and clicks go to it instead of mutiny's scrollback and selection. Hold Shift to override back to local scrollback and selection.
-- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 40 IPC verbs, 36 MCP tools, 26 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
-- Carrier-assigned consent across Tiers 1 through 4 plus `PolicyChange` with kernel-verified peer identity, Tier-3 standing policies, per-action `PolicyChange` (`install-policy`, `revoke-policy`, `pair-haven`, `revoke-peer`) and Tier-4 (`end-session`, `quit`) gating, and a durable redacted audit trail.
-- Bilateral peer pairing (`peers.json`, mode `0600`): an authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair (inbound tokens stored only as SHA-256 hashes at rest), an outbound stdlib `HavenPeerClient` over loopback or WireGuard/Yggdrasil tunnels, `list-peers` / `pair-haven` / `revoke-peer`, and a chrome Limb Status Pill (hidden when zero peers are paired). See [Remote agents over HTTP](#remote-agents-over-http).
+- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 41 IPC verbs, 37 MCP tools, 27 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
+- Carrier-assigned consent across Tiers 1 through 4 plus `PolicyChange` with kernel-verified peer identity, Tier-3 standing policies, per-action `PolicyChange` (`install-policy`, `revoke-policy`, `pair-haven`, `enroll-haven-signer`, `revoke-peer`) and Tier-4 (`end-session`, `quit`) gating, and a durable redacted audit trail.
+- Bilateral peer pairing and mirrored authentication (`peers.json`, mode `0600`): an authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair (inbound tokens stored only as SHA-256 hashes at rest), an outbound stdlib `HavenPeerClient` over loopback or WireGuard/Yggdrasil tunnels, `list-peers` / `pair-haven` / `enroll-haven-signer` / `revoke-peer`, unfocused cross-limb HMAC-SHA256 consent co-signing on Haven across Tiers 2 through 4 (with strict one-shot enforcement on `PolicyChange` and Tier-4 `Irreversible`), an inline GTK4 Haven Auth Bar for stalled phone SSH prompts (physical widget interaction only), `insert-peer-totp` (`Ctrl+Shift+Y`, local Operator/GUI only, typed straight into the PTY without touching the clipboard), and a chrome Limb Status Pill (hidden when zero peers are paired). See [Remote agents over HTTP](#remote-agents-over-http).
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications reach the desktop via `org.freedesktop.Notifications` and badge the notifying tab.
@@ -150,7 +150,8 @@ mutiny --http-bind 100.64.0.5:18740 --agent-consent ask
 A wildcard bind (`0.0.0.0` or `[::]`) is refused, because the listener is meant to sit on a named interface rather than every interface. By default `--http-bind` enables symmetric `initialize` tap-to-pair (pass `--no-http-pair` to disable it): an unauthenticated `POST /mcp` carrying `method: "initialize"` raises a single inline Pairing Bar in the window (concurrent requests receive HTTP `429`), lets you pick the peer's `ConsentMode`, mints an `mty_...` bearer token in `result._meta["sh.mutiny/pairingToken"]`, and stores only its SHA-256 digest in `$XDG_CONFIG_HOME/mutiny/peers.json` (`0600`). Any non-`initialize` unauthenticated request fails immediately with `401`. You can also pair an outbound Haven phone endpoint or manage peers from the CLI or Session menu:
 
 ```sh
-mutiny ctl pair-haven --label pixel --url http://127.0.0.1:8740/mcp
+mutiny ctl pair-haven --label pixel --url http://127.0.0.1:8740/mcp --enroll-signer
+mutiny ctl enroll-haven-signer --id-or-label pixel
 mutiny ctl list-peers
 mutiny ctl revoke-peer --id-or-label pixel
 ```
@@ -209,7 +210,7 @@ curl -s http://127.0.0.1:18740/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}'
 ```
 
-What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 36 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
+What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 37 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
 
 Every one of those single-token calls audited against the mutiny process's own pid, which was the shared-identity gap before `--http-peer` added per-token peer identities.
 
@@ -230,7 +231,7 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 | Menu | Covers | Actions |
 | --- | --- | --- |
 | **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Pair Haven Limb, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
-| **Edit** | the focused pane's content, and settings | Copy, Paste, Search, Previous/Next Command, Settings |
+| **Edit** | the focused pane's content, and settings | Copy, Paste, Insert Haven TOTP Code, Search, Previous/Next Command, Settings |
 | **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
 | **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Keybind Cheatsheet |
 
@@ -277,7 +278,7 @@ The MCP surface mirrors Haven's vocabulary: `propose_policy`, `list_policies`, `
 
 ## Settings
 
-`Ctrl+Shift+,` or Edit → Settings opens a dialog covering **every** key in the config store: font, all colours including the 16 ANSI entries, geometry, scrollback, and the whole `[sessions]` table. Save writes `config.toml`, which live-reloads, so most changes apply without a restart. Reset to Defaults writes the defaults back.
+`Ctrl+Shift+,` or Edit → Settings opens a dialog covering **every** key in the config store: font, all colours including the 16 ANSI entries, geometry, scrollback, `[sessions]`, and `[peer]`. Save writes `config.toml`, which live-reloads, so most changes apply without a restart. Reset to Defaults writes the defaults back.
 
 A test counts the dialog's editable widgets against the number of config keys, so adding a key without exposing it fails the build rather than silently leaving it unreachable.
 
@@ -350,6 +351,10 @@ ignore_size = false            # true adds tmux -f ignore-size, so this client c
 show_exited = true             # show zellij's resurrectable EXITED sessions, badged
 refresh_interval_s = 15        # re-list sessions so the submenu stays current; 0 disables
 preferred = "tmux"             # what New Tab uses: tmux, zellij, or none for a plain shell
+
+[peer]
+relay_unfocused_consent = true # auto-relay parked consent prompts to a connected Haven signer when unfocused
+unfocused_grace_ms = 1500      # clamped 0..60000; delay before unfocused consent auto-relays
 ```
 
 Colors are `#rrggbb`. The 256-color cube and grayscale ramp beyond ANSI 16 are computed, not configurable.
@@ -409,6 +414,7 @@ Not implemented: animation frames, file and shared-memory transmission, unicode 
 | Jump to next urgent pane | `Ctrl+Shift+A` |
 | Jump to previous / next OSC 133 prompt | `Ctrl+Shift+Up` / `Down` |
 | Copy / paste | `Ctrl+Shift+C` / `V` |
+| Insert Haven TOTP code | `Ctrl+Shift+Y` |
 | Search scrollback | `Ctrl+Shift+F` |
 | Toggle menu bar | `Ctrl+Shift+M` |
 | Command palette | `Ctrl+Shift+P` |
@@ -437,7 +443,7 @@ Session grants bind to a kernel-verified peer identity (uid, pid, and process st
 
 Every decision appends to a redacted, durable audit trail at `$XDG_STATE_HOME/mutiny/audit.jsonl`, recording the verb, its tier, the carrier, the peer identity, and the decision. Text payloads are logged as byte counts, never content. `Ctrl+Shift+J` opens the viewer, where session grants can be revoked.
 
-Ask mode fails closed when no GUI window is open to present a prompt. Consent chrome is not keyboard-reachable and no action verb resolves a consent, so input injection cannot confirm its own permission.
+Ask mode fails closed when neither a GUI window nor a connected signer-enrolled Haven limb is available to present a prompt. Consent chrome is not keyboard-reachable and no action verb resolves a consent, so input injection cannot confirm its own permission.
 
 One limit is worth stating plainly: same-uid processes are mutually trusted under the Unix model. Any process running as you can reach the operator socket and act as the operator. The uid check closes the cross-user hole, not that one.
 
@@ -448,7 +454,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 217 tests, no display required
+cargo test                    # 223 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

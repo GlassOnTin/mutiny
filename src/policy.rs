@@ -263,6 +263,7 @@ mod tests {
             "revoke-policy",
             "list-peers",
             "pair-haven",
+            "enroll-haven-signer",
             "revoke-peer",
             "*",
             "not-a-real-verb",

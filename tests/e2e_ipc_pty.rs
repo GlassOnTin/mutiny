@@ -598,6 +598,7 @@ fn every_advertised_mcp_tool_dispatches() {
             "pair_haven" => {
                 json!({"label": "probe", "url": "http://127.0.0.1:1/mcp", "token": "probe"})
             }
+            "enroll_haven_signer" => json!({"id_or_label": "absent-peer"}),
             "revoke_peer" => json!({"id_or_label": "absent-peer"}),
             // A nonexistent pane: the probe asserts dispatch, not success, and
             // closing a real pane would tear down the server other probes use.

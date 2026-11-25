@@ -86,6 +86,7 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::RevokePolicy { .. } => Some(McpSurface::Tool("revoke_policy")),
         IpcRequest::ListPeers => Some(McpSurface::Tool("list_peers")),
         IpcRequest::PairHaven { .. } => Some(McpSurface::Tool("pair_haven")),
+        IpcRequest::EnrollHavenSigner { .. } => Some(McpSurface::Tool("enroll_haven_signer")),
         IpcRequest::RevokePeer { .. } => Some(McpSurface::Tool("revoke_peer")),
         IpcRequest::EndSession { .. } => Some(McpSurface::Tool("end_session")),
         IpcRequest::ClosePane { .. } => Some(McpSurface::Tool("close_pane")),
@@ -498,7 +499,7 @@ impl McpBridge {
                         bracketed_paste,
                         return_snapshot,
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "send_to_agent" => {
@@ -517,7 +518,7 @@ impl McpBridge {
                         message,
                         max_lines,
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "spawn_pane" => {
@@ -542,13 +543,13 @@ impl McpBridge {
                         cwd: opt_cwd(),
                     },
                 };
-                (req, Duration::from_secs(30))
+                (req, Duration::from_secs(70))
             }
             "detach_split" => (
                 IpcRequest::DetachSplit {
                     pane: opt_pane("pane"),
                 },
-                Duration::from_secs(30),
+                Duration::from_secs(70),
             ),
             "move_pane" => {
                 let pane =
@@ -569,13 +570,13 @@ impl McpBridge {
                             SplitAxis::Horizontal
                         },
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "focus_pane" => {
                 let pane =
                     opt_pane("pane").ok_or_else(|| (-32602, String::from("`pane` is required")))?;
-                (IpcRequest::Focus { pane }, Duration::from_secs(30))
+                (IpcRequest::Focus { pane }, Duration::from_secs(70))
             }
             "run_action" => {
                 let slug = args
@@ -589,11 +590,11 @@ impl McpBridge {
                         action: spec.id,
                         window: opt_win("window"),
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
-            "save_session" => (IpcRequest::SaveSession, Duration::from_secs(15)),
-            "toggle_quick" => (IpcRequest::ToggleQuick, Duration::from_secs(15)),
+            "save_session" => (IpcRequest::SaveSession, Duration::from_secs(70)),
+            "toggle_quick" => (IpcRequest::ToggleQuick, Duration::from_secs(70)),
             "new_session" => {
                 let kind = match args.get("kind").and_then(Value::as_str) {
                     None | Some("tmux") => Some(crate::mux::MuxKind::Tmux),
@@ -616,7 +617,7 @@ impl McpBridge {
                         mode,
                         window: opt_win("window"),
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "list_policies" => (IpcRequest::ListPolicies, Duration::from_secs(10)),
@@ -624,13 +625,13 @@ impl McpBridge {
                 IpcRequest::InstallPolicy {
                     id: args.get("id").and_then(Value::as_u64).unwrap_or(0),
                 },
-                Duration::from_secs(10),
+                Duration::from_secs(70),
             ),
             "revoke_policy" => (
                 IpcRequest::RevokePolicy {
                     id: args.get("id").and_then(Value::as_u64).unwrap_or(0),
                 },
-                Duration::from_secs(10),
+                Duration::from_secs(70),
             ),
             "list_peers" => (IpcRequest::ListPeers, Duration::from_secs(5)),
             "pair_haven" => {
@@ -649,12 +650,35 @@ impl McpBridge {
                     .and_then(Value::as_str)
                     .filter(|s| !s.trim().is_empty())
                     .map(str::to_owned);
-                let timeout = if token.is_some() {
-                    Duration::from_secs(20)
-                } else {
-                    Duration::from_secs(70)
+                let enroll_signer = args
+                    .get("enroll_signer")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let timeout = match (token.is_some(), enroll_signer) {
+                    (true, false) => Duration::from_secs(20),
+                    (false, true) => Duration::from_secs(135),
+                    _ => Duration::from_secs(70),
                 };
-                (IpcRequest::PairHaven { label, url, token }, timeout)
+                (
+                    IpcRequest::PairHaven {
+                        label,
+                        url,
+                        token,
+                        enroll_signer,
+                    },
+                    timeout,
+                )
+            }
+            "enroll_haven_signer" => {
+                let id_or_label = args
+                    .get("id_or_label")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| (-32602, String::from("`id_or_label` is required")))?
+                    .to_owned();
+                (
+                    IpcRequest::EnrollHavenSigner { id_or_label },
+                    Duration::from_secs(70),
+                )
             }
             "revoke_peer" => {
                 let id_or_label = args
@@ -664,7 +688,7 @@ impl McpBridge {
                     .to_owned();
                 (
                     IpcRequest::RevokePeer { id_or_label },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "propose_policy" => {
@@ -726,7 +750,7 @@ impl McpBridge {
                         name,
                         host: args.get("host").and_then(Value::as_str).map(str::to_owned),
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "rename_session" => {
@@ -752,14 +776,14 @@ impl McpBridge {
                         new_name,
                         host: args.get("host").and_then(Value::as_str).map(str::to_owned),
                     },
-                    Duration::from_secs(30),
+                    Duration::from_secs(70),
                 )
             }
             "close_pane" => (
                 IpcRequest::ClosePane {
                     pane: opt_pane("pane"),
                 },
-                Duration::from_secs(15),
+                Duration::from_secs(70),
             ),
             "close_tab" => (
                 IpcRequest::CloseTab {
@@ -769,15 +793,15 @@ impl McpBridge {
                         .and_then(Value::as_u64)
                         .map(crate::topology::TabId),
                 },
-                Duration::from_secs(15),
+                Duration::from_secs(70),
             ),
             "close_window" => (
                 IpcRequest::CloseWindow {
                     window: opt_win("window"),
                 },
-                Duration::from_secs(15),
+                Duration::from_secs(70),
             ),
-            "quit" => (IpcRequest::Quit, Duration::from_secs(15)),
+            "quit" => (IpcRequest::Quit, Duration::from_secs(70)),
             "list_sessions" => {
                 let host = args.get("host").and_then(Value::as_str).map(str::to_owned);
                 let refresh = args
@@ -1130,7 +1154,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "list_peers",
-            "description": "Tier-1 Observe: list paired inbound HTTP MCP peers (redacted, never token hashes or bearer secrets) and paired outbound Haven limbs with live connection status.",
+            "description": "Tier-1 Observe: list paired inbound HTTP MCP peers and paired outbound Haven limbs with live connection status and signer enrollment metadata (redacted, never token hashes, bearer secrets, or signing_secret_b64).",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -1142,7 +1166,19 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "label": { "type": "string", "description": "Short human label for this Haven limb (for example pixel)" },
                     "url": { "type": "string", "description": "HTTP MCP URL over loopback or tunnel, e.g. http://127.0.0.1:8740/mcp" },
-                    "token": { "type": "string", "description": "Optional pre-shared Bearer token; omit for interactive tap-to-pair" }
+                    "token": { "type": "string", "description": "Optional pre-shared Bearer token; omit for interactive tap-to-pair" },
+                    "enroll_signer": { "type": "boolean", "description": "Also provision Haven's HMAC-SHA256 consent signing secret right after pairing" }
+                }
+            }
+        },
+        {
+            "name": "enroll_haven_signer",
+            "description": "PolicyChange: call get_egress_signing_secret on a paired outbound Haven limb (with phone human confirmation) and persist its HMAC-SHA256 signing key in peers.json (0600) for cross-limb consent co-signing. Never covered by session grants or standing policies.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["id_or_label"],
+                "properties": {
+                    "id_or_label": { "type": "string", "description": "Outbound Haven peer id or label from list_peers" }
                 }
             }
         },

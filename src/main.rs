@@ -287,6 +287,14 @@ enum CtlVerb {
         /// Optional pre-shared Bearer token; omit for interactive tap-to-pair on Haven
         #[arg(long)]
         token: Option<String>,
+        /// Also provision Haven's HMAC-SHA256 consent signing secret after pairing
+        #[arg(long)]
+        enroll_signer: bool,
+    },
+    /// Provision Haven's HMAC-SHA256 consent signing secret onto a paired outbound limb
+    EnrollHavenSigner {
+        #[arg(long)]
+        id_or_label: String,
     },
     /// Revoke an inbound or outbound paired peer immediately in memory and peers.json
     RevokePeer {
@@ -484,8 +492,27 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::Sessions { host: None, .. }
         | CtlVerb::RenameSession { host: None, .. }
         | CtlVerb::EndSession { host: None, .. } => Duration::from_secs(15),
-        CtlVerb::PairHaven { token: None, .. } => Duration::from_secs(70),
-        CtlVerb::PairHaven { token: Some(_), .. } => Duration::from_secs(20),
+        CtlVerb::PairHaven {
+            token: None,
+            enroll_signer: true,
+            ..
+        } => Duration::from_secs(135),
+        CtlVerb::PairHaven {
+            token: None,
+            enroll_signer: false,
+            ..
+        }
+        | CtlVerb::PairHaven {
+            token: Some(_),
+            enroll_signer: true,
+            ..
+        }
+        | CtlVerb::EnrollHavenSigner { .. } => Duration::from_secs(70),
+        CtlVerb::PairHaven {
+            token: Some(_),
+            enroll_signer: false,
+            ..
+        } => Duration::from_secs(20),
         CtlVerb::RevokePeer { .. } => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     };
@@ -626,7 +653,18 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::InstallPolicy { id } => IpcRequest::InstallPolicy { id },
         CtlVerb::RevokePolicy { id } => IpcRequest::RevokePolicy { id },
         CtlVerb::ListPeers => IpcRequest::ListPeers,
-        CtlVerb::PairHaven { label, url, token } => IpcRequest::PairHaven { label, url, token },
+        CtlVerb::PairHaven {
+            label,
+            url,
+            token,
+            enroll_signer,
+        } => IpcRequest::PairHaven {
+            label,
+            url,
+            token,
+            enroll_signer,
+        },
+        CtlVerb::EnrollHavenSigner { id_or_label } => IpcRequest::EnrollHavenSigner { id_or_label },
         CtlVerb::RevokePeer { id_or_label } => IpcRequest::RevokePeer { id_or_label },
         CtlVerb::EndSession { name, kind, host } => {
             let kind = match kind.as_str() {

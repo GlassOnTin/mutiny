@@ -270,6 +270,233 @@ pub fn hex_decode_32(hex: &str) -> Result<[u8; 32], String> {
     })
 }
 
+pub const MAX_REPLAY_CACHE_ENTRIES: usize = 512;
+
+/// Expected binding parameters for a cross-limb Haven `EgressGrantSigner`
+/// HMAC-SHA256 consent decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedEgressGrant {
+    pub request_id: String,
+    pub sandbox_id: String,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedEgressDecision {
+    Once,
+    Session,
+    Deny(String),
+}
+
+/// Bounded replay cache tracking consumed `(request_id, grant_id, nonce)`
+/// tuples so a captured Haven signature cannot be replayed.
+#[derive(Debug, Default)]
+pub struct GrantReplayCache {
+    order: std::collections::VecDeque<(String, String, String)>,
+    seen_grants: std::collections::HashSet<(String, String)>,
+    seen_requests: std::collections::HashSet<String>,
+}
+
+impl GrantReplayCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_replayed(&self, request_id: &str, grant_id: &str, nonce: &str) -> bool {
+        self.seen_requests.contains(request_id)
+            || self
+                .seen_grants
+                .contains(&(grant_id.to_owned(), nonce.to_owned()))
+    }
+
+    pub fn record(&mut self, request_id: String, grant_id: String, nonce: String) {
+        while self.order.len() >= MAX_REPLAY_CACHE_ENTRIES {
+            if let Some((old_req, old_grant, old_nonce)) = self.order.pop_front() {
+                self.seen_requests.remove(&old_req);
+                self.seen_grants.remove(&(old_grant, old_nonce));
+            }
+        }
+        self.seen_requests.insert(request_id.clone());
+        self.seen_grants.insert((grant_id.clone(), nonce.clone()));
+        self.order.push_back((request_id, grant_id, nonce));
+    }
+}
+
+/// Reproduces `sh.haven.core.security.EgressGrantSigner.canonicalMessage`
+/// byte-for-byte: LF-delimited UTF-8, no trailing newline, empty string when
+/// `expiry_ms` is `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_egress_message(
+    request_id: &str,
+    sandbox_id: &str,
+    host: &str,
+    port: u16,
+    decision: &str,
+    expiry_ms: Option<u64>,
+    grant_id: &str,
+    nonce: &str,
+) -> String {
+    let expiry_str = expiry_ms.map(|v| v.to_string()).unwrap_or_default();
+    format!(
+        "{request_id}\n{sandbox_id}\n{host}\n{port}\n{decision}\n{expiry_str}\n{grant_id}\n{nonce}"
+    )
+}
+
+/// Signs a canonical egress decision with standard padded Base64, matching
+/// Haven's `EgressGrantSigner.signDecision`.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_egress_decision(
+    secret: &[u8],
+    request_id: &str,
+    sandbox_id: &str,
+    host: &str,
+    port: u16,
+    decision: &str,
+    expiry_ms: Option<u64>,
+    grant_id: &str,
+    nonce: &str,
+) -> String {
+    let msg = canonical_egress_message(
+        request_id, sandbox_id, host, port, decision, expiry_ms, grant_id, nonce,
+    );
+    let mac = hmac_sha256(secret, msg.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac)
+}
+
+/// Validates and decodes a Base64-encoded 256-bit (or larger) HMAC signing key.
+pub fn decode_signing_secret_b64(secret_b64: &str) -> Result<Vec<u8>, String> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(secret_b64.trim())
+        .map_err(|e| format!("signing secret is not valid padded Base64: {e}"))?;
+    if raw.len() < 32 {
+        return Err(format!(
+            "signing secret must be at least 32 bytes, got {}",
+            raw.len()
+        ));
+    }
+    Ok(raw)
+}
+
+/// Fail-closed verifier for Haven `EgressGrantSigner` responses. Any missing
+/// field, target mismatch, expired timestamp, replay, or bad HMAC-SHA256
+/// signature resolves to `VerifiedEgressDecision::Deny`.
+pub fn verify_egress_decision(
+    secret_b64: &str,
+    expected: &ExpectedEgressGrant,
+    response: &serde_json::Value,
+    now_epoch_ms: u64,
+    replay_cache: &mut GrantReplayCache,
+) -> VerifiedEgressDecision {
+    let secret = match decode_signing_secret_b64(secret_b64) {
+        Ok(s) => s,
+        Err(err) => return VerifiedEgressDecision::Deny(err),
+    };
+
+    let Some(decision) = response.get("decision").and_then(serde_json::Value::as_str) else {
+        return VerifiedEgressDecision::Deny(String::from("missing `decision` field"));
+    };
+    if decision == "deny" {
+        return VerifiedEgressDecision::Deny(String::from("denied on Haven"));
+    }
+    if decision != "once" && decision != "session" {
+        return VerifiedEgressDecision::Deny(format!("unknown decision {decision:?}"));
+    }
+
+    let req_id = response
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let sandbox_id = response
+        .get("sandbox_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let host = response
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let port = response
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    if req_id != expected.request_id
+        || sandbox_id != expected.sandbox_id
+        || host != expected.host
+        || port != u64::from(expected.port)
+    {
+        return VerifiedEgressDecision::Deny(String::from(
+            "signed response fields do not match requested target",
+        ));
+    }
+
+    let grant_id = response
+        .get("grant_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let nonce = response
+        .get("nonce")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if grant_id.is_empty()
+        || nonce.is_empty()
+        || grant_id.contains(['\n', '\r'])
+        || nonce.contains(['\n', '\r'])
+    {
+        return VerifiedEgressDecision::Deny(String::from("missing or malformed grant_id/nonce"));
+    }
+    if replay_cache.is_replayed(req_id, grant_id, nonce) {
+        return VerifiedEgressDecision::Deny(String::from(
+            "replayed consent grant (request_id or grant_id/nonce already consumed)",
+        ));
+    }
+
+    let Some(expiry_ms) = response
+        .get("expiry_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&ms| ms > 0)
+    else {
+        return VerifiedEgressDecision::Deny(String::from(
+            "allow decision requires a positive expiry_ms",
+        ));
+    };
+    if now_epoch_ms > expiry_ms {
+        return VerifiedEgressDecision::Deny(String::from("signed consent grant has expired"));
+    }
+
+    let Some(sig_b64) = response
+        .get("signature")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return VerifiedEgressDecision::Deny(String::from("missing HMAC signature"));
+    };
+    let Ok(sig_bytes) = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) else {
+        return VerifiedEgressDecision::Deny(String::from("malformed Base64 HMAC signature"));
+    };
+
+    let canonical = canonical_egress_message(
+        req_id,
+        sandbox_id,
+        host,
+        expected.port,
+        decision,
+        Some(expiry_ms),
+        grant_id,
+        nonce,
+    );
+    let expected_mac = hmac_sha256(&secret, canonical.as_bytes());
+    if !constant_time_eq(&expected_mac, &sig_bytes) {
+        return VerifiedEgressDecision::Deny(String::from("HMAC-SHA256 signature mismatch"));
+    }
+
+    replay_cache.record(req_id.to_owned(), grant_id.to_owned(), nonce.to_owned());
+    if decision == "session" {
+        VerifiedEgressDecision::Session
+    } else {
+        VerifiedEgressDecision::Once
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +598,80 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "must be URL-safe base64 without padding: {t1}"
         );
+    }
+
+    #[test]
+    fn egress_grant_canonical_message_and_fail_closed_verifier() {
+        let msg_allow = canonical_egress_message(
+            "mty-consent-01",
+            "mutiny:end-session:irreversible:agent",
+            "mutiny.local",
+            1,
+            "once",
+            Some(1_900_000_000_000),
+            "grant-1",
+            "nonce-1",
+        );
+        assert_eq!(
+            msg_allow,
+            "mty-consent-01\nmutiny:end-session:irreversible:agent\nmutiny.local\n1\nonce\n1900000000000\ngrant-1\nnonce-1"
+        );
+        assert!(!msg_allow.ends_with('\n'));
+
+        let msg_deny = canonical_egress_message(
+            "mty-consent-02",
+            "mutiny:split:act:agent",
+            "mutiny.local",
+            1,
+            "deny",
+            None,
+            "grant-2",
+            "nonce-2",
+        );
+        assert_eq!(
+            msg_deny,
+            "mty-consent-02\nmutiny:split:act:agent\nmutiny.local\n1\ndeny\n\ngrant-2\nnonce-2"
+        );
+
+        let key = [0x42u8; 32];
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        let sig = sign_egress_decision(
+            &key,
+            "mty-consent-01",
+            "mutiny:end-session:irreversible:agent",
+            "mutiny.local",
+            1,
+            "once",
+            Some(1_900_000_000_000),
+            "grant-1",
+            "nonce-1",
+        );
+        let payload = serde_json::json!({
+            "decision": "once",
+            "request_id": "mty-consent-01",
+            "sandbox_id": "mutiny:end-session:irreversible:agent",
+            "host": "mutiny.local",
+            "port": 1,
+            "expiry_ms": 1_900_000_000_000u64,
+            "grant_id": "grant-1",
+            "nonce": "nonce-1",
+            "signature": sig,
+        });
+        let expected = ExpectedEgressGrant {
+            request_id: String::from("mty-consent-01"),
+            sandbox_id: String::from("mutiny:end-session:irreversible:agent"),
+            host: String::from("mutiny.local"),
+            port: 1,
+        };
+        let mut cache = GrantReplayCache::new();
+        assert_eq!(
+            verify_egress_decision(&key_b64, &expected, &payload, 1_800_000_000_000, &mut cache),
+            VerifiedEgressDecision::Once
+        );
+        // Immediate replay of identical signed payload must fail closed.
+        assert!(matches!(
+            verify_egress_decision(&key_b64, &expected, &payload, 1_800_000_000_000, &mut cache),
+            VerifiedEgressDecision::Deny(_)
+        ));
     }
 }

@@ -499,6 +499,7 @@ fn outbound_haven_client_tap_to_pair_liveness_transitions_and_public_ip_refusal(
                 label: String::from("bad"),
                 url: String::from(public_url),
                 token: Some(String::from("tok")),
+                enroll_signer: false,
             },
             Duration::from_secs(5),
         )
@@ -519,6 +520,7 @@ fn outbound_haven_client_tap_to_pair_liveness_transitions_and_public_ip_refusal(
                 label: String::from("pixel"),
                 url,
                 token: None,
+                enroll_signer: false,
             },
             Duration::from_secs(10),
         )
@@ -724,6 +726,7 @@ fn policy_change_verbs_never_bypass_consent_and_paired_peers_never_gain_operator
             label: String::from("rogue"),
             url: String::from("http://127.0.0.1:9999/mcp"),
             token: Some(String::from("tok")),
+            enroll_signer: false,
         },
         IpcRequest::RevokePeer {
             id_or_label: String::from("phone"),

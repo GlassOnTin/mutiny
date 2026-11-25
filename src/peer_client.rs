@@ -2,13 +2,18 @@
 //! dialing a paired Haven phone over SSH loopback forwarding or an encrypted
 //! WireGuard/Yggdrasil/private tunnel.
 //!
-//! Runs on a single bounded background worker thread and communicates with
+//! Runs on a bounded background worker loop and communicates with
 //! `AppController` exclusively via bounded `std::sync::mpsc` channels polled
-//! with `try_recv` on the 4 ms tick.
+//! with `try_recv` on the 4 ms tick. Human-interactive 65 s RPCs (`pair-haven`,
+//! `get_egress_signing_secret`, `request_egress_grant`, `generate_totp_code`)
+//! run on bounded short-lived worker threads (max 4 concurrent) so liveness
+//! polling and client teardown never block.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,6 +22,7 @@ use serde_json::{Value, json};
 
 use crate::crypto;
 use crate::peers::{InboundNotifyScope, OutboundHavenPeer, OutboundLimbStatus, unix_now_secs};
+use crate::topology::{PaneId, WindowId};
 
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_HEADER_LINES: usize = 64;
@@ -24,6 +30,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const NORMAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PAIRING_READ_TIMEOUT: Duration = Duration::from_secs(65);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_INTERACTIVE_RPCS: usize = 4;
+const DEFAULT_TOTP_ROLLOVER_SLEEP: Duration = Duration::from_millis(2500);
 
 #[derive(Debug, Clone)]
 pub struct PeerPollConfig {
@@ -52,14 +60,22 @@ pub struct ParsedPeerUrl {
     pub host_header: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HavenAuthPrompt {
+    pub profile_id: String,
+    pub label: String,
+    pub requires_passphrase: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TotpSecretItem {
+    pub id: String,
+    pub label: String,
+    pub issuer: Option<String>,
+    pub account_name: Option<String>,
+}
+
 /// Checks whether a plaintext HTTP target IP is permitted.
-///
-/// Loopback (`127.0.0.0/8`, `::1`), RFC 1918 private (`10.0.0.0/8`,
-/// `172.16.0.0/12`, `192.168.0.0/16`), CGNAT / WireGuard / Tailscale
-/// (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), and Yggdrasil (`200::/7`) are
-/// permitted; `allow_lan` additionally permits link-local (`169.254.0.0/16`,
-/// `fe80::/10`). Public internet addresses, unspecified (`0.0.0.0`, `::`), and
-/// multicast/broadcast addresses are always rejected over plaintext HTTP.
 pub fn is_allowed_plaintext_ip(ip: IpAddr, allow_lan: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => is_allowed_v4(v4, allow_lan),
@@ -440,7 +456,6 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
         let chunk_len = usize::from_str_radix(hex_part, 16)
             .map_err(|_| format!("invalid chunk size {hex_part:?}"))?;
         if chunk_len == 0 {
-            // Drain trailing CRLF / trailers bounded.
             let mut tail = String::new();
             let _ = read_bounded_line(reader, &mut tail, 1024);
             break;
@@ -525,6 +540,39 @@ pub fn jsonrpc_call(
         .ok_or_else(|| (None, String::from("JSON-RPC response missing `result`")))
 }
 
+/// Extracts the structured JSON object from an MCP `tools/call` result,
+/// accepting either `structuredContent` or JSON-encoded `content[0].text`.
+pub fn extract_mcp_tool_json(val: &Value) -> Result<Value, String> {
+    let is_err = val.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    if is_err {
+        let msg = val
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("remote MCP tool returned isError=true");
+        return Err(msg.to_owned());
+    }
+    if let Some(sc) = val.get("structuredContent").filter(|v| v.is_object()) {
+        return Ok(sc.clone());
+    }
+    if let Some(text) = val
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text"))
+        .and_then(Value::as_str)
+    {
+        return serde_json::from_str::<Value>(text)
+            .map_err(|e| format!("tool text is not valid JSON: {e}"));
+    }
+    if val.is_object() {
+        return Ok(val.clone());
+    }
+    Err(String::from("MCP tool result contained no JSON payload"))
+}
+
 #[derive(Debug)]
 pub enum PeerClientCommand {
     SetPeers(Vec<OutboundHavenPeer>),
@@ -533,7 +581,38 @@ pub enum PeerClientCommand {
         label: String,
         url: String,
         bearer_token: Option<String>,
+        enroll_signer: bool,
     },
+    EnrollSigner {
+        req_id: u64,
+        peer_id_or_label: String,
+    },
+    RequestConsent {
+        consent_id: u64,
+        peer_id: String,
+        request_id: String,
+        sandbox_id: String,
+        host: String,
+        port: u16,
+        scheme: String,
+        reason: String,
+    },
+    AnswerAuthPrompt {
+        peer_id: String,
+        password: String,
+        remember_password: bool,
+    },
+    ListTotpSecrets {
+        peer_id: String,
+        target_pane: PaneId,
+        target_window: Option<WindowId>,
+    },
+    GenerateTotpCode {
+        peer_id: String,
+        totp_secret_id: String,
+        target_pane: PaneId,
+    },
+    PollNow,
     CallTool {
         req_id: u64,
         peer_id: String,
@@ -555,6 +634,31 @@ pub enum PeerClientEvent {
         req_id: u64,
         result: Result<(OutboundHavenPeer, OutboundLimbStatus), String>,
     },
+    SignerEnrolled {
+        req_id: u64,
+        result: Result<(String, String, String), String>,
+    },
+    ConsentCompleted {
+        consent_id: u64,
+        peer_id: String,
+        result: Result<Value, String>,
+    },
+    AuthPromptChanged {
+        peer_id: String,
+        peer_label: String,
+        prompt: Option<HavenAuthPrompt>,
+    },
+    TotpChoicesReady {
+        peer_id: String,
+        target_pane: PaneId,
+        target_window: Option<WindowId>,
+        secrets: Vec<TotpSecretItem>,
+    },
+    TotpCodeReady {
+        target_pane: PaneId,
+        code: String,
+    },
+    TotpError(String),
     ToolCallCompleted {
         req_id: u64,
         peer_id: String,
@@ -573,7 +677,9 @@ impl HavenPeerClientHandle {
     pub fn spawn(initial_peers: Vec<OutboundHavenPeer>, cfg: PeerPollConfig) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PeerClientCommand>(64);
         let (evt_tx, evt_rx) = mpsc::sync_channel::<PeerClientEvent>(128);
-        let join = thread::spawn(move || worker_loop(initial_peers, cfg, cmd_rx, evt_tx));
+        let cmd_tx_internal = cmd_tx.clone();
+        let join =
+            thread::spawn(move || worker_loop(initial_peers, cfg, cmd_rx, cmd_tx_internal, evt_tx));
         Self {
             cmd_tx,
             evt_rx,
@@ -591,12 +697,17 @@ impl HavenPeerClientHandle {
             .map_err(|e| format!("peer client queue unavailable: {e}"))
     }
 
+    pub fn poll_now(&self) {
+        let _ = self.cmd_tx.try_send(PeerClientCommand::PollNow);
+    }
+
     pub fn pair_outbound(
         &self,
         req_id: u64,
         label: String,
         url: String,
         bearer_token: Option<String>,
+        enroll_signer: bool,
     ) -> Result<(), String> {
         self.cmd_tx
             .try_send(PeerClientCommand::PairOutbound {
@@ -604,12 +715,93 @@ impl HavenPeerClientHandle {
                 label,
                 url,
                 bearer_token,
+                enroll_signer,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    pub fn enroll_signer(&self, req_id: u64, peer_id_or_label: String) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::EnrollSigner {
+                req_id,
+                peer_id_or_label,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_consent(
+        &self,
+        consent_id: u64,
+        peer_id: String,
+        request_id: String,
+        sandbox_id: String,
+        host: String,
+        port: u16,
+        scheme: String,
+        reason: String,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::RequestConsent {
+                consent_id,
+                peer_id,
+                request_id,
+                sandbox_id,
+                host,
+                port,
+                scheme,
+                reason,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    pub fn answer_auth_prompt(
+        &self,
+        peer_id: String,
+        password: String,
+        remember_password: bool,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::AnswerAuthPrompt {
+                peer_id,
+                password,
+                remember_password,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    pub fn list_totp_secrets(
+        &self,
+        peer_id: String,
+        target_pane: PaneId,
+        target_window: Option<WindowId>,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::ListTotpSecrets {
+                peer_id,
+                target_pane,
+                target_window,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    pub fn generate_totp_code(
+        &self,
+        peer_id: String,
+        totp_secret_id: String,
+        target_pane: PaneId,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::GenerateTotpCode {
+                peer_id,
+                totp_secret_id,
+                target_pane,
             })
             .map_err(|e| format!("peer client busy or unavailable: {e}"))
     }
 
     /// Asynchronous non-blocking `tools/call` dispatch whose result arrives via
-    /// `PeerClientEvent::ToolCallCompleted` on the 4 ms tick (ready for M3.2 / M3.3).
+    /// `PeerClientEvent::ToolCallCompleted` on the 4 ms tick.
     pub fn send_call_tool(
         &self,
         req_id: u64,
@@ -671,6 +863,30 @@ struct TrackedPeer {
     next_poll: Instant,
     failures: u32,
     remote_version: Option<String>,
+    /// `Some(true)` if peer's `tools/list` advertises `request_peer_consent`,
+    /// `Some(false)` if it uses `request_egress_grant`, `None` before discovery.
+    has_request_peer_consent: Option<bool>,
+}
+
+struct InteractiveSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for InteractiveSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_interactive_slot(counter: &Arc<AtomicUsize>) -> Option<InteractiveSlotGuard> {
+    let mut cur = counter.load(Ordering::Acquire);
+    loop {
+        if cur >= MAX_CONCURRENT_INTERACTIVE_RPCS {
+            return None;
+        }
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(InteractiveSlotGuard(Arc::clone(counter))),
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 fn generate_outbound_id() -> String {
@@ -682,13 +898,24 @@ fn generate_outbound_id() -> String {
     }
 }
 
+fn find_tracked<'a>(
+    tracked: &'a HashMap<String, TrackedPeer>,
+    id_or_label: &str,
+) -> Option<&'a TrackedPeer> {
+    tracked
+        .get(id_or_label)
+        .or_else(|| tracked.values().find(|t| t.peer.label == id_or_label))
+}
+
 fn worker_loop(
     initial_peers: Vec<OutboundHavenPeer>,
     cfg: PeerPollConfig,
     cmd_rx: Receiver<PeerClientCommand>,
+    cmd_tx_self: SyncSender<PeerClientCommand>,
     evt_tx: SyncSender<PeerClientEvent>,
 ) {
     let mut rpc_seq: u64 = 1;
+    let interactive_inflight = Arc::new(AtomicUsize::new(0));
     let mut tracked: HashMap<String, TrackedPeer> = HashMap::new();
     let now = Instant::now();
     for p in initial_peers {
@@ -699,6 +926,7 @@ fn worker_loop(
                 next_poll: now,
                 failures: 0,
                 remote_version: None,
+                has_request_peer_consent: None,
             },
         );
     }
@@ -714,6 +942,12 @@ fn worker_loop(
 
         match cmd_rx.recv_timeout(next_wakeup) {
             Ok(PeerClientCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(PeerClientCommand::PollNow) => {
+                let t_now = Instant::now();
+                for entry in tracked.values_mut() {
+                    entry.next_poll = t_now;
+                }
+            }
             Ok(PeerClientCommand::SetPeers(new_peers)) => {
                 let mut next_map = HashMap::with_capacity(new_peers.len());
                 let t_now = Instant::now();
@@ -725,6 +959,7 @@ fn worker_loop(
                         if url_or_tok_changed {
                             existing.next_poll = t_now;
                             existing.failures = 0;
+                            existing.has_request_peer_consent = None;
                         }
                         next_map.insert(existing.peer.id.clone(), existing);
                     } else {
@@ -735,6 +970,7 @@ fn worker_loop(
                                 next_poll: t_now,
                                 failures: 0,
                                 remote_version: None,
+                                has_request_peer_consent: None,
                             },
                         );
                     }
@@ -746,7 +982,15 @@ fn worker_loop(
                 label,
                 url,
                 bearer_token,
+                enroll_signer,
             }) => {
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.send(PeerClientEvent::PairCompleted {
+                        req_id,
+                        result: Err(String::from("too many interactive peer requests in flight")),
+                    });
+                    continue;
+                };
                 let _ = evt_tx.try_send(PeerClientEvent::StatusChanged {
                     peer_id: None,
                     status: OutboundLimbStatus::Pairing {
@@ -755,37 +999,279 @@ fn worker_loop(
                     connected_at: None,
                 });
                 rpc_seq = rpc_seq.wrapping_add(1);
-                let pair_res = run_pair_outbound(
-                    rpc_seq,
-                    &label,
-                    &url,
-                    bearer_token.as_deref(),
-                    cfg.allow_lan,
-                );
-                match pair_res {
-                    Ok((peer, status, remote_version)) => {
-                        tracked.retain(|_, v| v.peer.label != peer.label);
-                        tracked.insert(
-                            peer.id.clone(),
-                            TrackedPeer {
-                                peer: peer.clone(),
-                                next_poll: Instant::now() + cfg.connected_interval,
-                                failures: 0,
-                                remote_version,
-                            },
-                        );
-                        let _ = evt_tx.send(PeerClientEvent::PairCompleted {
-                            req_id,
-                            result: Ok((peer, status)),
-                        });
+                let seq = rpc_seq;
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                let cmd_cl = cmd_tx_self.clone();
+                let existing_peers: Vec<OutboundHavenPeer> =
+                    tracked.values().map(|t| t.peer.clone()).collect();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    let pair_res = run_pair_outbound(
+                        seq,
+                        &label,
+                        &url,
+                        bearer_token.as_deref(),
+                        enroll_signer,
+                        allow_lan,
+                    );
+                    match pair_res {
+                        Ok((peer, status)) => {
+                            let mut updated = existing_peers;
+                            updated.retain(|p| p.label != peer.label && p.id != peer.id);
+                            updated.push(peer.clone());
+                            let _ = cmd_cl.try_send(PeerClientCommand::SetPeers(updated));
+                            let _ = evt_cl.send(PeerClientEvent::PairCompleted {
+                                req_id,
+                                result: Ok((peer, status)),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = evt_cl.send(PeerClientEvent::PairCompleted {
+                                req_id,
+                                result: Err(err),
+                            });
+                        }
                     }
-                    Err(err) => {
-                        let _ = evt_tx.send(PeerClientEvent::PairCompleted {
-                            req_id,
-                            result: Err(err),
-                        });
-                    }
+                });
+            }
+            Ok(PeerClientCommand::EnrollSigner {
+                req_id,
+                peer_id_or_label,
+            }) => {
+                let Some(entry) = find_tracked(&tracked, &peer_id_or_label) else {
+                    let _ = evt_tx.send(PeerClientEvent::SignerEnrolled {
+                        req_id,
+                        result: Err(format!(
+                            "no paired outbound Haven peer matching {peer_id_or_label:?}"
+                        )),
+                    });
+                    continue;
+                };
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.send(PeerClientEvent::SignerEnrolled {
+                        req_id,
+                        result: Err(String::from("too many interactive peer requests in flight")),
+                    });
+                    continue;
+                };
+                rpc_seq = rpc_seq.wrapping_add(1);
+                let seq = rpc_seq;
+                let peer_id = entry.peer.id.clone();
+                let url = entry.peer.url.clone();
+                let tok = entry.peer.bearer_token.clone();
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    let res = fetch_signing_secret(&url, &tok, seq, allow_lan)
+                        .map(|(sec_b64, key_id)| (peer_id, sec_b64, key_id));
+                    let _ = evt_cl.send(PeerClientEvent::SignerEnrolled {
+                        req_id,
+                        result: res,
+                    });
+                });
+            }
+            Ok(PeerClientCommand::RequestConsent {
+                consent_id,
+                peer_id,
+                request_id,
+                sandbox_id,
+                host,
+                port,
+                scheme,
+                reason,
+            }) => {
+                let Some(entry) = tracked.get_mut(&peer_id) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::ConsentCompleted {
+                        consent_id,
+                        peer_id,
+                        result: Err(String::from("outbound Haven peer not found")),
+                    });
+                    continue;
+                };
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::ConsentCompleted {
+                        consent_id,
+                        peer_id,
+                        result: Err(String::from("too many interactive peer requests in flight")),
+                    });
+                    continue;
+                };
+                if entry.has_request_peer_consent.is_none() {
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    entry.has_request_peer_consent = Some(detect_request_peer_consent(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        cfg.allow_lan,
+                    ));
                 }
+                let use_peer_consent = entry.has_request_peer_consent.unwrap_or(false);
+                let tool_name = if use_peer_consent {
+                    "request_peer_consent"
+                } else {
+                    "request_egress_grant"
+                };
+                rpc_seq = rpc_seq.wrapping_add(1);
+                let seq = rpc_seq;
+                let url = entry.peer.url.clone();
+                let tok = entry.peer.bearer_token.clone();
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    let args = json!({
+                        "request_id": request_id,
+                        "sandbox_id": sandbox_id,
+                        "host": host,
+                        "port": port,
+                        "scheme": scheme,
+                        "reason": reason,
+                    });
+                    let res = jsonrpc_call(
+                        &url,
+                        Some(&tok),
+                        seq,
+                        "tools/call",
+                        json!({
+                            "name": tool_name,
+                            "arguments": args,
+                        }),
+                        PAIRING_READ_TIMEOUT,
+                        allow_lan,
+                    )
+                    .map_err(|(_, m)| m)
+                    .and_then(|v| extract_mcp_tool_json(&v));
+                    let _ = evt_cl.try_send(PeerClientEvent::ConsentCompleted {
+                        consent_id,
+                        peer_id,
+                        result: res,
+                    });
+                });
+            }
+            Ok(PeerClientCommand::AnswerAuthPrompt {
+                peer_id,
+                password,
+                remember_password,
+            }) => {
+                if let Some(entry) = tracked.get_mut(&peer_id) {
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    let _ = call_remote_tool(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        "answer_auth_prompt",
+                        json!({
+                            "password": password,
+                            "rememberPassword": remember_password,
+                        }),
+                        cfg.allow_lan,
+                    );
+                    entry.next_poll = Instant::now();
+                }
+            }
+            Ok(PeerClientCommand::ListTotpSecrets {
+                peer_id,
+                target_pane,
+                target_window,
+            }) => {
+                let Some(entry) = find_tracked(&tracked, &peer_id) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::TotpError(String::from(
+                        "no paired outbound Haven peer available",
+                    )));
+                    continue;
+                };
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::TotpError(String::from(
+                        "too many interactive peer requests in flight",
+                    )));
+                    continue;
+                };
+                rpc_seq = rpc_seq.wrapping_add(2);
+                let seq = rpc_seq;
+                let resolved_id = entry.peer.id.clone();
+                let url = entry.peer.url.clone();
+                let tok = entry.peer.bearer_token.clone();
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    match fetch_totp_list(&url, &tok, seq, allow_lan) {
+                        Ok(mut secrets) => {
+                            if secrets.is_empty() {
+                                let _ = evt_cl.try_send(PeerClientEvent::TotpError(String::from(
+                                    "no TOTP secrets saved on Haven",
+                                )));
+                            } else if secrets.len() == 1 {
+                                let chosen = secrets.remove(0);
+                                match fetch_fresh_totp_code(
+                                    &url,
+                                    &tok,
+                                    seq.wrapping_add(1),
+                                    &chosen.id,
+                                    allow_lan,
+                                ) {
+                                    Ok(code) => {
+                                        let _ = evt_cl.try_send(PeerClientEvent::TotpCodeReady {
+                                            target_pane,
+                                            code,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        let _ = evt_cl.try_send(PeerClientEvent::TotpError(err));
+                                    }
+                                }
+                            } else {
+                                let _ = evt_cl.try_send(PeerClientEvent::TotpChoicesReady {
+                                    peer_id: resolved_id,
+                                    target_pane,
+                                    target_window,
+                                    secrets,
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            let _ = evt_cl.try_send(PeerClientEvent::TotpError(err));
+                        }
+                    }
+                });
+            }
+            Ok(PeerClientCommand::GenerateTotpCode {
+                peer_id,
+                totp_secret_id,
+                target_pane,
+            }) => {
+                let Some(entry) = find_tracked(&tracked, &peer_id) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::TotpError(String::from(
+                        "no paired outbound Haven peer available",
+                    )));
+                    continue;
+                };
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::TotpError(String::from(
+                        "too many interactive peer requests in flight",
+                    )));
+                    continue;
+                };
+                rpc_seq = rpc_seq.wrapping_add(2);
+                let seq = rpc_seq;
+                let url = entry.peer.url.clone();
+                let tok = entry.peer.bearer_token.clone();
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    match fetch_fresh_totp_code(&url, &tok, seq, &totp_secret_id, allow_lan) {
+                        Ok(code) => {
+                            let _ = evt_cl
+                                .try_send(PeerClientEvent::TotpCodeReady { target_pane, code });
+                        }
+                        Err(err) => {
+                            let _ = evt_cl.try_send(PeerClientEvent::TotpError(err));
+                        }
+                    }
+                });
             }
             Ok(PeerClientCommand::CallTool {
                 req_id,
@@ -794,10 +1280,7 @@ fn worker_loop(
                 arguments,
                 reply_tx,
             }) => {
-                let res = match tracked
-                    .get(&peer_id)
-                    .or_else(|| tracked.values().find(|t| t.peer.label == peer_id))
-                {
+                let res = match find_tracked(&tracked, &peer_id) {
                     Some(entry) => {
                         rpc_seq = rpc_seq.wrapping_add(1);
                         call_remote_tool(
@@ -869,6 +1352,21 @@ fn worker_loop(
                         status,
                         connected_at: Some(now_secs),
                     });
+
+                    // Also poll Haven's stalled SSH fallback prompt (`get_pending_auth_prompt`).
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    if let Ok(prompt_opt) = poll_pending_auth_prompt(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        cfg.allow_lan,
+                    ) {
+                        let _ = evt_tx.try_send(PeerClientEvent::AuthPromptChanged {
+                            peer_id: entry.peer.id.clone(),
+                            peer_label: entry.peer.label.clone(),
+                            prompt: prompt_opt,
+                        });
+                    }
                 }
                 Err(err) => {
                     entry.failures = entry.failures.saturating_add(1);
@@ -888,6 +1386,11 @@ fn worker_loop(
                         status,
                         connected_at: None,
                     });
+                    let _ = evt_tx.try_send(PeerClientEvent::AuthPromptChanged {
+                        peer_id: entry.peer.id.clone(),
+                        peer_label: entry.peer.label.clone(),
+                        prompt: None,
+                    });
                 }
             }
         }
@@ -899,8 +1402,9 @@ fn run_pair_outbound(
     label: &str,
     url: &str,
     explicit_token: Option<&str>,
+    enroll_signer: bool,
     allow_lan: bool,
-) -> Result<(OutboundHavenPeer, OutboundLimbStatus, Option<String>), String> {
+) -> Result<(OutboundHavenPeer, OutboundLimbStatus), String> {
     let clean_label = label.trim();
     if clean_label.is_empty() {
         return Err(String::from("peer label must not be empty"));
@@ -956,6 +1460,14 @@ fn run_pair_outbound(
         .and_then(Value::as_str)
         .map(str::to_owned);
 
+    let (signing_secret_b64, signing_key_id) = if enroll_signer {
+        let (sec, kid) =
+            fetch_signing_secret(clean_url, &token, rpc_id.wrapping_add(1), allow_lan)?;
+        (Some(sec), Some(kid))
+    } else {
+        (None, None)
+    };
+
     let now_secs = unix_now_secs();
     let id = generate_outbound_id();
     let peer = OutboundHavenPeer {
@@ -966,14 +1478,240 @@ fn run_pair_outbound(
         inbound_notify_scope: InboundNotifyScope::default(),
         paired_at: now_secs,
         last_connected_at: Some(now_secs),
+        signing_secret_b64,
+        signing_key_id,
     };
     let status = OutboundLimbStatus::Connected {
         id,
         label: clean_label.to_owned(),
-        remote_version: remote_version.clone(),
+        remote_version,
         rtt_ms,
     };
-    Ok((peer, status, remote_version))
+    Ok((peer, status))
+}
+
+fn fetch_signing_secret(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    allow_lan: bool,
+) -> Result<(String, String), String> {
+    let raw = jsonrpc_call(
+        url,
+        Some(bearer_token),
+        rpc_id,
+        "tools/call",
+        json!({
+            "name": "get_egress_signing_secret",
+            "arguments": {},
+        }),
+        PAIRING_READ_TIMEOUT,
+        allow_lan,
+    )
+    .map_err(|(_, msg)| msg)?;
+    let obj = extract_mcp_tool_json(&raw)?;
+    let alg = obj
+        .get("algorithm")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if alg != "HMAC-SHA256" {
+        return Err(format!(
+            "unsupported signing algorithm {alg:?}; expected \"HMAC-SHA256\""
+        ));
+    }
+    let secret_b64 = obj
+        .get("secret_base64")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| String::from("Haven response missing `secret_base64`"))?;
+    crypto::decode_signing_secret_b64(secret_b64)?;
+    let key_id = obj
+        .get("key_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("haven-hmac")
+        .to_owned();
+    Ok((secret_b64.to_owned(), key_id))
+}
+
+fn detect_request_peer_consent(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    allow_lan: bool,
+) -> bool {
+    let Ok(val) = jsonrpc_call(
+        url,
+        Some(bearer_token),
+        rpc_id,
+        "tools/list",
+        json!({}),
+        NORMAL_READ_TIMEOUT,
+        allow_lan,
+    ) else {
+        return false;
+    };
+    val.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|t| {
+                t.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| n == "request_peer_consent")
+            })
+        })
+}
+
+fn poll_pending_auth_prompt(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    allow_lan: bool,
+) -> Result<Option<HavenAuthPrompt>, ()> {
+    let res = jsonrpc_call(
+        url,
+        Some(bearer_token),
+        rpc_id,
+        "tools/call",
+        json!({
+            "name": "get_pending_auth_prompt",
+            "arguments": {},
+        }),
+        NORMAL_READ_TIMEOUT,
+        allow_lan,
+    );
+    let Ok(val) = res else {
+        return Err(());
+    };
+    let Ok(obj) = extract_mcp_tool_json(&val) else {
+        return Err(());
+    };
+    let pending = obj.get("pending").and_then(Value::as_bool).unwrap_or(false);
+    if !pending {
+        return Ok(None);
+    }
+    let profile_id = obj
+        .get("profileId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let label = obj
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or(&profile_id)
+        .to_owned();
+    let requires_passphrase = obj
+        .get("requiresPassphrase")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if profile_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(HavenAuthPrompt {
+        profile_id,
+        label,
+        requires_passphrase,
+    }))
+}
+
+fn fetch_totp_list(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    allow_lan: bool,
+) -> Result<Vec<TotpSecretItem>, String> {
+    let raw = call_remote_tool(
+        url,
+        bearer_token,
+        rpc_id,
+        "list_totp_secrets",
+        json!({}),
+        allow_lan,
+    )?;
+    let obj = extract_mcp_tool_json(&raw)?;
+    let arr = obj
+        .get("secrets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| String::from("list_totp_secrets response missing `secrets` array"))?;
+    let mut items = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(id) = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let label = entry
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("Authenticator")
+            .to_owned();
+        let issuer = entry
+            .get("issuer")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let account_name = entry
+            .get("accountName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        items.push(TotpSecretItem {
+            id: id.to_owned(),
+            label,
+            issuer,
+            account_name,
+        });
+    }
+    Ok(items)
+}
+
+fn fetch_fresh_totp_code(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    totp_secret_id: &str,
+    allow_lan: bool,
+) -> Result<String, String> {
+    let call_once = |seq: u64| -> Result<(String, u64), String> {
+        let raw = jsonrpc_call(
+            url,
+            Some(bearer_token),
+            seq,
+            "tools/call",
+            json!({
+                "name": "generate_totp_code",
+                "arguments": { "totpSecretId": totp_secret_id },
+            }),
+            PAIRING_READ_TIMEOUT,
+            allow_lan,
+        )
+        .map_err(|(_, msg)| msg)?;
+        let obj = extract_mcp_tool_json(&raw)?;
+        let code = obj
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| String::from("generate_totp_code response missing `code`"))?
+            .to_owned();
+        let secs = obj
+            .get("secondsRemaining")
+            .and_then(Value::as_u64)
+            .unwrap_or(30);
+        Ok((code, secs))
+    };
+
+    let (code, secs_rem) = call_once(rpc_id)?;
+    if secs_rem <= 2 {
+        thread::sleep(DEFAULT_TOTP_ROLLOVER_SLEEP);
+        let (fresh_code, _) = call_once(rpc_id.wrapping_add(1))?;
+        return Ok(fresh_code);
+    }
+    Ok(code)
 }
 
 fn probe_liveness(
@@ -1001,11 +1739,8 @@ fn probe_liveness(
                 let ver = extract_version_from_tool_result(&val);
                 return Ok(ver);
             }
-            // Fall through to lightweight `ping` if `get_app_info` returned isError.
         }
-        Err((Some(-32601 | -32602), _)) => {
-            // Peer does not implement `get_app_info`; fall back to JSON-RPC `ping`.
-        }
+        Err((Some(-32601 | -32602), _)) => {}
         Err((_, msg)) => return Err(msg),
     }
 
@@ -1023,13 +1758,7 @@ fn probe_liveness(
 }
 
 fn extract_version_from_tool_result(val: &Value) -> Option<String> {
-    let text = val
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(|item| item.get("text"))
-        .and_then(Value::as_str)?;
-    let parsed: Value = serde_json::from_str(text).ok()?;
+    let parsed = extract_mcp_tool_json(val).ok()?;
     parsed
         .get("versionName")
         .or_else(|| parsed.get("version"))
@@ -1107,10 +1836,8 @@ mod tests {
             );
         }
 
-        // Link-local is refused by default, allowed with --allow-lan-peer.
         assert!(parse_and_validate_peer_url("http://169.254.1.2:8740/mcp", false).is_err());
         assert!(parse_and_validate_peer_url("http://169.254.1.2:8740/mcp", true).is_ok());
-        // Public IP is still refused even with --allow-lan-peer!
         assert!(parse_and_validate_peer_url("http://8.8.8.8:8740/mcp", true).is_err());
     }
 }

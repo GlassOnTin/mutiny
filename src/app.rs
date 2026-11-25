@@ -32,7 +32,8 @@ use crate::mux::{
 };
 use crate::notify::{DBusNotifier, DesktopNotifier};
 use crate::peer_client::{
-    HavenPeerClientHandle, PeerClientEvent, PeerPollConfig, parse_and_validate_peer_url,
+    HavenAuthPrompt, HavenPeerClientHandle, PeerClientEvent, PeerPollConfig,
+    parse_and_validate_peer_url,
 };
 use crate::peers::{
     self, InboundPeer, InboundPeerTable, LiveInboundPeer, OutboundLimbStatus, OutboundPeerSummary,
@@ -73,7 +74,11 @@ pub struct PendingConsent {
     /// Kernel-verified peer, so an Allow Session grant binds to the process
     /// that asked rather than to the name it typed.
     pub peer: PeerIdentity,
+    pub created_at: Instant,
     pub deadline: Instant,
+    pub relayed_to_haven: bool,
+    pub remote_request_id: Option<String>,
+    pub remote_sandbox_id: Option<String>,
     stream: UnixStream,
 }
 
@@ -188,6 +193,10 @@ pub struct AppController {
     pairing_outbound_label: RefCell<Option<String>>,
     pending_pair_replies: RefCell<HashMap<u64, UnixStream>>,
     next_pair_req_id: Cell<u64>,
+    consent_replay_cache: RefCell<crypto::GrantReplayCache>,
+    haven_auth_prompts: RefCell<HashMap<String, (String, HavenAuthPrompt)>>,
+    dismissed_auth_prompts: RefCell<HashSet<(String, String)>>,
+    force_window_focused_for_test: Cell<Option<bool>>,
     next_peer_sock_seq: Cell<usize>,
     discovery_jobs: RefCell<Vec<PendingDiscovery>>,
     discovery_queue: RefCell<VecDeque<(Option<String>, MuxKind)>>,
@@ -327,6 +336,10 @@ impl AppController {
             pairing_outbound_label: RefCell::new(None),
             pending_pair_replies: RefCell::new(HashMap::new()),
             next_pair_req_id: Cell::new(1),
+            consent_replay_cache: RefCell::new(crypto::GrantReplayCache::default()),
+            haven_auth_prompts: RefCell::new(HashMap::new()),
+            dismissed_auth_prompts: RefCell::new(HashSet::new()),
+            force_window_focused_for_test: Cell::new(None),
             next_peer_sock_seq: Cell::new(1000),
             discovery_jobs: RefCell::new(Vec::new()),
             discovery_queue: RefCell::new(VecDeque::new()),
@@ -616,6 +629,46 @@ impl AppController {
 
     pub fn set_allow_headless_pairing_for_test(&self, allow: bool) {
         self.allow_headless_pairing.set(allow);
+    }
+
+    pub fn set_force_window_focused_for_test(&self, focused: Option<bool>) {
+        self.force_window_focused_for_test.set(focused);
+    }
+
+    pub fn any_window_focused(&self) -> bool {
+        if let Some(forced) = self.force_window_focused_for_test.get() {
+            return forced;
+        }
+        self.ui_windows
+            .borrow()
+            .values()
+            .any(|w| w.gtk_window().is_active())
+    }
+
+    pub fn poll_haven_peers_now(&self) {
+        if let Some(client) = self.peer_client.borrow().as_ref() {
+            client.poll_now();
+        }
+    }
+
+    pub fn connected_signer_peer(&self) -> Option<(String, String)> {
+        let store = self.peer_store.borrow();
+        let statuses = self.outbound_statuses.borrow();
+        store
+            .outbound_peers
+            .iter()
+            .find(|p| {
+                p.signing_secret_b64.is_some()
+                    && matches!(
+                        statuses.get(&p.id),
+                        Some(OutboundLimbStatus::Connected { .. })
+                    )
+            })
+            .map(|p| (p.id.clone(), p.label.clone()))
+    }
+
+    pub fn has_connected_haven_signer(&self) -> bool {
+        self.connected_signer_peer().is_some()
     }
 
     pub fn set_allow_lan_peer(&self, allow_lan: bool) {
@@ -930,9 +983,14 @@ impl AppController {
                         .as_deref()
                         .map(|v| format!(" v{v}"))
                         .unwrap_or_default();
+                    let signer = if primary.has_signing_key {
+                        ", signer enrolled"
+                    } else {
+                        ""
+                    };
                     Some((
                         format!("● haven:{label}"),
-                        format!("Haven limb '{label}'{ver} connected ({rtt_ms} ms RTT)"),
+                        format!("Haven limb '{label}'{ver} connected ({rtt_ms} ms RTT{signer})"),
                     ))
                 }
                 OutboundLimbStatus::Pairing { label } => Some((
@@ -974,6 +1032,7 @@ impl AppController {
         label: String,
         url: String,
         token: Option<String>,
+        enroll_signer: bool,
         reply: Option<UnixStream>,
     ) -> Result<(), String> {
         let clean_label = mux::sanitize_text(label.trim(), 48);
@@ -1001,7 +1060,7 @@ impl AppController {
             .borrow()
             .as_ref()
             .expect("peer client spawned")
-            .pair_outbound(req_id, clean_label, url, token);
+            .pair_outbound(req_id, clean_label, url, token, enroll_signer);
         if let Err(err) = send_res {
             *self.pairing_outbound_label.borrow_mut() = None;
             self.pending_pair_replies.borrow_mut().remove(&req_id);
@@ -1009,6 +1068,49 @@ impl AppController {
             return Err(err);
         }
         self.refresh_all_window_chromes();
+        Ok(())
+    }
+
+    pub fn begin_enroll_haven_signer(
+        &self,
+        id_or_label: String,
+        reply: Option<UnixStream>,
+    ) -> Result<(), String> {
+        let target = id_or_label.trim();
+        if target.is_empty() {
+            return Err(String::from("peer id or label must not be empty"));
+        }
+        let exists = self
+            .peer_store
+            .borrow()
+            .outbound_peers
+            .iter()
+            .any(|p| p.id == target || p.label == target);
+        if !exists {
+            return Err(format!("no paired outbound Haven peer matching {target:?}"));
+        }
+        if self.peer_client.borrow().is_none() {
+            let initial = self.peer_store.borrow().outbound_peers.clone();
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+        }
+        let req_id = self.next_pair_req_id.get();
+        self.next_pair_req_id.set(req_id + 1);
+        if let Some(stream) = reply {
+            self.pending_pair_replies
+                .borrow_mut()
+                .insert(req_id, stream);
+        }
+        let send_res = self
+            .peer_client
+            .borrow()
+            .as_ref()
+            .expect("peer client spawned")
+            .enroll_signer(req_id, target.to_owned());
+        if let Err(err) = send_res {
+            self.pending_pair_replies.borrow_mut().remove(&req_id);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1089,6 +1191,10 @@ impl AppController {
 
         for out_id in &removed_outbound_ids {
             self.outbound_statuses.borrow_mut().remove(out_id);
+            self.haven_auth_prompts.borrow_mut().remove(out_id);
+            self.dismissed_auth_prompts
+                .borrow_mut()
+                .retain(|(pid, _)| pid != out_id);
         }
         if !removed_outbound_ids.is_empty()
             && let Some(client) = self.peer_client.borrow().as_ref()
@@ -1175,6 +1281,221 @@ impl AppController {
             front.request.redacted_summary(),
             front.request.consent_tier(),
         ))
+    }
+
+    pub fn consent_haven_relay_state(&self, consent_id: u64) -> (bool, bool) {
+        let already_relayed = self
+            .pending_consents
+            .borrow()
+            .iter()
+            .find(|c| c.id == consent_id)
+            .is_some_and(|c| c.relayed_to_haven);
+        (self.has_connected_haven_signer(), already_relayed)
+    }
+
+    pub fn relay_consent_to_haven(&self, consent_id: u64) -> Result<(), String> {
+        let Some((peer_id, _)) = self.connected_signer_peer() else {
+            return Err(String::from("no connected Haven signer available"));
+        };
+        let mut raw_id = [0u8; 16];
+        crypto::fill_random(&mut raw_id)
+            .map_err(|e| format!("failed to generate CSPRNG request_id: {e}"))?;
+        let request_id = format!("mty-consent-{}", crypto::hex_encode(&raw_id));
+
+        let dispatch_info = {
+            let mut queue = self.pending_consents.borrow_mut();
+            let Some(item) = queue.iter_mut().find(|c| c.id == consent_id) else {
+                return Err(String::from("consent prompt is no longer pending"));
+            };
+            if item.relayed_to_haven {
+                return Ok(());
+            }
+            let verb = item.request.verb_name();
+            let tier = item.request.consent_tier();
+            let tier_slug = match tier {
+                crate::action::ConsentTier::Observe => "observe",
+                crate::action::ConsentTier::Act => "act",
+                crate::action::ConsentTier::PolicyChange => "policy-change",
+                crate::action::ConsentTier::Irreversible => "irreversible",
+            };
+            let clean_caller: String = mux::sanitize_text(&item.client, 48)
+                .chars()
+                .map(|c| if c.is_whitespace() { '_' } else { c })
+                .collect();
+            let caller_slug = if clean_caller.is_empty() {
+                String::from("peer")
+            } else {
+                clean_caller
+            };
+            let sandbox_id = format!("mutiny:{verb}:{tier_slug}:{caller_slug}");
+            let tier_tag = match tier {
+                crate::action::ConsentTier::Irreversible => "Irreversible",
+                crate::action::ConsentTier::PolicyChange => "PolicyChange",
+                crate::action::ConsentTier::Act => "Act",
+                crate::action::ConsentTier::Observe => "Observe",
+            };
+            let detail = mux::sanitize_text(&item.request.redacted_summary(), 96);
+            let reason = if detail.is_empty() {
+                format!("[{tier_tag}] Peer '{caller_slug}' requests {verb}. Approve?")
+            } else {
+                format!("[{tier_tag}] Peer '{caller_slug}' requests {verb} ({detail}). Approve?")
+            };
+            item.relayed_to_haven = true;
+            item.remote_request_id = Some(request_id.clone());
+            item.remote_sandbox_id = Some(sandbox_id.clone());
+            item.deadline = item.deadline.max(Instant::now() + Duration::from_secs(68));
+            (sandbox_id, reason)
+        };
+
+        let send_res = match self.peer_client.borrow().as_ref() {
+            Some(client) => client.request_consent(
+                consent_id,
+                peer_id,
+                request_id,
+                dispatch_info.0,
+                String::from("mutiny.local"),
+                1,
+                String::from("https"),
+                dispatch_info.1,
+            ),
+            None => Err(String::from("no outbound Haven peer client active")),
+        };
+        if let Err(err) = send_res {
+            if let Some(item) = self
+                .pending_consents
+                .borrow_mut()
+                .iter_mut()
+                .find(|c| c.id == consent_id)
+            {
+                item.relayed_to_haven = false;
+                item.remote_request_id = None;
+                item.remote_sandbox_id = None;
+            }
+            return Err(err);
+        }
+        self.refresh_all_window_chromes();
+        Ok(())
+    }
+
+    fn poll_unfocused_consent_relay(&self) {
+        let (relay_enabled, grace_ms) = {
+            let cfg = self.config.borrow();
+            (cfg.relay_unfocused_consent, cfg.unfocused_grace_ms)
+        };
+        if !relay_enabled || self.any_window_focused() || !self.has_connected_haven_signer() {
+            return;
+        }
+        let grace = Duration::from_millis(grace_ms);
+        let due_ids: Vec<u64> = self
+            .pending_consents
+            .borrow()
+            .iter()
+            .filter(|c| !c.relayed_to_haven && c.created_at.elapsed() >= grace)
+            .map(|c| c.id)
+            .collect();
+        for cid in due_ids {
+            let _ = self.relay_consent_to_haven(cid);
+        }
+    }
+
+    pub(crate) fn active_haven_auth_prompt(&self) -> Option<(String, String, HavenAuthPrompt)> {
+        let map = self.haven_auth_prompts.borrow();
+        let dismissed = self.dismissed_auth_prompts.borrow();
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for peer_id in keys {
+            if let Some((peer_label, prompt)) = map.get(peer_id)
+                && !dismissed.contains(&(peer_id.clone(), prompt.profile_id.clone()))
+            {
+                return Some((peer_id.clone(), peer_label.clone(), prompt.clone()));
+            }
+        }
+        None
+    }
+
+    /// Triggered exclusively from physical GTK4 widget interaction on the
+    /// Haven Auth Bar. Never reachable over IPC, CLI, or MCP.
+    pub(crate) fn submit_haven_auth_prompt(
+        &self,
+        peer_id: &str,
+        profile_id: &str,
+        password: String,
+        remember_password: bool,
+    ) -> Result<(), String> {
+        let matches_active = self
+            .haven_auth_prompts
+            .borrow()
+            .get(peer_id)
+            .is_some_and(|(_, p)| p.profile_id == profile_id);
+        if !matches_active {
+            return Err(String::from("auth prompt is no longer pending"));
+        }
+        self.haven_auth_prompts.borrow_mut().remove(peer_id);
+        self.dismissed_auth_prompts
+            .borrow_mut()
+            .remove(&(peer_id.to_owned(), profile_id.to_owned()));
+        let res = match self.peer_client.borrow().as_ref() {
+            Some(client) => {
+                client.answer_auth_prompt(peer_id.to_owned(), password, remember_password)
+            }
+            None => Err(String::from("no outbound Haven peer client active")),
+        };
+        self.refresh_all_window_chromes();
+        res
+    }
+
+    pub(crate) fn dismiss_haven_auth_prompt(&self, peer_id: &str, profile_id: &str) {
+        self.dismissed_auth_prompts
+            .borrow_mut()
+            .insert((peer_id.to_owned(), profile_id.to_owned()));
+        self.refresh_all_window_chromes();
+    }
+
+    pub(crate) fn trigger_insert_peer_totp(
+        &self,
+        target_window: Option<WindowId>,
+        target_pane: PaneId,
+    ) -> Result<(), String> {
+        let peer_id = self
+            .outbound_statuses
+            .borrow()
+            .iter()
+            .find_map(|(id, st)| match st {
+                OutboundLimbStatus::Connected { .. } => Some(id.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                self.peer_store
+                    .borrow()
+                    .outbound_peers
+                    .first()
+                    .map(|p| p.id.clone())
+            })
+            .ok_or_else(|| String::from("no paired outbound Haven peer"))?;
+
+        if self.peer_client.borrow().is_none() {
+            let initial = self.peer_store.borrow().outbound_peers.clone();
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+        }
+        self.peer_client
+            .borrow()
+            .as_ref()
+            .expect("peer client spawned")
+            .list_totp_secrets(peer_id, target_pane, target_window)
+    }
+
+    pub(crate) fn request_haven_totp_code(
+        &self,
+        peer_id: String,
+        totp_secret_id: String,
+        target_pane: PaneId,
+    ) -> Result<(), String> {
+        let guard = self.peer_client.borrow();
+        let Some(client) = guard.as_ref() else {
+            return Err(String::from("no outbound Haven peer client active"));
+        };
+        client.generate_totp_code(peer_id, totp_secret_id, target_pane)
     }
 
     /// Labels of the granted peer identities, for the audit dialog. The grant
@@ -2678,6 +2999,13 @@ impl AppController {
                     ui_win.show_pair_haven_dialog();
                 }
             }
+            ActionId::InsertPeerTotp => {
+                if let Some(pid) = active_pane
+                    && let Err(err) = self.trigger_insert_peer_totp(active_win, pid)
+                {
+                    eprintln!("warning: insert-peer-totp: {err}");
+                }
+            }
             ActionId::SessionPicker => {
                 if let Some(win_id) = active_win
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
@@ -2869,6 +3197,7 @@ impl AppController {
         self.advance_mux_commands();
         self.poll_inbound_pairing();
         self.poll_peer_client();
+        self.poll_unfocused_consent_relay();
         self.refresh_agent_icon();
         self.refresh_sessions_periodically();
         self.expire_pending_consents();
@@ -3015,7 +3344,29 @@ impl AppController {
             self.refresh_all_window_chromes();
         }
 
-        let gui_present = !self.ui_windows.borrow().is_empty();
+        // Strict operator-only invariant: a Peer carrier (HTTP MCP or agent
+        // socket) must never dump live TOTP codes into a terminal pane.
+        if matches!(
+            env_req.request,
+            IpcRequest::RunAction {
+                action: ActionId::InsertPeerTotp,
+                ..
+            }
+        ) && carrier.carrier_role() != CarrierRole::Operator
+        {
+            self.record_audit(
+                &client_label,
+                &env_req.request,
+                AuditDecision::Denied,
+                carrier,
+                peer,
+            );
+            return Some(IpcResponse::err(
+                "insert-peer-totp is restricted to the local Operator; Peer carriers are refused",
+            ));
+        }
+
+        let gui_present = !self.ui_windows.borrow().is_empty() || self.has_connected_haven_signer();
         // Tier 3 first: an installed policy substitutes for the prompt an ask
         // carrier would raise. It never escalates a carrier, so it is consulted
         // only for ask + Act and returns None otherwise.
@@ -3113,6 +3464,7 @@ impl AppController {
                 };
                 let cid = self.next_consent_id.get();
                 self.next_consent_id.set(cid + 1);
+                let now_inst = Instant::now();
                 self.pending_consents
                     .borrow_mut()
                     .push_back(PendingConsent {
@@ -3121,7 +3473,11 @@ impl AppController {
                         request: env_req.request,
                         carrier,
                         peer,
-                        deadline: Instant::now() + Duration::from_secs(25),
+                        created_at: now_inst,
+                        deadline: now_inst + Duration::from_secs(25),
+                        relayed_to_haven: false,
+                        remote_request_id: None,
+                        remote_sandbox_id: None,
                         stream: cloned,
                     });
                 self.refresh_all_window_chromes();
@@ -3297,11 +3653,25 @@ impl AppController {
                 }
                 Some(resp)
             }
-            IpcRequest::PairHaven { label, url, token } => {
+            IpcRequest::PairHaven {
+                label,
+                url,
+                token,
+                enroll_signer,
+            } => {
                 let Ok(cloned) = raw_stream.try_clone() else {
                     return Some(IpcResponse::err("could not clone the request stream"));
                 };
-                match self.begin_pair_haven(label, url, token, Some(cloned)) {
+                match self.begin_pair_haven(label, url, token, enroll_signer, Some(cloned)) {
+                    Ok(()) => None,
+                    Err(err) => Some(IpcResponse::err(err)),
+                }
+            }
+            IpcRequest::EnrollHavenSigner { id_or_label } => {
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                match self.begin_enroll_haven_signer(id_or_label, Some(cloned)) {
                     Ok(()) => None,
                     Err(err) => Some(IpcResponse::err(err)),
                 }
@@ -4056,7 +4426,7 @@ impl AppController {
         self.refresh_all_window_chromes();
     }
 
-    fn poll_peer_client(&self) {
+    fn poll_peer_client(self: &Rc<Self>) {
         let mut events = Vec::new();
         if let Some(client) = self.peer_client.borrow().as_ref() {
             while let Some(ev) = client.try_recv() {
@@ -4103,6 +4473,8 @@ impl AppController {
                                 inbound_notify_scope: peer.inbound_notify_scope,
                                 paired_at: peer.paired_at,
                                 last_connected_at: peer.last_connected_at,
+                                has_signing_key: peer.signing_secret_b64.is_some(),
+                                signing_key_id: peer.signing_key_id.clone(),
                                 status: status.clone(),
                             };
                             let save_res = {
@@ -4143,6 +4515,222 @@ impl AppController {
                         }
                     }
                     refresh_ui = true;
+                }
+                PeerClientEvent::SignerEnrolled { req_id, result } => {
+                    let reply_stream = self.pending_pair_replies.borrow_mut().remove(&req_id);
+                    match result {
+                        Ok((peer_id, secret_b64, key_id)) => {
+                            let mut updated_peers_opt = None;
+                            let mut summary_opt = None;
+                            let save_res = {
+                                let mut store = self.peer_store.borrow_mut();
+                                if let Some(entry) =
+                                    store.outbound_peers.iter_mut().find(|p| p.id == peer_id)
+                                {
+                                    entry.signing_secret_b64 = Some(secret_b64);
+                                    entry.signing_key_id = Some(key_id.clone());
+                                    let status = self
+                                        .outbound_statuses
+                                        .borrow()
+                                        .get(&entry.id)
+                                        .cloned()
+                                        .unwrap_or_else(|| OutboundLimbStatus::Offline {
+                                            id: entry.id.clone(),
+                                            label: entry.label.clone(),
+                                            last_error: None,
+                                        });
+                                    summary_opt = Some(OutboundPeerSummary {
+                                        id: entry.id.clone(),
+                                        label: entry.label.clone(),
+                                        url: entry.url.clone(),
+                                        inbound_notify_scope: entry.inbound_notify_scope,
+                                        paired_at: entry.paired_at,
+                                        last_connected_at: entry.last_connected_at,
+                                        has_signing_key: true,
+                                        signing_key_id: Some(key_id),
+                                        status,
+                                    });
+                                    let res = peers::save(&self.peers_path.borrow(), &store);
+                                    if res.is_ok() {
+                                        updated_peers_opt = Some(store.outbound_peers.clone());
+                                    }
+                                    res.map_err(|e| format!("failed to persist peers.json: {e}"))
+                                } else {
+                                    Err(format!(
+                                        "outbound peer {peer_id:?} was removed before enrollment completed"
+                                    ))
+                                }
+                            };
+                            match save_res {
+                                Ok(()) => {
+                                    if let (Some(updated), Some(client)) =
+                                        (updated_peers_opt, self.peer_client.borrow().as_ref())
+                                    {
+                                        let _ = client.set_peers(updated);
+                                    }
+                                    if let Some(mut stream) = reply_stream {
+                                        let mut resp = IpcResponse::empty_ok();
+                                        if let IpcResponse::Ok { outbound_peer, .. } = &mut resp {
+                                            *outbound_peer = summary_opt;
+                                        }
+                                        let _ = write_response(&mut stream, &resp);
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Some(mut stream) = reply_stream {
+                                        let _ = write_response(&mut stream, &IpcResponse::err(err));
+                                    } else {
+                                        eprintln!("warning: {err}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(mut stream) = reply_stream {
+                                let _ = write_response(&mut stream, &IpcResponse::err(err));
+                            } else {
+                                eprintln!("warning: Haven signer enrollment failed: {err}");
+                            }
+                        }
+                    }
+                    refresh_ui = true;
+                }
+                PeerClientEvent::ConsentCompleted {
+                    consent_id,
+                    peer_id,
+                    result,
+                } => {
+                    let pending_meta = {
+                        let queue = self.pending_consents.borrow();
+                        queue.iter().find(|c| c.id == consent_id).map(|c| {
+                            (
+                                c.remote_request_id.clone(),
+                                c.remote_sandbox_id.clone(),
+                                c.request.consent_tier(),
+                            )
+                        })
+                    };
+                    // First-human-wins race: if local Allow/Deny already resolved
+                    // this PendingConsent, ignore the late remote response.
+                    let Some((Some(exp_req_id), Some(exp_sandbox_id), tier)) = pending_meta else {
+                        continue;
+                    };
+                    let secret_opt = self
+                        .peer_store
+                        .borrow()
+                        .outbound_peers
+                        .iter()
+                        .find(|p| p.id == peer_id)
+                        .and_then(|p| p.signing_secret_b64.clone());
+                    let Some(secret_b64) = secret_opt else {
+                        eprintln!(
+                            "warning: Haven consent reply for {exp_req_id} rejected: missing signing key"
+                        );
+                        self.resolve_consent(consent_id, ConsentResolution::Deny);
+                        continue;
+                    };
+                    let resolution = match result {
+                        Ok(payload) => {
+                            let expected = crypto::ExpectedEgressGrant {
+                                request_id: exp_req_id.clone(),
+                                sandbox_id: exp_sandbox_id,
+                                host: String::from("mutiny.local"),
+                                port: 1,
+                            };
+                            let verified = {
+                                let mut cache = self.consent_replay_cache.borrow_mut();
+                                crypto::verify_egress_decision(
+                                    &secret_b64,
+                                    &expected,
+                                    &payload,
+                                    now_ms(),
+                                    &mut cache,
+                                )
+                            };
+                            match verified {
+                                crypto::VerifiedEgressDecision::Once => {
+                                    ConsentResolution::AllowOnce
+                                }
+                                crypto::VerifiedEgressDecision::Session => {
+                                    // Tier-3 / Tier-4 one-shot enforcement: Irreversible
+                                    // and PolicyChange never record a session-wide grant.
+                                    if matches!(
+                                        tier,
+                                        crate::action::ConsentTier::Irreversible
+                                            | crate::action::ConsentTier::PolicyChange
+                                    ) {
+                                        ConsentResolution::AllowOnce
+                                    } else {
+                                        ConsentResolution::AllowSession
+                                    }
+                                }
+                                crypto::VerifiedEgressDecision::Deny(reason) => {
+                                    eprintln!(
+                                        "warning: Haven consent denied or failed verification for {exp_req_id}: {reason}"
+                                    );
+                                    ConsentResolution::Deny
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("warning: Haven consent request {exp_req_id} failed: {err}");
+                            ConsentResolution::Deny
+                        }
+                    };
+                    self.resolve_consent(consent_id, resolution);
+                }
+                PeerClientEvent::AuthPromptChanged {
+                    peer_id,
+                    peer_label,
+                    prompt,
+                } => {
+                    let mut map = self.haven_auth_prompts.borrow_mut();
+                    match prompt {
+                        Some(p) => {
+                            let changed = map
+                                .get(&peer_id)
+                                .map(|(lbl, old)| lbl != &peer_label || old != &p)
+                                .unwrap_or(true);
+                            map.insert(peer_id, (peer_label, p));
+                            if changed {
+                                refresh_ui = true;
+                            }
+                        }
+                        None => {
+                            if map.remove(&peer_id).is_some() {
+                                refresh_ui = true;
+                            }
+                            self.dismissed_auth_prompts
+                                .borrow_mut()
+                                .retain(|(pid, _)| pid != &peer_id);
+                        }
+                    }
+                }
+                PeerClientEvent::TotpChoicesReady {
+                    peer_id,
+                    target_pane,
+                    target_window,
+                    secrets,
+                } => {
+                    let win_id =
+                        target_window.or_else(|| self.workspace.borrow().active_window_id());
+                    if let Some(wid) = win_id
+                        && let Some(ui_win) = self.ui_windows.borrow().get(&wid).cloned()
+                    {
+                        ui_win.show_totp_chooser_dialog(&peer_id, target_pane, &secrets);
+                    }
+                }
+                PeerClientEvent::TotpCodeReady { target_pane, code } => {
+                    if let Some(eng) = self.workspace.borrow_mut().pane_mut(target_pane)
+                        && let Err(err) = eng.write_to_pty(code.as_bytes())
+                    {
+                        eprintln!(
+                            "warning: failed to write Haven TOTP code to pane {target_pane}: {err}"
+                        );
+                    }
+                }
+                PeerClientEvent::TotpError(err) => {
+                    eprintln!("warning: Haven TOTP request failed: {err}");
                 }
                 PeerClientEvent::ToolCallCompleted { .. } => {}
             }

@@ -29,6 +29,7 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("close-window", "", "Session"),
     ("copy", "Ctrl+Shift+C", "Edit"),
     ("paste", "Ctrl+Shift+V", "Edit"),
+    ("insert-peer-totp", "Ctrl+Shift+Y", "Edit"),
     ("search", "Ctrl+Shift+F", "Edit"),
     ("jump-prev-prompt", "Ctrl+Shift+Up", "Edit"),
     ("jump-next-prompt", "Ctrl+Shift+Down", "Edit"),

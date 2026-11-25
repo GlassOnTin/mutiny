@@ -45,8 +45,16 @@ struct MutinyWindowInner {
     active_pairing_id: Cell<Option<u64>>,
     consent_bar: gtk4::Box,
     consent_label: gtk4::Label,
+    send_haven_btn: gtk4::Button,
     allow_sess_btn: gtk4::Button,
     active_consent_id: Cell<Option<u64>>,
+    haven_auth_bar: gtk4::Box,
+    haven_auth_label: gtk4::Label,
+    haven_auth_entry: gtk4::PasswordEntry,
+    haven_auth_remember: gtk4::CheckButton,
+    haven_auth_unlock_btn: gtk4::Button,
+    haven_auth_dismiss_btn: gtk4::Button,
+    active_haven_auth_target: RefCell<Option<(String, String)>>,
     notice_bar: gtk4::Box,
     notice_label: gtk4::Label,
     search_bar: gtk4::Box,
@@ -214,15 +222,51 @@ impl MutinyWindow {
         consent_label.set_xalign(0.0);
         consent_bar.append(&consent_label);
 
+        let send_haven_btn = gtk4::Button::with_label("Send to Haven");
+        send_haven_btn.set_can_focus(false);
+        send_haven_btn.set_visible(false);
         let allow_once_btn = gtk4::Button::with_label("Allow Once");
         allow_once_btn.set_can_focus(false);
         let allow_sess_btn = gtk4::Button::with_label("Allow Session");
         allow_sess_btn.set_can_focus(false);
         let deny_btn = gtk4::Button::with_label("Deny");
         deny_btn.set_can_focus(false);
+        consent_bar.append(&send_haven_btn);
         consent_bar.append(&allow_once_btn);
         consent_bar.append(&allow_sess_btn);
         consent_bar.append(&deny_btn);
+
+        // Inline Haven stalled SSH authentication bar (physical GUI interaction only)
+        let haven_auth_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        haven_auth_bar.set_margin_start(8);
+        haven_auth_bar.set_margin_end(8);
+        haven_auth_bar.set_margin_top(4);
+        haven_auth_bar.set_margin_bottom(4);
+        haven_auth_bar.set_visible(false);
+
+        let haven_auth_label = gtk4::Label::new(None);
+        haven_auth_label.set_hexpand(true);
+        haven_auth_label.set_xalign(0.0);
+        haven_auth_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        haven_auth_bar.append(&haven_auth_label);
+
+        let haven_auth_entry = gtk4::PasswordEntry::new();
+        haven_auth_entry.set_show_peek_icon(true);
+        haven_auth_entry.set_width_chars(20);
+        haven_auth_bar.append(&haven_auth_entry);
+
+        let haven_auth_remember = gtk4::CheckButton::with_label("Remember on Haven");
+        haven_auth_remember.set_active(false);
+        haven_auth_remember.set_can_focus(false);
+        haven_auth_bar.append(&haven_auth_remember);
+
+        let haven_auth_unlock_btn = gtk4::Button::with_label("Unlock");
+        haven_auth_unlock_btn.add_css_class("suggested-action");
+        haven_auth_unlock_btn.set_can_focus(false);
+        let haven_auth_dismiss_btn = gtk4::Button::with_label("Dismiss");
+        haven_auth_dismiss_btn.set_can_focus(false);
+        haven_auth_bar.append(&haven_auth_unlock_btn);
+        haven_auth_bar.append(&haven_auth_dismiss_btn);
 
         // Bidirectional agent -> operator notice banner
         let notice_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -307,6 +351,7 @@ impl MutinyWindow {
         root_vbox.append(&chrome_bar);
         root_vbox.append(&pairing_bar);
         root_vbox.append(&consent_bar);
+        root_vbox.append(&haven_auth_bar);
         root_vbox.append(&notice_bar);
         root_vbox.append(&search_bar);
         root_vbox.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -330,8 +375,16 @@ impl MutinyWindow {
                 active_pairing_id: Cell::new(None),
                 consent_bar,
                 consent_label,
+                send_haven_btn: send_haven_btn.clone(),
                 allow_sess_btn: allow_sess_btn.clone(),
                 active_consent_id: Cell::new(None),
+                haven_auth_bar,
+                haven_auth_label,
+                haven_auth_entry: haven_auth_entry.clone(),
+                haven_auth_remember: haven_auth_remember.clone(),
+                haven_auth_unlock_btn: haven_auth_unlock_btn.clone(),
+                haven_auth_dismiss_btn: haven_auth_dismiss_btn.clone(),
+                active_haven_auth_target: RefCell::new(None),
                 notice_bar,
                 notice_label,
                 search_bar,
@@ -346,7 +399,14 @@ impl MutinyWindow {
             }),
         };
 
-        this.wire_banner_buttons(&allow_once_btn, &allow_sess_btn, &deny_btn, &ack_btn);
+        this.wire_banner_buttons(
+            &send_haven_btn,
+            &allow_once_btn,
+            &allow_sess_btn,
+            &deny_btn,
+            &ack_btn,
+        );
+        this.wire_haven_auth_bar();
         this.wire_pairing_and_limb_ui(
             &pair_approve_btn,
             &pair_deny_btn,
@@ -362,6 +422,7 @@ impl MutinyWindow {
                 && let Some(ctrl) = ctrl_weak.upgrade()
             {
                 ctrl.workspace.borrow_mut().set_active_window(window_id);
+                ctrl.poll_haven_peers_now();
             }
         });
 
@@ -399,11 +460,25 @@ impl MutinyWindow {
 
     fn wire_banner_buttons(
         &self,
+        send_haven: &gtk4::Button,
         allow_once: &gtk4::Button,
         allow_sess: &gtk4::Button,
         deny: &gtk4::Button,
         ack: &gtk4::Button,
     ) {
+        {
+            let inner_weak = Rc::downgrade(&self.inner);
+            send_haven.connect_clicked(move |_| {
+                if let Some(inner) = inner_weak.upgrade()
+                    && let (Some(cid), Some(ctrl)) =
+                        (inner.active_consent_id.get(), inner.controller.upgrade())
+                    && let Err(err) = ctrl.relay_consent_to_haven(cid)
+                {
+                    eprintln!("warning: could not relay consent to Haven: {err}");
+                }
+            });
+        }
+
         for (btn, res) in [
             (allow_once, ConsentResolution::AllowOnce),
             (allow_sess, ConsentResolution::AllowSession),
@@ -435,6 +510,66 @@ impl MutinyWindow {
                 }
             }
         });
+    }
+
+    fn wire_haven_auth_bar(&self) {
+        {
+            let this = self.clone();
+            self.inner.haven_auth_unlock_btn.connect_clicked(move |_| {
+                this.submit_active_haven_auth();
+            });
+        }
+        {
+            let this = self.clone();
+            self.inner.haven_auth_entry.connect_activate(move |_| {
+                this.submit_active_haven_auth();
+            });
+        }
+        {
+            let this = self.clone();
+            self.inner.haven_auth_dismiss_btn.connect_clicked(move |_| {
+                this.dismiss_active_haven_auth();
+            });
+        }
+        {
+            let this = self.clone();
+            let keys = gtk4::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gdk::Key::Escape {
+                    this.dismiss_active_haven_auth();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            self.inner.haven_auth_entry.add_controller(keys);
+        }
+    }
+
+    fn submit_active_haven_auth(&self) {
+        let secret = self.inner.haven_auth_entry.text().to_string();
+        let remember = self.inner.haven_auth_remember.is_active();
+        // Clear immediately so credentials do not linger in GTK widget buffers.
+        self.inner.haven_auth_entry.set_text("");
+        self.inner.haven_auth_remember.set_active(false);
+        if secret.is_empty() {
+            return;
+        }
+        let target = self.inner.active_haven_auth_target.borrow().clone();
+        if let (Some((peer_id, profile_id)), Some(ctrl)) = (target, self.inner.controller.upgrade())
+            && let Err(err) = ctrl.submit_haven_auth_prompt(&peer_id, &profile_id, secret, remember)
+        {
+            eprintln!("warning: could not submit Haven auth prompt: {err}");
+        }
+    }
+
+    fn dismiss_active_haven_auth(&self) {
+        self.inner.haven_auth_entry.set_text("");
+        self.inner.haven_auth_remember.set_active(false);
+        let target = self.inner.active_haven_auth_target.borrow().clone();
+        if let (Some((peer_id, profile_id)), Some(ctrl)) = (target, self.inner.controller.upgrade())
+        {
+            ctrl.dismiss_haven_auth_prompt(&peer_id, &profile_id);
+        }
     }
 
     fn wire_search_bar(&self, prev: &gtk4::Button, next: &gtk4::Button, close: &gtk4::Button) {
@@ -1145,6 +1280,16 @@ impl MutinyWindow {
                 crate::action::ConsentTier::Irreversible | crate::action::ConsentTier::PolicyChange
             );
             self.inner.allow_sess_btn.set_visible(!no_session_grant);
+            let (can_relay, already_relayed) = ctrl.consent_haven_relay_state(cid);
+            self.inner
+                .send_haven_btn
+                .set_visible(can_relay || already_relayed);
+            self.inner.send_haven_btn.set_sensitive(!already_relayed);
+            self.inner.send_haven_btn.set_label(if already_relayed {
+                "Sent to Haven…"
+            } else {
+                "Send to Haven"
+            });
             let tier_label = match tier {
                 crate::action::ConsentTier::Irreversible => "Tier-4 irreversible",
                 crate::action::ConsentTier::PolicyChange => "PolicyChange",
@@ -1156,7 +1301,43 @@ impl MutinyWindow {
             self.inner.consent_bar.set_visible(true);
         } else {
             self.inner.active_consent_id.set(None);
+            self.inner.send_haven_btn.set_visible(false);
             self.inner.consent_bar.set_visible(false);
+        }
+
+        if let Some((peer_id, peer_label, prompt)) = ctrl.active_haven_auth_prompt() {
+            let target = (peer_id, prompt.profile_id.clone());
+            let changed = *self.inner.active_haven_auth_target.borrow() != Some(target.clone());
+            if changed {
+                *self.inner.active_haven_auth_target.borrow_mut() = Some(target);
+                self.inner.haven_auth_entry.set_text("");
+                self.inner.haven_auth_remember.set_active(false);
+            }
+            let secret_kind = if prompt.requires_passphrase {
+                "SSH key passphrase"
+            } else {
+                "host password"
+            };
+            self.inner
+                .haven_auth_entry
+                .set_placeholder_text(Some(secret_kind));
+            self.inner.haven_auth_label.set_text(&format!(
+                "Haven '{peer_label}' needs {secret_kind} for '{}'",
+                prompt.label
+            ));
+            self.inner.haven_auth_bar.set_visible(true);
+        } else {
+            if self
+                .inner
+                .active_haven_auth_target
+                .borrow_mut()
+                .take()
+                .is_some()
+            {
+                self.inner.haven_auth_entry.set_text("");
+                self.inner.haven_auth_remember.set_active(false);
+            }
+            self.inner.haven_auth_bar.set_visible(false);
         }
 
         let active_notice = {
@@ -1798,6 +1979,21 @@ impl MutinyWindow {
             "Show exited zellij sessions",
             current.sessions.show_exited,
             Box::new(|c, v| c.sessions.show_exited = v),
+        );
+
+        heading("Peer");
+        check(
+            "Relay unfocused consent prompts to Haven signer",
+            current.peer.relay_unfocused_consent,
+            Box::new(|c, v| c.peer.relay_unfocused_consent = v),
+        );
+        spin(
+            "Unfocused consent relay grace ms",
+            current.peer.unfocused_grace_ms as f64,
+            0.0,
+            60_000.0,
+            100.0,
+            Box::new(|c, v| c.peer.unfocused_grace_ms = v as u64),
         );
 
         let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -2491,8 +2687,10 @@ impl MutinyWindow {
             container.append(&empty);
         }
 
+        let has_any_outbound = !listing.outbound.is_empty();
         for out in listing.outbound {
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let signer_badge = if out.has_signing_key { " [signer]" } else { "" };
             let status_text = match &out.status {
                 crate::peers::OutboundLimbStatus::Connected {
                     remote_version,
@@ -2503,17 +2701,24 @@ impl MutinyWindow {
                         .as_deref()
                         .map(|v| format!(" v{v}"))
                         .unwrap_or_default();
-                    format!("● haven:{}{} ({} ms) {}", out.label, ver, rtt_ms, out.url)
+                    format!(
+                        "● haven:{}{} ({} ms){} {}",
+                        out.label, ver, rtt_ms, signer_badge, out.url
+                    )
                 }
                 crate::peers::OutboundLimbStatus::Pairing { .. } => {
-                    format!("◐ haven:{} (pairing…) {}", out.label, out.url)
+                    format!(
+                        "◐ haven:{} (pairing…){} {}",
+                        out.label, signer_badge, out.url
+                    )
                 }
                 crate::peers::OutboundLimbStatus::Offline { last_error, .. } => {
                     let err = last_error.as_deref().unwrap_or("offline");
                     format!(
-                        "◌ haven:{} ({}) {}",
+                        "◌ haven:{} ({}){} {}",
                         out.label,
                         truncate_label(err, 36),
+                        signer_badge,
                         out.url
                     )
                 }
@@ -2522,6 +2727,25 @@ impl MutinyWindow {
             lbl.set_xalign(0.0);
             lbl.set_hexpand(true);
             row.append(&lbl);
+
+            let enroll_label = if out.has_signing_key {
+                "Re-enroll Signer"
+            } else {
+                "Enroll Consent Signer"
+            };
+            let enroll_btn = gtk4::Button::with_label(enroll_label);
+            let ctrl_enroll = Rc::downgrade(&ctrl);
+            let pop_enroll = popover.clone();
+            let enroll_target = out.id.clone();
+            enroll_btn.connect_clicked(move |_| {
+                pop_enroll.popdown();
+                if let Some(c) = ctrl_enroll.upgrade()
+                    && let Err(e) = c.begin_enroll_haven_signer(enroll_target.clone(), None)
+                {
+                    eprintln!("warning: enroll signer failed: {e}");
+                }
+            });
+            row.append(&enroll_btn);
 
             let revoke_btn = gtk4::Button::with_label("Revoke");
             revoke_btn.add_css_class("destructive-action");
@@ -2570,6 +2794,19 @@ impl MutinyWindow {
         }
 
         container.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        if has_any_outbound {
+            let totp_btn = gtk4::Button::with_label("Insert Haven TOTP Code (Ctrl+Shift+Y)");
+            let ctrl_totp = Rc::downgrade(&ctrl);
+            let pop_totp = popover.clone();
+            let win_id = self.inner.window_id;
+            totp_btn.connect_clicked(move |_| {
+                pop_totp.popdown();
+                if let Some(c) = ctrl_totp.upgrade() {
+                    c.execute_action(ActionId::InsertPeerTotp, Some(win_id));
+                }
+            });
+            container.append(&totp_btn);
+        }
         let pair_btn = gtk4::Button::with_label("Pair Haven Limb…");
         let this = self.clone();
         let pop_clone = popover.clone();
@@ -2631,6 +2868,10 @@ impl MutinyWindow {
 
         vbox.append(&grid);
 
+        let enroll_check = gtk4::CheckButton::with_label("Enroll consent signer after pairing");
+        enroll_check.set_active(false);
+        vbox.append(&enroll_check);
+
         let hint = gtk4::Label::new(Some(
             "Use a loopback SSH forward (127.0.0.1) or an encrypted WireGuard/Yggdrasil tunnel address.",
         ));
@@ -2661,6 +2902,7 @@ impl MutinyWindow {
             pair.connect_clicked(move |_| {
                 let label = entry_name.text().to_string();
                 let url = entry_url.text().to_string();
+                let enroll_signer = enroll_check.is_active();
                 let tok = {
                     let raw = entry_tok.text().to_string();
                     if raw.trim().is_empty() {
@@ -2671,7 +2913,7 @@ impl MutinyWindow {
                 };
                 d.close();
                 if let Some(c) = ctrl_weak.upgrade()
-                    && let Err(err) = c.begin_pair_haven(label, url, tok, None)
+                    && let Err(err) = c.begin_pair_haven(label, url, tok, enroll_signer, None)
                 {
                     eprintln!("warning: could not start Haven pairing: {err}");
                 }
@@ -2680,6 +2922,85 @@ impl MutinyWindow {
 
         attach_escape_to_close(&dialog);
         dialog.present();
+    }
+
+    pub(crate) fn show_totp_chooser_dialog(
+        &self,
+        peer_id: &str,
+        target_pane: PaneId,
+        secrets: &[crate::peer_client::TotpSecretItem],
+    ) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("Insert Haven TOTP Code")
+            .default_width(440)
+            .default_height(320)
+            .build();
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        vbox.set_margin_top(10);
+        vbox.set_margin_bottom(10);
+        vbox.set_margin_start(10);
+        vbox.set_margin_end(10);
+
+        let prompt = gtk4::Label::new(Some(
+            "Select an authenticator secret on Haven to type into the active pane:",
+        ));
+        prompt.set_xalign(0.0);
+        prompt.set_wrap(true);
+        vbox.append(&prompt);
+
+        let list = gtk4::ListBox::new();
+        list.set_selection_mode(gtk4::SelectionMode::Single);
+        let ids: Vec<String> = secrets.iter().map(|s| s.id.clone()).collect();
+        for item in secrets {
+            let sub = match (&item.issuer, &item.account_name) {
+                (Some(iss), Some(acc)) => format!("{iss} ({acc})"),
+                (Some(iss), None) => iss.clone(),
+                (None, Some(acc)) => acc.clone(),
+                (None, None) => String::new(),
+            };
+            list.append(&session_row(&item.label, &sub, "", true));
+        }
+        if let Some(first) = list.row_at_index(0) {
+            list.select_row(Some(&first));
+        }
+
+        let scroller = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
+            .child(&list)
+            .build();
+        vbox.append(&scroller);
+        dialog.set_child(Some(&vbox));
+
+        let peer_owned = peer_id.to_owned();
+        let ctrl_weak = Rc::downgrade(&ctrl);
+        let dialog_for_row = dialog.clone();
+        list.connect_row_activated(move |_, row| {
+            let idx = row.index();
+            let chosen = if idx >= 0 {
+                ids.get(idx as usize).cloned()
+            } else {
+                None
+            };
+            dialog_for_row.close();
+            if let (Some(secret_id), Some(c)) = (chosen, ctrl_weak.upgrade())
+                && let Err(err) =
+                    c.request_haven_totp_code(peer_owned.clone(), secret_id, target_pane)
+            {
+                eprintln!("warning: could not request Haven TOTP code: {err}");
+            }
+        });
+
+        attach_escape_to_close(&dialog);
+        dialog.present();
+        list.grab_focus();
     }
 
     pub fn is_pairing_bar_visible(&self) -> bool {
@@ -2692,6 +3013,44 @@ impl MutinyWindow {
 
     pub fn select_pairing_mode_index(&self, idx: u32) {
         self.inner.pairing_mode_dropdown.set_selected(idx);
+    }
+
+    pub fn is_consent_bar_visible(&self) -> bool {
+        self.inner.consent_bar.is_visible()
+    }
+
+    pub fn consent_bar_text(&self) -> String {
+        self.inner.consent_label.text().to_string()
+    }
+
+    pub fn is_send_to_haven_visible(&self) -> bool {
+        self.inner.send_haven_btn.is_visible()
+    }
+
+    pub fn click_send_to_haven(&self) {
+        self.inner.send_haven_btn.emit_clicked();
+    }
+
+    pub fn is_haven_auth_bar_visible(&self) -> bool {
+        self.inner.haven_auth_bar.is_visible()
+    }
+
+    pub fn haven_auth_bar_text(&self) -> String {
+        self.inner.haven_auth_label.text().to_string()
+    }
+
+    pub fn haven_auth_entry_text(&self) -> String {
+        self.inner.haven_auth_entry.text().to_string()
+    }
+
+    pub fn unlock_haven_auth_bar_via_ui(&self, password: &str, remember: bool) {
+        self.inner.haven_auth_entry.set_text(password);
+        self.inner.haven_auth_remember.set_active(remember);
+        self.inner.haven_auth_unlock_btn.emit_clicked();
+    }
+
+    pub fn dismiss_haven_auth_bar_via_ui(&self) {
+        self.inner.haven_auth_dismiss_btn.emit_clicked();
     }
 
     pub fn is_limb_pill_visible(&self) -> bool {

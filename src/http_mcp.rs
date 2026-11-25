@@ -22,7 +22,7 @@
 //! socket. Each relay carrier pins its own consent mode (`ask`, `paired`, or
 //! `observe-only`), so a network client can never be assigned `Operator`.
 //!
-//! Bounded slice: `POST /mcp` with a JSON response over `40` IPC verbs and `36`
+//! Bounded slice: `POST /mcp` with a JSON response over `41` IPC verbs and `37`
 //! MCP tools. SSE streaming, session management, and `DELETE` are not
 //! implemented.
 

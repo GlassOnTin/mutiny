@@ -66,6 +66,10 @@ pub struct OutboundHavenPeer {
     pub paired_at: u64,
     #[serde(default)]
     pub last_connected_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_secret_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
 }
 
 /// Live connection state of an outbound Haven limb, surfaced on `list-peers`
@@ -127,7 +131,7 @@ pub struct InboundPeerSummary {
 }
 
 /// Redacted view of an outbound Haven peer for IPC/CLI/MCP responses. Never
-/// carries `bearer_token`.
+/// carries `bearer_token` or `signing_secret_b64`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundPeerSummary {
     pub id: String,
@@ -137,6 +141,9 @@ pub struct OutboundPeerSummary {
     pub paired_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_connected_at: Option<u64>,
+    pub has_signing_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
     pub status: OutboundLimbStatus,
 }
 
@@ -222,6 +229,15 @@ pub fn load(path: &Path) -> Result<PeerStore, String> {
                 path.display(),
                 peer.label
             ));
+        }
+        if let Some(secret_b64) = peer.signing_secret_b64.as_deref() {
+            crypto::decode_signing_secret_b64(secret_b64).map_err(|e| {
+                format!(
+                    "{}: outbound peer {:?} has invalid signing_secret_b64: {e}",
+                    path.display(),
+                    peer.label
+                )
+            })?;
         }
     }
     Ok(store)
@@ -401,6 +417,8 @@ pub fn build_listing(
                 inbound_notify_scope: p.inbound_notify_scope,
                 paired_at: p.paired_at,
                 last_connected_at: p.last_connected_at,
+                has_signing_key: p.signing_secret_b64.is_some(),
+                signing_key_id: p.signing_key_id.clone(),
                 status,
             }
         })
@@ -448,6 +466,8 @@ mod tests {
                 inbound_notify_scope: InboundNotifyScope::default(),
                 paired_at: 1_700_000_001,
                 last_connected_at: None,
+                signing_secret_b64: None,
+                signing_key_id: None,
             }],
         };
 

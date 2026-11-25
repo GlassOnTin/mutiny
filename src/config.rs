@@ -161,6 +161,25 @@ impl Default for SessionsConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeerConfig {
+    /// Relay pending consent prompts to a connected, signer-enrolled outbound
+    /// Haven limb when no Mutiny window has compositor focus.
+    pub relay_unfocused_consent: bool,
+    /// Grace window in milliseconds before an unfocused prompt relays to Haven.
+    pub unfocused_grace_ms: u64,
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        Self {
+            relay_unfocused_consent: true,
+            unfocused_grace_ms: 1_500,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -169,6 +188,7 @@ pub struct Config {
     pub geometry: GeometryConfig,
     pub terminal: TerminalConfig,
     pub sessions: SessionsConfig,
+    pub peer: PeerConfig,
 }
 
 /// CLI flags that shadow config keys. Applied after the file on every load.
@@ -213,6 +233,8 @@ pub struct ResolvedConfig {
     /// `None` means New Tab opens a plain shell.
     pub preferred_mux: Option<crate::mux::MuxKind>,
     pub discovery_timeout_ms: u64,
+    pub relay_unfocused_consent: bool,
+    pub unfocused_grace_ms: u64,
 }
 
 impl Default for ResolvedConfig {
@@ -407,6 +429,8 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
         session_refresh_interval_s: config.sessions.refresh_interval_s.min(3600),
         preferred_mux: parse_preferred(&config.sessions.preferred),
         discovery_timeout_ms: config.sessions.discovery_timeout_ms.clamp(200, 60_000),
+        relay_unfocused_consent: config.peer.relay_unfocused_consent,
+        unfocused_grace_ms: config.peer.unfocused_grace_ms.min(60_000),
     }
 }
 

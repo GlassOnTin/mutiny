@@ -205,12 +205,19 @@ pub enum IpcRequest {
     ListPeers,
     /// Pairs an outbound Haven HTTP MCP limb over loopback or an encrypted
     /// tunnel, optionally running symmetric `initialize` tap-to-pair when
-    /// `token` is omitted.
+    /// `token` is omitted, and optionally enrolling the HMAC consent signer.
     PairHaven {
         label: String,
         url: String,
         #[serde(default)]
         token: Option<String>,
+        #[serde(default)]
+        enroll_signer: bool,
+    },
+    /// Enrolls a paired outbound Haven limb's HMAC-SHA256 consent signing key
+    /// (`get_egress_signing_secret`) into `peers.json` (`0600`).
+    EnrollHavenSigner {
+        id_or_label: String,
     },
     /// Revokes an inbound or outbound paired peer immediately in memory and in
     /// `peers.json`.
@@ -365,6 +372,7 @@ impl IpcRequest {
             IpcRequest::RevokePolicy { .. } => ConsentTier::PolicyChange,
             IpcRequest::ListPeers => ConsentTier::Observe,
             IpcRequest::PairHaven { .. } => ConsentTier::PolicyChange,
+            IpcRequest::EnrollHavenSigner { .. } => ConsentTier::PolicyChange,
             IpcRequest::RevokePeer { .. } => ConsentTier::PolicyChange,
             IpcRequest::EndSession { .. } => ConsentTier::Irreversible,
             IpcRequest::ClosePane { .. } => ConsentTier::Act,
@@ -448,6 +456,7 @@ impl IpcRequest {
             IpcRequest::RevokePolicy { .. } => "revoke-policy",
             IpcRequest::ListPeers => "list-peers",
             IpcRequest::PairHaven { .. } => "pair-haven",
+            IpcRequest::EnrollHavenSigner { .. } => "enroll-haven-signer",
             IpcRequest::RevokePeer { .. } => "revoke-peer",
             IpcRequest::EndSession { .. } => "end-session",
             IpcRequest::ClosePane { .. } => "close-pane",
@@ -549,13 +558,19 @@ impl IpcRequest {
             IpcRequest::InstallPolicy { id } | IpcRequest::RevokePolicy { id } => {
                 format!("id={id}")
             }
-            IpcRequest::PairHaven { label, url, token } => format!(
-                "label={:?} url={:?} has_token={}",
+            IpcRequest::PairHaven {
+                label,
+                url,
+                token,
+                enroll_signer,
+            } => format!(
+                "label={:?} url={:?} has_token={} enroll_signer={enroll_signer}",
                 crate::mux::sanitize_text(label, 48),
                 crate::mux::sanitize_text(url, 96),
                 token.is_some()
             ),
-            IpcRequest::RevokePeer { id_or_label } => {
+            IpcRequest::EnrollHavenSigner { id_or_label }
+            | IpcRequest::RevokePeer { id_or_label } => {
                 format!("target={:?}", crate::mux::sanitize_text(id_or_label, 64))
             }
             IpcRequest::EndSession { kind, name, host } => format!(
@@ -1298,8 +1313,12 @@ pub fn verb_samples() -> Vec<IpcRequest> {
             label: String::from("haven-probe"),
             url: String::from("http://127.0.0.1:1/mcp"),
             token: Some(String::from("probe")),
+            enroll_signer: false,
         },
         IpcRequest::RevokePeer {
+            id_or_label: String::from("absent-peer"),
+        },
+        IpcRequest::EnrollHavenSigner {
             id_or_label: String::from("absent-peer"),
         },
     ]
@@ -1346,6 +1365,7 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::ListPeers => 37,
         IpcRequest::PairHaven { .. } => 38,
         IpcRequest::RevokePeer { .. } => 39,
+        IpcRequest::EnrollHavenSigner { .. } => 40,
         IpcRequest::EndSession { .. } => 31,
         IpcRequest::ClosePane { .. } => 25,
         IpcRequest::CloseTab { .. } => 27,
