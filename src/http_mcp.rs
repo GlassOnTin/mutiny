@@ -9,10 +9,10 @@
 //! before its body is even read.
 //!
 //! Requests are forwarded to a per-peer relay Unix socket, never the operator
-//! socket. Each relay carrier's mode is the agent carrier's, pinned by the
-//! operator at GUI launch (`--agent-consent`, one of ask/paired/observe-only),
-//! so a network client can never be assigned `Operator`. That is structural,
-//! not a check that could be forgotten: this module has no path to the operator
+//! socket. Each relay carrier pins its own consent mode (`ask`, `paired`, or
+//! `observe-only`, defaulting to `--agent-consent` from GUI launch), so a
+//! network client can never be assigned `Operator`. That is structural, not a
+//! check that could be forgotten: this module has no path to the operator
 //! socket at all.
 //!
 //! HTTP has no `SO_PEERCRED` equivalent, so the pairing token IS the peer
@@ -26,10 +26,8 @@
 //! Bounded slice: POST /mcp with a JSON response. SSE streaming, session
 //! management, and DELETE are not implemented. Each request is stateless, so
 //! the name a client sends in `initialize` does not persist; calls are audited
-//! under the peer's configured label.
-//!
-//! Still global: the consent *mode* is one setting for the whole listener, not
-//! per peer. Per-peer mode would need a mode per relay carrier; see VISION.
+//! under the peer's configured label, with per-peer identity, grants, and
+//! consent mode.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

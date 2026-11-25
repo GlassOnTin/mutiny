@@ -203,11 +203,15 @@ impl McpBridge {
         // reaches the socket. The carrier assigns the effective mode; this
         // bridge can only ever be more restrictive than the carrier, never less.
         if self.consent_mode == ConsentMode::ObserveOnly
-            && request.consent_tier() == crate::action::ConsentTier::Act
+            && request.consent_tier() != crate::action::ConsentTier::Observe
         {
-            return Ok(IpcResponse::err(
-                "observe-only session cannot execute Tier-2 Act verbs",
-            ));
+            let label = match request.consent_tier() {
+                crate::action::ConsentTier::Irreversible => "Tier-4 Irreversible",
+                _ => "Tier-2 Act",
+            };
+            return Ok(IpcResponse::err(format!(
+                "observe-only session cannot execute {label} verbs"
+            )));
         }
 
         let env_req = IpcEnvelope {
@@ -1079,7 +1083,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "end_session",
-            "description": "Tier-2 Act, DESTRUCTIVE: end a multiplexer session (tmux kill-session, zellij kill-session). Everything running inside it stops, on every device attached to it. This is NOT the same as close_tab or close_pane, which only end this client and leave the session running. The GUI gates this behind a confirmation; an agent calling it directly does not get one.",
+            "description": "Tier-4 Irreversible, DESTRUCTIVE: end a multiplexer session (tmux kill-session, zellij kill-session). Everything running inside it stops, on every device attached to it. This is NOT the same as close_tab or close_pane, which only end this client and leave the session running. Always requires per-action operator confirmation; never covered by session grants or standing policies.",
             "inputSchema": {
                 "type": "object",
                 "required": ["name"],
@@ -1092,7 +1096,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "rename_session",
-            "description": "Tier-2 Act: rename a multiplexer session using its own command (tmux rename-session, zellij action rename-session), then update every Mutiny pane attached to it so labels and the saved layout follow. Returns once the command is launched; a remote rename applies when it completes.",
+            "description": "Tier-2 Act: rename a multiplexer session using its own command (tmux rename-session, zellij action rename-session), then update every Mutiny pane attached to it so labels and the saved layout follow. Replies once the command finishes and reports non-zero exit errors.",
             "inputSchema": {
                 "type": "object",
                 "required": ["name", "new_name"],
@@ -1140,7 +1144,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "quit",
-            "description": "Tier-2 Act: save the session, then quit Mutiny. This ends every mutiny-owned shell; processes inside tmux or zellij survive because the multiplexer owns them.",
+            "description": "Tier-4 Irreversible: save the session, then quit Mutiny. This ends every mutiny-owned shell; processes inside tmux or zellij survive because the multiplexer owns them. Always requires per-action operator confirmation; never covered by session grants or standing policies.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {

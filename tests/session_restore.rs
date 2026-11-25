@@ -62,7 +62,7 @@ fn restored_bundle_reproduces_geometry_ratios_cwd_and_scrollback() {
     ] {
         let mut ws = first.workspace.borrow_mut();
         let eng = ws.pane_mut(pid).unwrap();
-        eng.advance_bytes(format!("\x1b]7;file://host{}\x07", cwd.display()).as_bytes());
+        eng.advance_bytes(format!("\x1b]7;file://localhost{}\x07", cwd.display()).as_bytes());
         eng.advance_bytes(format!("{marker} line one\r\n{marker} line two\r\n").as_bytes());
     }
     first.save_session().expect("save");

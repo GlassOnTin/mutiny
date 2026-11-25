@@ -416,3 +416,142 @@ fn unattached_sessions_are_visible_and_filterable_but_never_auto_reaped() {
     assert_eq!(orphan.attached, 0, "no client is attached to it");
     ctrl.shutdown_ipc();
 }
+
+#[test]
+fn ipc_rename_and_end_session_propagate_exit_errors_and_wait_for_completion() {
+    use mutiny::ipc::{IpcRequest, IpcResponse, send_request};
+    use std::sync::mpsc;
+
+    let dir = std::env::temp_dir().join(format!("mutiny-mux-ipc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Deterministic fake tmux script that fails with non-zero exit + stderr on
+    // unknown sessions and succeeds on "live", so this test runs even on hosts
+    // without tmux installed while exercising the real child-process exit path.
+    let state_file = dir.join("live-session");
+    std::fs::write(&state_file, "live").unwrap();
+    let fake_tmux = dir.join("fake-tmux");
+    std::fs::write(
+        &fake_tmux,
+        format!(
+            "#!/bin/sh\nstate={:?}\ncur=$(cat \"$state\" 2>/dev/null || true)\ncase \"$1\" in\n  rename-session)\n    old=\"$3\"; new=\"$4\"\n    if [ \"$old\" != \"$cur\" ]; then\n      echo \"can't find session: $old\" >&2\n      exit 1\n    fi\n    printf '%s' \"$new\" > \"$state\"\n    exit 0\n    ;;\n  kill-session)\n    target=\"$3\"\n    if [ \"$target\" != \"$cur\" ]; then\n      echo \"can't find session: $target\" >&2\n      exit 1\n    fi\n    rm -f \"$state\"\n    exit 0\n    ;;\n  list-sessions)\n    if [ -n \"$cur\" ]; then printf '%s\\t1\\t0\\t1\\t/tmp\\n' \"$cur\"; fi\n    exit 0\n    ;;\nesac\nexit 0\n",
+            state_file.display().to_string()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[sessions]\ntmux_program = {:?}\nzellij_program = \"/nonexistent-zellij\"\nssh_program = \"/nonexistent-ssh\"\nrefresh_interval_s = 0\n",
+            fake_tmux.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let operator_sock = dir.join("mutiny.sock");
+    let op = operator_sock.clone();
+    let dir_bg = dir.clone();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let ctrl = AppController::with_config(
+            Some((String::from("/bin/sh"), Vec::new())),
+            dir_bg.join("audit.jsonl"),
+            dir_bg.join("config.toml"),
+            Overrides::default(),
+        );
+        ctrl.start_ipc_listener(&op).expect("operator listener");
+        ctrl.create_window(None).expect("window");
+        ready_tx.send(()).unwrap();
+        while stop_rx.try_recv().is_err() {
+            ctrl.poll_once();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ctrl.shutdown_ipc();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // 1. Failing rename-session must return IpcResponse::Error with stderr detail.
+    match send_request(
+        &operator_sock,
+        &IpcRequest::RenameSession {
+            kind: MuxKind::Tmux,
+            name: String::from("missing"),
+            new_name: String::from("renamed"),
+            host: None,
+        },
+        Duration::from_secs(5),
+    )
+    .expect("rename missing")
+    {
+        IpcResponse::Error { message } => {
+            assert!(
+                message.contains("can't find session: missing"),
+                "expected mux stderr in IPC error, got: {message}"
+            );
+        }
+        other => panic!("failing rename-session must not report ok: {other:?}"),
+    }
+
+    // 2. Failing end-session must return IpcResponse::Error with stderr detail.
+    match send_request(
+        &operator_sock,
+        &IpcRequest::EndSession {
+            kind: MuxKind::Tmux,
+            name: String::from("missing"),
+            host: None,
+        },
+        Duration::from_secs(5),
+    )
+    .expect("end missing")
+    {
+        IpcResponse::Error { message } => {
+            assert!(
+                message.contains("can't find session: missing"),
+                "expected mux stderr in IPC error, got: {message}"
+            );
+        }
+        other => panic!("failing end-session must not report ok: {other:?}"),
+    }
+
+    // 3. Successful rename-session and end-session reply Ok after completion.
+    assert!(matches!(
+        send_request(
+            &operator_sock,
+            &IpcRequest::RenameSession {
+                kind: MuxKind::Tmux,
+                name: String::from("live"),
+                new_name: String::from("renamed"),
+                host: None,
+            },
+            Duration::from_secs(5),
+        )
+        .expect("rename live"),
+        IpcResponse::Ok { .. }
+    ));
+    assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "renamed");
+
+    assert!(matches!(
+        send_request(
+            &operator_sock,
+            &IpcRequest::EndSession {
+                kind: MuxKind::Tmux,
+                name: String::from("renamed"),
+                host: None,
+            },
+            Duration::from_secs(5),
+        )
+        .expect("end renamed"),
+        IpcResponse::Ok { .. }
+    ));
+    assert!(!state_file.exists(), "end-session must have run before Ok");
+
+    let _ = stop_tx.send(());
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}

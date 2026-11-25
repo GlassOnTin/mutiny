@@ -185,7 +185,8 @@ pub enum IpcRequest {
     },
     /// ENDS a multiplexer session. Destructive: everything running inside it
     /// stops, on every device. Distinct from closing a tab, which only ends
-    /// this client and leaves the session running.
+    /// this client and leaves the session running. Tier-4 Irreversible: never
+    /// covered by a session grant or a standing policy.
     EndSession {
         kind: crate::mux::MuxKind,
         name: String,
@@ -219,7 +220,8 @@ pub enum IpcRequest {
     CloseWindow {
         window: Option<WindowId>,
     },
-    /// Saves the session and quits. Act-tier: it ends every mutiny-owned shell.
+    /// Saves the session and quits. Tier-4 Irreversible: it ends every
+    /// mutiny-owned shell and always requires explicit per-action confirmation.
     Quit,
     /// Lists tmux/zellij sessions. `host: None` means THIS machine only, which
     /// is Observe. Naming a host authenticates to it with the user's keys and
@@ -327,11 +329,11 @@ impl IpcRequest {
             IpcRequest::ListPolicies => ConsentTier::Observe,
             IpcRequest::InstallPolicy { .. } => ConsentTier::Act,
             IpcRequest::RevokePolicy { .. } => ConsentTier::Act,
-            IpcRequest::EndSession { .. } => ConsentTier::Act,
+            IpcRequest::EndSession { .. } => ConsentTier::Irreversible,
             IpcRequest::ClosePane { .. } => ConsentTier::Act,
             IpcRequest::CloseTab { .. } => ConsentTier::Act,
             IpcRequest::CloseWindow { .. } => ConsentTier::Act,
-            IpcRequest::Quit => ConsentTier::Act,
+            IpcRequest::Quit => ConsentTier::Irreversible,
 
             IpcRequest::SpawnWindow { .. }
             | IpcRequest::SpawnTab { .. }
@@ -486,6 +488,27 @@ impl IpcRequest {
             ),
             IpcRequest::CloseTab { window, tab } => format!("window={window:?} tab={tab:?}"),
             IpcRequest::CloseWindow { window } => format!("window={window:?}"),
+            IpcRequest::ProposePolicy {
+                description,
+                verbs,
+                arg_constraints,
+                max_calls_per_minute,
+                expires_in_minutes,
+            } => {
+                let clean_verbs: Vec<String> = verbs
+                    .iter()
+                    .take(8)
+                    .map(|v| crate::mux::sanitize_text(v, 32))
+                    .collect();
+                format!(
+                    "desc={:?} verbs={clean_verbs:?} pins={} max_per_min={max_calls_per_minute} expires_min={expires_in_minutes}",
+                    crate::mux::sanitize_text(description, 48),
+                    arg_constraints.len()
+                )
+            }
+            IpcRequest::InstallPolicy { id } | IpcRequest::RevokePolicy { id } => {
+                format!("id={id}")
+            }
             IpcRequest::EndSession { kind, name, host } => format!(
                 "kind={kind:?} host={host:?} name={:?}",
                 crate::mux::sanitize_text(name, 64)
@@ -937,7 +960,58 @@ pub fn consent_outcome(
                 ConsentOutcome::Park
             }
         }
+        // Tier 4: destroys state the operator cannot recover. Always per-action,
+        // never standing: neither a session grant, a standing policy, nor a
+        // paired agent carrier bypasses explicit confirmation. Only the human
+        // running `mutiny ctl` on the operator socket is the consent.
+        (ConsentTier::Irreversible, ConsentMode::Operator) => {
+            ConsentOutcome::Allow(AuditDecision::Allowed)
+        }
+        (ConsentTier::Irreversible, ConsentMode::ObserveOnly) => ConsentOutcome::Deny(
+            String::from("observe-only session cannot execute Tier-4 Irreversible verbs"),
+        ),
+        (ConsentTier::Irreversible, ConsentMode::Ask | ConsentMode::Paired) => {
+            if !gui_present {
+                ConsentOutcome::Deny(String::from(
+                    "consent prompt requires an open Mutiny GUI window",
+                ))
+            } else {
+                ConsentOutcome::Park
+            }
+        }
     }
+}
+
+/// Classification of a verb slug for Tier-3 standing-policy scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyVerbScope {
+    Allowed,
+    Irreversible,
+    PolicyManagement,
+    Unknown,
+}
+
+/// Checks whether a verb slug may appear in a Tier-3 standing policy. Policy
+/// management verbs and Tier-4 irreversible verbs are never coverable; Tier-4
+/// membership is derived from `verb_samples()` so a newly added irreversible
+/// verb cannot be forgotten here.
+pub fn classify_policy_verb(verb: &str) -> PolicyVerbScope {
+    if matches!(
+        verb,
+        "propose-policy" | "list-policies" | "install-policy" | "revoke-policy"
+    ) {
+        return PolicyVerbScope::PolicyManagement;
+    }
+    for sample in verb_samples() {
+        if sample.verb_name() == verb {
+            return if sample.consent_tier() == ConsentTier::Irreversible {
+                PolicyVerbScope::Irreversible
+            } else {
+                PolicyVerbScope::Allowed
+            };
+        }
+    }
+    PolicyVerbScope::Unknown
 }
 
 pub fn write_response(stream: &mut UnixStream, resp: &IpcResponse) -> io::Result<()> {
@@ -1513,6 +1587,89 @@ mod tests {
             consent_outcome(ConsentTier::Act, ConsentMode::ObserveOnly, p, &grants, true),
             ConsentOutcome::Deny(_)
         ));
+    }
+
+    #[test]
+    fn irreversible_tier_never_rides_on_session_grants_or_paired_carriers() {
+        use crate::action::ConsentTier;
+        use std::collections::HashSet;
+
+        let end = IpcRequest::EndSession {
+            kind: crate::mux::MuxKind::Tmux,
+            name: String::from("prod"),
+            host: None,
+        };
+        let quit = IpcRequest::Quit;
+        assert_eq!(end.consent_tier(), ConsentTier::Irreversible);
+        assert_eq!(quit.consent_tier(), ConsentTier::Irreversible);
+
+        let granted = peer(111, 5_000);
+        let mut grants = HashSet::new();
+        grants.insert(granted);
+
+        // Only the operator carrier is the consent itself.
+        assert_eq!(
+            consent_outcome(
+                ConsentTier::Irreversible,
+                ConsentMode::Operator,
+                granted,
+                &grants,
+                false
+            ),
+            ConsentOutcome::Allow(AuditDecision::Allowed)
+        );
+        // Observe-only refuses outright.
+        assert!(matches!(
+            consent_outcome(
+                ConsentTier::Irreversible,
+                ConsentMode::ObserveOnly,
+                granted,
+                &grants,
+                true
+            ),
+            ConsentOutcome::Deny(_)
+        ));
+        // Neither a session grant on `ask` nor a `paired` carrier bypasses the
+        // per-action prompt: GUI present parks, headless fails closed.
+        for carrier in [ConsentMode::Ask, ConsentMode::Paired] {
+            assert_eq!(
+                consent_outcome(ConsentTier::Irreversible, carrier, granted, &grants, true),
+                ConsentOutcome::Park,
+                "{carrier:?} must still prompt for Tier-4 Irreversible"
+            );
+            assert!(
+                matches!(
+                    consent_outcome(ConsentTier::Irreversible, carrier, granted, &grants, false),
+                    ConsentOutcome::Deny(_)
+                ),
+                "{carrier:?} must fail closed without a GUI"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_management_verbs_format_redacted_summaries() {
+        let propose = IpcRequest::ProposePolicy {
+            description: String::from("safe\x1b[31m grant"),
+            verbs: vec![String::from("spawn-tab"), String::from("split")],
+            arg_constraints: std::collections::BTreeMap::from([(
+                String::from("axis"),
+                String::from("horizontal"),
+            )]),
+            max_calls_per_minute: 30,
+            expires_in_minutes: 60,
+        };
+        let summary = propose.redacted_summary();
+        assert!(summary.contains("spawn-tab") && summary.contains("pins=1"));
+        assert!(!summary.contains('\x1b'), "control chars must be sanitized");
+        assert_eq!(
+            IpcRequest::InstallPolicy { id: 42 }.redacted_summary(),
+            "id=42"
+        );
+        assert_eq!(
+            IpcRequest::RevokePolicy { id: 7 }.redacted_summary(),
+            "id=7"
+        );
     }
 
     #[test]

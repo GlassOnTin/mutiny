@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::action::ConsentTier;
-use crate::ipc::{AuditDecision, ConsentMode, ConsentOutcome, PeerIdentity};
+use crate::ipc::{
+    AuditDecision, ConsentMode, ConsentOutcome, PeerIdentity, PolicyVerbScope, classify_policy_verb,
+};
 
 /// Rolling window for the rate ceiling.
 pub const RATE_WINDOW_MS: u64 = 60_000;
@@ -43,14 +45,17 @@ pub struct StandingPolicy {
 }
 
 impl StandingPolicy {
-    /// Trims and bounds a proposal. Refuses an empty scope rather than
-    /// silently granting everything.
+    /// Trims and bounds a proposal. Refuses an empty scope, unknown verbs,
+    /// policy-management verbs, and Tier-4 irreversible verbs.
     pub fn sanitised(mut self) -> Result<Self, String> {
         self.description = self.description.trim().to_owned();
         if self.description.is_empty() {
             return Err(String::from("a policy needs a description"));
         }
-        self.verbs.retain(|v| !v.trim().is_empty());
+        for v in &mut self.verbs {
+            *v = v.trim().to_owned();
+        }
+        self.verbs.retain(|v| !v.is_empty());
         self.verbs.dedup();
         if self.verbs.is_empty() {
             return Err(String::from(
@@ -59,6 +64,24 @@ impl StandingPolicy {
         }
         if self.verbs.len() > MAX_POLICY_VERBS {
             return Err(format!("at most {MAX_POLICY_VERBS} verbs per policy"));
+        }
+        for verb in &self.verbs {
+            match classify_policy_verb(verb) {
+                PolicyVerbScope::Allowed => {}
+                PolicyVerbScope::Irreversible => {
+                    return Err(format!(
+                        "irreversible Tier-4 verb {verb:?} always requires per-action confirmation and cannot be covered by a standing policy"
+                    ));
+                }
+                PolicyVerbScope::PolicyManagement => {
+                    return Err(format!(
+                        "policy management verb {verb:?} cannot be covered by a standing policy"
+                    ));
+                }
+                PolicyVerbScope::Unknown => {
+                    return Err(format!("unknown IPC verb {verb:?} in policy scope"));
+                }
+            }
         }
         if self.max_calls_per_minute == 0 {
             return Err(String::from("the rate ceiling must be at least 1"));
@@ -95,6 +118,9 @@ pub fn policy_match(
 ) -> PolicyMatch {
     if policy.expired(now_ms) {
         return PolicyMatch::Expired;
+    }
+    if classify_policy_verb(verb) != PolicyVerbScope::Allowed {
+        return PolicyMatch::NotInScope;
     }
     if !policy.verbs.iter().any(|v| v == verb) {
         return PolicyMatch::NotInScope;
@@ -227,6 +253,49 @@ mod tests {
         let mut p = policy(&["send-input"], 10, 10_000);
         p.description = String::from("   ");
         assert!(p.sanitised().is_err());
+
+        for forbidden in [
+            "end-session",
+            "quit",
+            "propose-policy",
+            "list-policies",
+            "install-policy",
+            "revoke-policy",
+            "*",
+            "not-a-real-verb",
+        ] {
+            let bad = policy(&[forbidden], 10, 10_000);
+            assert!(
+                bad.sanitised().is_err(),
+                "{forbidden:?} must be refused in a standing policy scope"
+            );
+        }
+
+        // Defense in depth: even an unsanitised struct in memory cannot match
+        // Tier-4 irreversible or policy-management verbs.
+        let raw = policy(&["end-session", "quit", "install-policy"], 10, 10_000);
+        let none = VecDeque::new();
+        for verb in ["end-session", "quit", "install-policy"] {
+            assert_eq!(
+                policy_match(&raw, verb, &pins(&[]), 1_000, &none),
+                PolicyMatch::NotInScope
+            );
+        }
+        assert_eq!(
+            policy_decision(
+                PolicyCall {
+                    tier: ConsentTier::Irreversible,
+                    carrier: ConsentMode::Ask,
+                    identity: peer(11),
+                    verb: "end-session",
+                    pins: &pins(&[]),
+                    now_ms: 1_000,
+                },
+                &[raw],
+                &BTreeMap::new(),
+            ),
+            None
+        );
     }
 
     #[test]

@@ -1052,3 +1052,65 @@ fn ipc_search_is_chunked_and_keeps_the_wire_shape() {
         other => panic!("unexpected hit response: {other:?}"),
     }
 }
+
+#[test]
+fn remote_osc7_hostname_is_never_inherited_as_local_cwd_on_split() {
+    let dir = env::temp_dir().join(format!("mutiny-osc7-remote-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let local_dir = dir.join("local-work");
+    // A path that genuinely exists on the local disk too, so a naive chdir
+    // check would accept it if OSC 7 failed to reject the remote hostname.
+    let collision_dir = dir.join("same-path-on-remote");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&collision_dir).unwrap();
+
+    let ctrl = AppController::with_config(
+        Some((String::from("/bin/sh"), Vec::new())),
+        dir.join("audit.jsonl"),
+        dir.join("config.toml"),
+        mutiny::config::Overrides::default(),
+    );
+    let (_w, _t, p1) = ctrl.create_window(None).expect("window");
+
+    // Local OSC 7 is accepted and inherited by a split.
+    ctrl.workspace
+        .borrow_mut()
+        .pane_mut(p1)
+        .unwrap()
+        .advance_bytes(format!("\x1b]7;file://localhost{}\x07", local_dir.display()).as_bytes());
+    let (_w, _t, p2) = ctrl
+        .split_pane(Some(p1), SplitAxis::Horizontal, None)
+        .expect("split from local cwd");
+    assert_eq!(
+        ctrl.workspace.borrow().pane(p2).unwrap().cwd(),
+        Some(local_dir.as_path()),
+        "local OSC 7 cwd must be inherited"
+    );
+
+    // Remote SSH OSC 7 must clear the inherited cwd rather than adopting the
+    // remote path or keeping the pre-SSH local directory.
+    ctrl.workspace
+        .borrow_mut()
+        .pane_mut(p1)
+        .unwrap()
+        .advance_bytes(
+            format!(
+                "\x1b]7;file://prod-bastion.internal{}\x07",
+                collision_dir.display()
+            )
+            .as_bytes(),
+        );
+    assert_eq!(ctrl.workspace.borrow().pane(p1).unwrap().cwd(), None);
+
+    let (_w, _t, p3) = ctrl
+        .split_pane(Some(p1), SplitAxis::Vertical, None)
+        .expect("split inside remote SSH session");
+    assert_eq!(
+        ctrl.workspace.borrow().pane(p3).unwrap().cwd(),
+        None,
+        "remote OSC 7 URI must never be inherited as a local working directory"
+    );
+
+    ctrl.shutdown_ipc();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use mutiny::app::AppController;
 use mutiny::config::Overrides;
-use mutiny::ipc::{ConsentMode, IpcRequest, IpcResponse, send_request};
+use mutiny::ipc::{ConsentMode, IpcRequest, IpcResponse, PeerIdentity, send_request, server_uid};
 
 struct Server {
     operator: PathBuf,
     agent: PathBuf,
+    grant: mpsc::Sender<(PeerIdentity, String)>,
     stop: mpsc::Sender<()>,
     handle: Option<thread::JoinHandle<()>>,
     _dir: PathBuf,
@@ -29,6 +30,7 @@ impl Server {
         let operator = dir.join("mutiny.sock");
         let agent = dir.join("mutiny-agent.sock");
         let (stop_tx, stop_rx) = mpsc::channel();
+        let (grant_tx, grant_rx) = mpsc::channel::<(PeerIdentity, String)>();
         let op = operator.clone();
         let ag = agent.clone();
         let audit = dir.join("audit.jsonl");
@@ -45,6 +47,9 @@ impl Server {
                 .expect("agent");
             ctrl.create_window(None).expect("pane");
             while stop_rx.try_recv().is_err() {
+                if let Ok((peer, label)) = grant_rx.try_recv() {
+                    ctrl.grant_session(peer, &label);
+                }
                 ctrl.poll_once();
                 thread::sleep(Duration::from_millis(4));
             }
@@ -54,10 +59,25 @@ impl Server {
         Self {
             operator,
             agent,
+            grant: grant_tx,
             stop: stop_tx,
             handle: Some(handle),
             _dir: dir,
         }
+    }
+
+    fn grant_this_process(&self) {
+        let pid = std::process::id() as i32;
+        let peer = PeerIdentity {
+            uid: server_uid(),
+            pid,
+            start_time: mutiny::ipc::process_start_time(pid),
+            token_peer: None,
+        };
+        self.grant
+            .send((peer, String::from("granted-agent")))
+            .expect("grant channel");
+        thread::sleep(Duration::from_millis(30));
     }
 
     fn call(&self, sock: &std::path::Path, req: &IpcRequest) -> IpcResponse {
@@ -256,4 +276,121 @@ fn a_pinned_policy_only_covers_matching_arguments() {
         ),
         "a different value must not be covered by the pin"
     );
+}
+
+#[test]
+fn neither_a_session_grant_nor_a_standing_policy_can_approve_end_session_or_quit() {
+    let s = Server::new("irreversible");
+
+    // 1. Standing policy proposals naming Tier-4 or policy-management verbs are
+    //    rejected outright before anything can be queued or installed.
+    for forbidden in ["end-session", "quit", "install-policy", "revoke-policy"] {
+        let resp = s.call(
+            &s.agent,
+            &IpcRequest::ProposePolicy {
+                description: format!("try covering {forbidden}"),
+                verbs: vec![String::from(forbidden)],
+                arg_constraints: Default::default(),
+                max_calls_per_minute: 10,
+                expires_in_minutes: 5,
+            },
+        );
+        assert!(
+            matches!(resp, IpcResponse::Error { .. }),
+            "proposing {forbidden:?} in a standing policy must fail, got {resp:?}"
+        );
+    }
+
+    // 2. Install a real standing policy AND grant this peer an Allow Session
+    //    session grant, proving ordinary Tier-2 Act verbs pass without prompts.
+    let id = match s.call(
+        &s.agent,
+        &IpcRequest::ProposePolicy {
+            description: String::from("allow tabs"),
+            verbs: vec![String::from("spawn-tab")],
+            arg_constraints: Default::default(),
+            max_calls_per_minute: 10,
+            expires_in_minutes: 5,
+        },
+    ) {
+        IpcResponse::Ok {
+            policy_id: Some(id),
+            ..
+        } => id,
+        other => panic!("proposal: {other:?}"),
+    };
+    assert!(matches!(
+        s.call(&s.operator, &IpcRequest::InstallPolicy { id }),
+        IpcResponse::Ok { .. }
+    ));
+    s.grant_this_process();
+
+    // Tier-2 Act verbs succeed under the standing policy and the session grant.
+    assert!(s.agent_act(), "standing policy covers spawn-tab");
+    assert!(
+        matches!(
+            s.call(&s.agent, &IpcRequest::SaveSession),
+            IpcResponse::Ok { .. }
+        ),
+        "session grant covers Tier-2 SaveSession"
+    );
+
+    // 3. Even with BOTH a session grant and an active standing policy, Tier-4
+    //    EndSession and Quit still require per-action confirmation (which fails
+    //    closed on this headless server), and InstallPolicy cannot ride on the
+    //    session grant either.
+    let pending_id = match s.call(
+        &s.agent,
+        &IpcRequest::ProposePolicy {
+            description: String::from("second proposal"),
+            verbs: vec![String::from("split")],
+            arg_constraints: Default::default(),
+            max_calls_per_minute: 10,
+            expires_in_minutes: 5,
+        },
+    ) {
+        IpcResponse::Ok {
+            policy_id: Some(pid),
+            ..
+        } => pid,
+        other => panic!("second proposal: {other:?}"),
+    };
+    assert!(
+        matches!(
+            s.call(&s.agent, &IpcRequest::InstallPolicy { id: pending_id }),
+            IpcResponse::Error { .. }
+        ),
+        "a session grant must not let an agent self-install a standing policy"
+    );
+
+    for (label, req) in [
+        (
+            "end-session",
+            IpcRequest::EndSession {
+                kind: mutiny::mux::MuxKind::Tmux,
+                name: String::from("never-touch"),
+                host: None,
+            },
+        ),
+        ("quit", IpcRequest::Quit),
+    ] {
+        let resp = s.call(&s.agent, &req);
+        assert!(
+            matches!(resp, IpcResponse::Error { .. }),
+            "Tier-4 {label} must not be auto-approved by session grant or policy: {resp:?}"
+        );
+    }
+
+    let entries = match s.call(&s.operator, &IpcRequest::AuditLog { limit: 100 }) {
+        IpcResponse::Ok { audit: Some(a), .. } => a,
+        other => panic!("audit: {other:?}"),
+    };
+    for verb in ["end-session", "quit"] {
+        let found = entries
+            .iter()
+            .find(|e| e.verb == verb)
+            .unwrap_or_else(|| panic!("missing audit entry for {verb}"));
+        assert_eq!(found.tier, mutiny::action::ConsentTier::Irreversible);
+        assert_eq!(found.decision, mutiny::ipc::AuditDecision::Denied);
+    }
 }

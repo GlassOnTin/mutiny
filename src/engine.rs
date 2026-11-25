@@ -1139,11 +1139,11 @@ impl PaneEngine {
 
         match code {
             "133" => self.handle_osc_133(rest, out),
-            "7" => {
-                if let Some(path) = parse_osc7_uri(rest) {
-                    self.cwd = Some(path);
-                }
-            }
+            "7" => match parse_osc7_cwd(rest, &crate::mux::local_hostname()) {
+                Some(Osc7Cwd::Local(path)) => self.cwd = Some(path),
+                Some(Osc7Cwd::Remote) => self.cwd = None,
+                None => {}
+            },
             "9" => {
                 if let Some(state) = parse_osc9_progress(rest) {
                     self.progress = state;
@@ -1925,11 +1925,62 @@ fn terminfo_reply(hex_names: &[u8]) -> String {
     }
 }
 
-fn parse_osc7_uri(uri: &str) -> Option<PathBuf> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Osc7Cwd {
+    Local(PathBuf),
+    Remote,
+}
+
+fn osc7_authority_is_local(authority: &str, local_host: &str) -> bool {
+    let decoded = percent_decode(authority);
+    if decoded.contains('@') {
+        return false;
+    }
+    let host = decoded.trim_end_matches('.');
+    let local = local_host.trim_end_matches('.');
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.localdomain")
+        || host == "127.0.0.1"
+        || host == "[::1]"
+    {
+        return true;
+    }
+    if !local.is_empty() && host.eq_ignore_ascii_case(local) {
+        return true;
+    }
+    // When the local kernel hostname is an FQDN (`box.lan`) and a shell emits
+    // the short hostname (`box`), accept it. Never strip a domain from the URI
+    // authority itself, so `box.remote.corp` cannot impersonate local `box`.
+    if let Some((local_short, _)) = local.split_once('.')
+        && !local_short.is_empty()
+        && !host.contains('.')
+        && host.eq_ignore_ascii_case(local_short)
+    {
+        return true;
+    }
+    false
+}
+
+fn parse_osc7_cwd(uri: &str, local_host: &str) -> Option<Osc7Cwd> {
     let rest = uri.strip_prefix("file://")?;
     let slash_pos = rest.find('/')?;
+    let authority = &rest[..slash_pos];
     let raw_path = &rest[slash_pos..];
-    Some(PathBuf::from(percent_decode(raw_path)))
+    if osc7_authority_is_local(authority, local_host) {
+        Some(Osc7Cwd::Local(PathBuf::from(percent_decode(raw_path))))
+    } else {
+        Some(Osc7Cwd::Remote)
+    }
+}
+
+/// Parses an OSC 7 `file://HOST/PATH` URI into a local filesystem path,
+/// returning `None` when the URI is malformed or names a remote host.
+pub fn parse_osc7_uri(uri: &str) -> Option<PathBuf> {
+    match parse_osc7_cwd(uri, &crate::mux::local_hostname()) {
+        Some(Osc7Cwd::Local(path)) => Some(path),
+        Some(Osc7Cwd::Remote) | None => None,
+    }
 }
 
 fn percent_decode(input: &str) -> String {
@@ -2020,8 +2071,33 @@ mod tests {
     #[test]
     fn tracks_osc7_cwd_and_osc9_progress() {
         let mut engine = PaneEngine::new_headless(40, 5);
-        engine.advance_bytes(b"\x1b]7;file://myhost/home/user/Code/my%20repo\x1b\\");
+        engine.advance_bytes(b"\x1b]7;file://localhost/home/user/Code/my%20repo\x1b\\");
         assert_eq!(engine.cwd(), Some(Path::new("/home/user/Code/my repo")));
+
+        let local = crate::mux::local_hostname();
+        engine.advance_bytes(format!("\x1b]7;file://{local}/var/tmp\x07").as_bytes());
+        assert_eq!(engine.cwd(), Some(Path::new("/var/tmp")));
+
+        // Entering an SSH session that emits a remote OSC 7 authority must not
+        // store the remote path or retain the stale pre-SSH local directory.
+        engine.advance_bytes(b"\x1b]7;file://remote-host.example/srv/prod\x07");
+        assert_eq!(engine.cwd(), None);
+        assert_eq!(parse_osc7_uri("file://remote-host.example/srv/prod"), None);
+        assert_eq!(parse_osc7_uri("file://user@localhost/srv/prod"), None);
+        assert_eq!(
+            parse_osc7_uri("file:///tmp/plain"),
+            Some(PathBuf::from("/tmp/plain"))
+        );
+        assert_eq!(
+            parse_osc7_cwd("file://box/tmp/a", "box.lan"),
+            Some(Osc7Cwd::Local(PathBuf::from("/tmp/a"))),
+            "short host matches an FQDN local kernel hostname"
+        );
+        assert_eq!(
+            parse_osc7_cwd("file://box.remote.corp/tmp/a", "box"),
+            Some(Osc7Cwd::Remote),
+            "remote FQDN must never impersonate a short local hostname"
+        );
 
         engine.advance_bytes(b"\x1b]9;4;1;65\x07");
         assert_eq!(engine.progress(), ProgressState::Normal(65));

@@ -123,6 +123,31 @@ fn sessions_submenu_fills_without_opening_the_picker() {
         "a session that disappeared must be dropped: {after:?}"
     );
 
+    // Closing windows must prune their registered Sessions submenus rather than
+    // retaining dead menu models across the session lifetime.
+    assert_eq!(
+        ctrl.sessions_menu_count(),
+        2,
+        "app menu + first window menu"
+    );
+    let (w2, _t2, p2) = ctrl.create_window(None).expect("second window");
+    assert_eq!(ctrl.sessions_menu_count(), 3);
+    assert!(ctrl.close_window(w2));
+    assert_eq!(
+        ctrl.sessions_menu_count(),
+        2,
+        "close_window must prune that window's submenu"
+    );
+    let (_w3, _t3, p3) = ctrl.create_window(None).expect("third window");
+    assert_eq!(ctrl.sessions_menu_count(), 3);
+    let _ = p2;
+    ctrl.close_pane(p3);
+    assert_eq!(
+        ctrl.sessions_menu_count(),
+        2,
+        "closing the last pane of a window must also prune its submenu"
+    );
+
     ctrl.shutdown_ipc();
     let _ = std::fs::remove_dir_all(&dir);
 }

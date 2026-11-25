@@ -88,6 +88,7 @@ struct PendingMuxCommand {
     deadline: Instant,
     killed: bool,
     effect: MuxEffect,
+    reply: Option<UnixStream>,
 }
 
 /// Applied only after the command exits successfully, so a failed rename does
@@ -95,7 +96,7 @@ struct PendingMuxCommand {
 enum MuxEffect {
     /// Nothing to rewrite: the panes' clients exit when the session dies, and
     /// the usual exited-pane path closes them. Only the inventory needs a refresh.
-    End,
+    End { kind: MuxKind, name: String },
     Rename {
         kind: MuxKind,
         host: Option<String>,
@@ -163,9 +164,9 @@ pub struct AppController {
     cache_gen: Cell<u64>,
     pending_session_reply: RefCell<Option<UnixStream>>,
     discovery_deadline: Cell<Option<Instant>>,
-    /// Every live Sessions submenu (the app menubar and each window's own), so
-    /// discovery results fill them all.
-    sessions_menus: RefCell<Vec<gtk4::gio::Menu>>,
+    /// Every live Sessions submenu (the app menubar with `None`, and each
+    /// window's own with `Some(win_id)` so closed windows prune theirs).
+    sessions_menus: RefCell<Vec<(Option<WindowId>, gtk4::gio::Menu)>>,
     sessions_menu_gen: Cell<u64>,
     /// Last agent-active state pushed to the window icons, so the icon is only
     /// touched on a transition.
@@ -561,7 +562,9 @@ impl AppController {
         }
     }
 
-    pub fn pending_consent_prompt(&self) -> Option<(u64, String, String, String)> {
+    pub fn pending_consent_prompt(
+        &self,
+    ) -> Option<(u64, String, String, String, crate::action::ConsentTier)> {
         let guard = self.pending_consents.borrow();
         let front = guard.front()?;
         Some((
@@ -569,6 +572,7 @@ impl AppController {
             front.client.clone(),
             front.request.verb_name().to_owned(),
             front.request.redacted_summary(),
+            front.request.consent_tier(),
         ))
     }
 
@@ -694,12 +698,25 @@ impl AppController {
                 }
             }
             ConsentResolution::AllowSession => {
-                // Bind to the verified peer, not to the label it sent.
-                self.grant_session(item.peer, &item.client);
+                // Tier-4 Irreversible and policy-management verbs never create
+                // or ride on a standing session grant.
+                let can_grant_session = item.request.consent_tier()
+                    == crate::action::ConsentTier::Act
+                    && !matches!(
+                        item.request,
+                        IpcRequest::InstallPolicy { .. } | IpcRequest::RevokePolicy { .. }
+                    );
+                let decision = if can_grant_session {
+                    // Bind to the verified peer, not to the label it sent.
+                    self.grant_session(item.peer, &item.client);
+                    AuditDecision::ApprovedSession
+                } else {
+                    AuditDecision::ApprovedOnce
+                };
                 self.record_audit(
                     &item.client,
                     &item.request,
-                    AuditDecision::ApprovedSession,
+                    decision,
                     item.carrier,
                     item.peer,
                 );
@@ -812,6 +829,18 @@ impl AppController {
         new: &str,
         host: Option<&str>,
     ) -> io::Result<()> {
+        self.rename_session_with_reply(kind, old, new, host, None)
+            .map(|_| ())
+    }
+
+    fn rename_session_with_reply(
+        &self,
+        kind: MuxKind,
+        old: &str,
+        new: &str,
+        host: Option<&str>,
+        reply: Option<UnixStream>,
+    ) -> io::Result<Option<IpcResponse>> {
         if new.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -819,51 +848,53 @@ impl AppController {
             ));
         }
         if old == new {
-            return Ok(());
+            return Ok(Some(IpcResponse::empty_ok()));
         }
         let opts = self.config.borrow().sessions.clone();
         let (program, argv) = mux::rename_command(kind, old, new, host, &opts)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let child = Command::new(&program)
-            .args(&argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("could not run {program} to rename: {e}"))
-            })?;
-        if let Some(out) = child.stdout.as_ref() {
-            set_nonblocking(out.as_raw_fd());
-        }
-        if let Some(err) = child.stderr.as_ref() {
-            set_nonblocking(err.as_raw_fd());
-        }
-        let timeout = Duration::from_millis(self.config.borrow().discovery_timeout_ms);
-        self.mux_commands.borrow_mut().push(PendingMuxCommand {
-            child,
-            out: Vec::new(),
-            err: Vec::new(),
-            deadline: Instant::now() + timeout,
-            killed: false,
-            effect: MuxEffect::Rename {
+        self.launch_mux_command(
+            &program,
+            &argv,
+            MuxEffect::Rename {
                 kind,
                 host: host.map(str::to_owned),
                 old: old.to_owned(),
                 new: new.to_owned(),
             },
-        });
-        Ok(())
+            reply,
+        )?;
+        Ok(None)
     }
 
     /// Ends a multiplexer session. DESTRUCTIVE: everything running inside it
     /// stops, unlike closing a tab, which only ends this client. The UI gates
     /// this behind an explicit confirmation naming the session.
     pub fn end_session(&self, kind: MuxKind, name: &str, host: Option<&str>) -> io::Result<()> {
+        self.end_session_with_reply(kind, name, host, None)
+            .map(|_| ())
+    }
+
+    fn end_session_with_reply(
+        &self,
+        kind: MuxKind,
+        name: &str,
+        host: Option<&str>,
+        reply: Option<UnixStream>,
+    ) -> io::Result<Option<IpcResponse>> {
         let opts = self.config.borrow().sessions.clone();
         let (program, argv) = mux::end_command(kind, name, host, &opts)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.launch_mux_command(&program, &argv, MuxEffect::End)
+        self.launch_mux_command(
+            &program,
+            &argv,
+            MuxEffect::End {
+                kind,
+                name: name.to_owned(),
+            },
+            reply,
+        )?;
+        Ok(None)
     }
 
     fn launch_mux_command(
@@ -871,6 +902,7 @@ impl AppController {
         program: &str,
         argv: &[String],
         effect: MuxEffect,
+        reply: Option<UnixStream>,
     ) -> io::Result<()> {
         let child = Command::new(program)
             .args(argv)
@@ -893,6 +925,7 @@ impl AppController {
             deadline: Instant::now() + timeout,
             killed: false,
             effect,
+            reply,
         });
         Ok(())
     }
@@ -904,7 +937,7 @@ impl AppController {
             return;
         }
         let mut budget = DISCOVERY_BYTES_PER_TICK;
-        let mut done: Vec<(MuxEffect, bool, String)> = Vec::new();
+        let mut done: Vec<(MuxEffect, Option<UnixStream>, bool, String)> = Vec::new();
         {
             let mut jobs = self.mux_commands.borrow_mut();
             let mut i = 0;
@@ -926,40 +959,29 @@ impl AppController {
                         let detail = if job.killed {
                             String::from("timed out")
                         } else {
-                            String::from_utf8_lossy(&job.err).trim().to_owned()
+                            let stderr = String::from_utf8_lossy(&job.err);
+                            let stdout = String::from_utf8_lossy(&job.out);
+                            let first = stderr
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .or_else(|| stdout.lines().find(|l| !l.trim().is_empty()))
+                                .unwrap_or("")
+                                .trim();
+                            let clean = mux::sanitize_text(first, 160);
+                            if clean.is_empty() {
+                                format!("exited with {:?}", status.code())
+                            } else {
+                                clean
+                            }
                         };
-                        done.push((
-                            std::mem::replace(
-                                &mut job.effect,
-                                MuxEffect::Rename {
-                                    kind: MuxKind::Tmux,
-                                    host: None,
-                                    old: String::new(),
-                                    new: String::new(),
-                                },
-                            ),
-                            ok,
-                            detail,
-                        ));
-                        jobs.remove(i);
+                        let finished = jobs.remove(i);
+                        done.push((finished.effect, finished.reply, ok, detail));
                         continue;
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        done.push((
-                            std::mem::replace(
-                                &mut job.effect,
-                                MuxEffect::Rename {
-                                    kind: MuxKind::Tmux,
-                                    host: None,
-                                    old: String::new(),
-                                    new: String::new(),
-                                },
-                            ),
-                            false,
-                            e.to_string(),
-                        ));
-                        jobs.remove(i);
+                        let finished = jobs.remove(i);
+                        done.push((finished.effect, finished.reply, false, e.to_string()));
                         continue;
                     }
                 }
@@ -967,13 +989,26 @@ impl AppController {
             }
         }
         let mut changed = false;
-        for (effect, ok, detail) in done {
+        for (effect, reply, ok, detail) in done {
             match effect {
-                MuxEffect::End => {
+                MuxEffect::End { kind, name } => {
                     if ok {
                         changed = true;
+                        if let Some(mut stream) = reply {
+                            let _ = write_response(&mut stream, &IpcResponse::empty_ok());
+                        }
                     } else {
-                        eprintln!("warning: ending the session failed: {detail}");
+                        let msg = format!(
+                            "ending {} session {:?} failed: {detail}",
+                            kind.label(),
+                            mux::sanitize_text(&name, 64)
+                        );
+                        match reply {
+                            Some(mut stream) => {
+                                let _ = write_response(&mut stream, &IpcResponse::err(msg));
+                            }
+                            None => eprintln!("warning: {msg}"),
+                        }
                     }
                 }
                 MuxEffect::Rename {
@@ -985,8 +1020,25 @@ impl AppController {
                     if ok {
                         self.apply_rename(kind, host.as_deref(), &old, &new);
                         changed = true;
-                    } else if !new.is_empty() {
-                        eprintln!("warning: rename {old:?} to {new:?} failed: {detail}");
+                        if let Some(mut stream) = reply {
+                            let _ = write_response(&mut stream, &IpcResponse::empty_ok());
+                        }
+                    } else {
+                        let msg = format!(
+                            "rename {:?} to {:?} failed: {detail}",
+                            mux::sanitize_text(&old, 64),
+                            mux::sanitize_text(&new, 64)
+                        );
+                        match reply {
+                            Some(mut stream) => {
+                                let _ = write_response(&mut stream, &IpcResponse::err(msg));
+                            }
+                            None => {
+                                if !new.is_empty() {
+                                    eprintln!("warning: {msg}");
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1233,10 +1285,21 @@ impl AppController {
         }
     }
 
-    /// Registers a Sessions submenu to be filled from discovery results.
+    /// Registers an application-level Sessions submenu (not tied to a single
+    /// window) to be filled from discovery results.
     pub fn register_sessions_menu(&self, menu: gtk4::gio::Menu) {
         crate::action::populate_sessions_menu(&menu, &self.session_inventory());
-        self.sessions_menus.borrow_mut().push(menu);
+        self.sessions_menus.borrow_mut().push((None, menu));
+    }
+
+    /// Registers a per-window Sessions submenu so closing that window prunes it.
+    pub fn register_window_sessions_menu(&self, win_id: WindowId, menu: gtk4::gio::Menu) {
+        crate::action::populate_sessions_menu(&menu, &self.session_inventory());
+        self.sessions_menus.borrow_mut().push((Some(win_id), menu));
+    }
+
+    pub fn sessions_menu_count(&self) -> usize {
+        self.sessions_menus.borrow().len()
     }
 
     pub fn session_inventory(&self) -> MuxInventory {
@@ -1517,14 +1580,22 @@ impl AppController {
         self.bump_cache_gen();
     }
 
-    /// Kills and reaps any outstanding discovery child. `Child::drop` does
-    /// neither, so leaving them would leak zombies.
+    /// Kills and reaps any outstanding discovery or mux command child.
+    /// `Child::drop` does neither, so leaving them would leak zombies.
     fn shutdown_discoveries(&self) {
         self.discovery_queue.borrow_mut().clear();
         let jobs = std::mem::take(&mut *self.discovery_jobs.borrow_mut());
         for mut job in jobs {
             let _ = job.child.kill();
             let _ = job.child.wait();
+        }
+        let mux_jobs = std::mem::take(&mut *self.mux_commands.borrow_mut());
+        for mut job in mux_jobs {
+            let _ = job.child.kill();
+            let _ = job.child.wait();
+            if let Some(mut stream) = job.reply {
+                let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
+            }
         }
         self.pending_session_reply.borrow_mut().take();
         self.discovery_deadline.set(None);
@@ -1817,6 +1888,9 @@ impl AppController {
         }
         self.save_before_last_window_goes();
         self.ui_windows.borrow_mut().remove(&win_id);
+        self.sessions_menus
+            .borrow_mut()
+            .retain(|(w, _)| *w != Some(win_id));
         let _dropped = self.workspace.borrow_mut().close_window(win_id);
         self.quit_if_empty();
     }
@@ -2088,6 +2162,9 @@ impl AppController {
         if still_exists {
             self.sync_ui_window(win_id);
         } else if let Some(ui_win) = self.ui_windows.borrow_mut().remove(&win_id) {
+            self.sessions_menus
+                .borrow_mut()
+                .retain(|(w, _)| *w != Some(win_id));
             ui_win.close_programmatically();
         }
     }
@@ -2380,11 +2457,23 @@ impl AppController {
             self.record_audit(&client_label, &env_req.request, decision, carrier, peer);
             return self.execute_ipc_request(env_req.request, raw_stream);
         }
+        // Policy-management verbs never ride on a session grant, so an agent on
+        // an `ask` carrier cannot use an earlier Allow Session tap to install
+        // or revoke standing policies silently.
+        let empty_grants = HashSet::new();
+        let grants = if matches!(
+            env_req.request,
+            IpcRequest::InstallPolicy { .. } | IpcRequest::RevokePolicy { .. }
+        ) {
+            &empty_grants
+        } else {
+            &*self.session_approved_clients.borrow()
+        };
         let outcome = consent_outcome(
             env_req.request.consent_tier(),
             carrier,
             peer,
-            &self.session_approved_clients.borrow(),
+            grants,
             gui_present,
         );
 
@@ -2587,8 +2676,11 @@ impl AppController {
                 }
             }
             IpcRequest::EndSession { kind, name, host } => {
-                match self.end_session(kind, &name, host.as_deref()) {
-                    Ok(()) => Some(IpcResponse::empty_ok()),
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                match self.end_session_with_reply(kind, &name, host.as_deref(), Some(cloned)) {
+                    Ok(immediate) => immediate,
                     Err(err) => Some(IpcResponse::err(err.to_string())),
                 }
             }
@@ -2597,10 +2689,21 @@ impl AppController {
                 name,
                 new_name,
                 host,
-            } => match self.rename_session(kind, &name, &new_name, host.as_deref()) {
-                Ok(()) => Some(IpcResponse::empty_ok()),
-                Err(err) => Some(IpcResponse::err(err.to_string())),
-            },
+            } => {
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                match self.rename_session_with_reply(
+                    kind,
+                    &name,
+                    &new_name,
+                    host.as_deref(),
+                    Some(cloned),
+                ) {
+                    Ok(immediate) => immediate,
+                    Err(err) => Some(IpcResponse::err(err.to_string())),
+                }
+            }
             IpcRequest::ToggleQuick => match self.toggle_quick_terminal() {
                 Ok((window, visible)) => {
                     let mut resp = IpcResponse::empty_ok();
@@ -3174,7 +3277,12 @@ impl AppController {
         if self.sessions_menu_gen.get() != generation {
             self.sessions_menu_gen.set(generation);
             let inventory = self.session_inventory();
-            let menus: Vec<gtk4::gio::Menu> = self.sessions_menus.borrow().clone();
+            let menus: Vec<gtk4::gio::Menu> = self
+                .sessions_menus
+                .borrow()
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect();
             for menu in menus {
                 crate::action::populate_sessions_menu(&menu, &inventory);
             }

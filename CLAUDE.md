@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop terminal in pure Rust + `gtk4-rs` (no libadwaita, no Ghostty/Zig/C-ABI code), designed as the workstation peer to Haven: humans and agents act on the same panes through the same verb vocabulary. One binary plays three roles: GTK GUI, `mutiny ctl` CLI, and `mutiny mcp` stdio MCP server.
 
-`VISION.md` is the product and architecture spec (draft v20). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, and damage tracking are shipped. M1 is complete. M2 is open: session restore, the authenticated HTTP MCP listener with per-peer identity and per-peer consent mode, and a tmux/zellij session picker are shipped. The quick terminal is shipped as a summonable scratch window, not a layer-shell drop-down; a system-wide global shortcut is not. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
+`VISION.md` is the product and architecture spec (draft v21). M0, the trust/parity half of M0.5, peer-identity grant binding, chunked scrollback search, bundled shell integration, TOML config, terminal capability queries, IME with font fallback, the Kitty graphics slice, split ratios with drag gestures, OSC 777 notifications, damage tracking, per-cell glyph layout caching, host-checked OSC 7 working directories, and Tier 3/4 consent enforcement are shipped. M1 is complete. M2 is open: session restore, the authenticated HTTP MCP listener with per-peer identity and per-peer consent mode, the tmux/zellij session picker, and the Settings dialog are shipped. The quick terminal is shipped as a summonable scratch window, not a layer-shell drop-down; a system-wide global shortcut is not. Read it for intent and constraints, not as a description of current behaviour. Its "Growth diagnostic" section is the authoritative list of which claims are ahead of the code.
 
 Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (thesis, identity, numbered commitments, presence laws, growth diagnostic, juxtapositions, milestones, scope boundaries). Match that structure, but use plain punctuation. No em-dashes, including in section headings; use a colon or a full stop instead.
 
@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 203 tests: 108 unit + 7 config + 11 e2e + 7 http + 10 mux + 5 menuia + 6 manage + 4 mouse + 3 quick + 1 sessmenu + 1 restoregui + 1 settings + 3 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 208 tests: 110 unit + 7 config + 12 e2e + 7 http + 10 mux + 5 menuia + 7 manage + 4 mouse + 3 quick + 1 sessmenu + 1 restoregui + 1 settings + 4 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -270,7 +270,7 @@ Bounds worth knowing: 10 000 lines scrollback, 64 command records, 256 prompt ma
 
 ### Consent and audit: the carrier assigns, the client never claims
 
-`ConsentTier` (Observe/Act) is per-verb, declared in `IpcRequest::consent_tier()`; `RunAction` delegates to the `ActionSpec`. `ConsentMode` (Operator/Paired/Ask/ObserveOnly) is per-**carrier**, not per-client. `CallerMeta` carries only a label; `consent_mode` is not a wire field, and `parse_envelope` refuses any envelope that sends one.
+`ConsentTier` (`Observe` / `Act` / `Irreversible`) is per-verb, declared in `IpcRequest::consent_tier()`; `RunAction` delegates to the `ActionSpec`. `EndSession` and `Quit` are Tier-4 `Irreversible`: they always require explicit per-action confirmation (only `ConsentMode::Operator` is the consent itself; `Ask` and `Paired` both park for an in-window prompt with `Allow Session` hidden, and fail closed headlessly). `ConsentMode` (Operator/Paired/Ask/ObserveOnly) is per-**carrier**, not per-client. `CallerMeta` carries only a label; `consent_mode` is not a wire field, and `parse_envelope` refuses any envelope that sends one.
 
 `AppController` binds two listeners. `accept_carrier` tags each accepted connection with its carrier's mode before dispatch:
 
@@ -307,7 +307,7 @@ Grid line indices are relative to the current screen, so output arriving mid-sca
 
 `src/policy.rs` is pure: `policy_match` and `policy_decision` take the clock and the call history as arguments, so scope, pins, ceiling, and expiry are all testable without sleeping. The controller consults `policy_decision` BEFORE `consent_outcome`, and only for ask + Act, so a policy substitutes for a prompt and can never escalate a carrier.
 
-`propose_policy` is Observe because asking is not acting; it queues an inert proposal. `install_policy` is Act and operator-side, which is what stops an agent installing its own proposal: on an ask carrier the install call itself needs consent. Policies bind to `PeerIdentity`, taken from `dispatch_peer` so an HTTP peer's token-derived identity is used rather than this process's pid.
+`propose_policy` is Observe because asking is not acting; it queues an inert proposal. `StandingPolicy::sanitised` and `policy_match` reject policy-management verbs (`propose-policy`, `list-policies`, `install-policy`, `revoke-policy`), Tier-4 `Irreversible` verbs (`end-session`, `quit`), and unknown verb slugs. `install_policy` and `revoke_policy` never ride on an `Allow Session` grant, so an agent on an `ask` carrier cannot self-install or revoke policies. Policies bind to `PeerIdentity`, taken from `dispatch_peer` so an HTTP peer's token-derived identity is used rather than this process's pid.
 
 `IpcRequest::pin_fields` supplies the exact-match values a policy can pin. Verbs without meaningful scalars return an empty map, so a pin on a key the call does not carry does NOT match vacuously.
 
@@ -329,7 +329,7 @@ Avoid "detach" for moving a pane to another window: to a tmux user detaching mea
 
 `create_argv` is separate from `attach_argv` on purpose. Attach passes tmux `-A` and zellij `attach --create`, both of which ATTACH on a name collision; create must fail instead, so it uses `new-session -s NAME` without `-A` and zellij's global `--session NAME`. Reusing the attach argv for creation is the bug this split prevents.
 
-`rename_session` runs the multiplexer's own command as a one-shot child, polled by `advance_mux_commands` with the same nonblocking drain and kill-then-reap rules as discovery. The pane refs are updated only AFTER the command exits successfully, so a failed rename never leaves mutiny claiming a name the multiplexer rejected. `apply_rename` updates every pane matching (kind, host, old name), not just the one that was right-clicked.
+`rename_session` and `end_session` run the multiplexer's own command as a one-shot child, polled by `advance_mux_commands` with the same nonblocking drain and kill-then-reap rules as discovery. IPC callers park their reply stream on `PendingMuxCommand` so non-zero exit statuses and stderr propagate back as `IpcResponse::Error` rather than reporting premature success. The pane refs are updated only AFTER a rename exits successfully, so a failed rename never leaves mutiny claiming a name the multiplexer rejected. `apply_rename` updates every pane matching (kind, host, old name), not just the one that was right-clicked.
 
 `ActionId::NewTab` honours `preferred_mux`; the IPC `SpawnTab` verb deliberately does not, because agents and scripts ask for a shell explicitly.
 

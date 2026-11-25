@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub enum ConsentTier {
     Observe,
     Act,
+    /// Tier 4: destroys state the operator cannot recover. Always per-action,
+    /// never covered by a session grant, a standing policy, or a paired agent
+    /// carrier.
+    Irreversible,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

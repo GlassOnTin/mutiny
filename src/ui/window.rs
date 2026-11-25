@@ -40,6 +40,7 @@ struct MutinyWindowInner {
     agent_badge_btn: gtk4::Button,
     consent_bar: gtk4::Box,
     consent_label: gtk4::Label,
+    allow_sess_btn: gtk4::Button,
     active_consent_id: Cell<Option<u64>>,
     notice_bar: gtk4::Box,
     notice_label: gtk4::Label,
@@ -81,7 +82,7 @@ impl MutinyWindow {
 
         let (menu_model, sessions_menu) = build_menubar_model();
         let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
-        controller.register_sessions_menu(sessions_menu);
+        controller.register_window_sessions_menu(window_id, sessions_menu);
 
         let chrome_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         chrome_bar.set_margin_start(6);
@@ -273,6 +274,7 @@ impl MutinyWindow {
                 agent_badge_btn,
                 consent_bar,
                 consent_label,
+                allow_sess_btn: allow_sess_btn.clone(),
                 active_consent_id: Cell::new(None),
                 notice_bar,
                 notice_label,
@@ -1035,10 +1037,17 @@ impl MutinyWindow {
             self.inner.agent_badge_btn.set_visible(false);
         }
 
-        if let Some((cid, client, verb, detail)) = ctrl.pending_consent_prompt() {
+        if let Some((cid, client, verb, detail, tier)) = ctrl.pending_consent_prompt() {
             self.inner.active_consent_id.set(Some(cid));
+            let irreversible = tier == crate::action::ConsentTier::Irreversible;
+            self.inner.allow_sess_btn.set_visible(!irreversible);
+            let tier_label = if irreversible {
+                "Tier-4 irreversible"
+            } else {
+                "Tier-2"
+            };
             self.inner.consent_label.set_text(&format!(
-                "Agent '{client}' requests Tier-2 '{verb}' {detail}"
+                "Agent '{client}' requests {tier_label} '{verb}' {detail}"
             ));
             self.inner.consent_bar.set_visible(true);
         } else {

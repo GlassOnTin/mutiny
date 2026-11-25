@@ -447,9 +447,13 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             Duration::from_millis(timeout_ms.saturating_add(1_500))
         }
         // A named host has to authenticate and run a command remotely, which
-        // takes far longer than a local listing.
-        CtlVerb::Sessions { host: Some(_), .. } => Duration::from_secs(40),
-        CtlVerb::Sessions { host: None, .. } => Duration::from_secs(15),
+        // takes far longer than a local listing or session mutation.
+        CtlVerb::Sessions { host: Some(_), .. }
+        | CtlVerb::RenameSession { host: Some(_), .. }
+        | CtlVerb::EndSession { host: Some(_), .. } => Duration::from_secs(40),
+        CtlVerb::Sessions { host: None, .. }
+        | CtlVerb::RenameSession { host: None, .. }
+        | CtlVerb::EndSession { host: None, .. } => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     };
 

@@ -9,12 +9,12 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore and the authenticated HTTP MCP listener are shipped; quick terminal remains. The engine, pane mobility, and agent surface are covered by 200 tests. Most run with no display at all; the IME and font-fallback test needs GTK and runs under Xvfb in CI. Rendering to a real window is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, and M1 are shipped. M2 is open: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener (with per-peer identity and per-peer consent mode), the tmux/zellij session picker, the Settings dialog, Tier-3 standing policies, Tier-4 irreversible per-action gating, and the summonable scratch quick terminal are shipped; a system-wide global shortcut is not scheduled. The engine, pane mobility, and agent surface are covered by 208 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
 
 Working today:
 
 - `alacritty_terminal` 0.26 engine with a PTY per pane, 10 000 lines of scrollback, and line-level search.
-- OSC 133 command journal, OSC 7 working directory, OSC 9;4 progress, OSC 8 hyperlinks, OSC 52 clipboard.
+- OSC 133 command journal, host-checked local OSC 7 working directory, OSC 9;4 progress state, OSC 52 clipboard (OSC 8 hyperlinks are parsed by the VT engine; click/hover UI is not built yet).
 - Shell integration bundled for bash, zsh, fish, and nushell, injected automatically at spawn. A fresh install gets prompt jumping, command-output capture, and exit-code reporting without editing any dotfile.
 - Binary split trees and tabs. The tab strip wraps to multiple rows within the window width and scrolls past a height cap, so opening many tabs never stretches the window. `detach-split` pops a pane into its own window and `move-pane` moves it into another tab, both without touching the running shell or its scrollback. Divider positions are stored, applied, and written back on drag; tabs drag to reorder, and dragging a tab onto the terminal area detaches it.
 - `urgent-next` jumps across windows, tabs, and splits to the next pane needing attention (a bell, a failed command, or an agent notice).
@@ -22,8 +22,8 @@ Working today:
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
 - Mouse reporting: when a program asks for mouse events (tmux with `mouse on`, vim, less), the wheel and clicks go to it instead of mutiny's scrollback and selection. Hold Shift to override back to local scrollback and selection.
-- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 22 IPC verbs, 18 MCP tools, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
-- Carrier-assigned consent with kernel-verified peer identity, and a durable redacted audit trail.
+- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 37 IPC verbs, 33 MCP tools, 25 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
+- Carrier-assigned consent across Tiers 1 through 4 with kernel-verified peer identity, Tier-3 standing policies, per-action Tier-4 gating (`end-session`, `quit`), and a durable redacted audit trail.
 - An authenticated HTTP MCP listener, off by default, so a peer such as Haven can drive the desktop terminal from a phone. It refuses an unpaired client and can never assign Operator. See [Remote agents over HTTP](#remote-agents-over-http).
 - TOML config with live reload for font, colors, palette, geometry, and scrollback depth. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
@@ -34,10 +34,12 @@ Working today:
 - A session picker (`Ctrl+Shift+S`) lists tmux and zellij sessions, local and over SSH, and opens one in a new tab or window. See [Multiplexer sessions](#multiplexer-sessions).
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
 - Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
+- Summonable scratch quick terminal (``Ctrl+Shift+` ``) that hides on dismiss or window-manager close while keeping its shell alive, plus an in-app Settings dialog (`Ctrl+Shift+,`) covering every key in `config.toml`.
 
 Not built yet:
 
-- No config editor or in-app settings UI; the TOML file is the only surface.
+- The Settings dialog writes `config.toml` on Save rather than validating per key live, and Tier-3 standing policies live in memory rather than persisting across restarts.
+- No click/hover UI for OSC 8 hyperlinks or plain-text URLs, and no visual indicator yet for OSC 9;4 progress.
 - No shell integration for shells other than bash, zsh, fish, and nushell. dash and plain sh get no markers.
 - Restored scrollback is plain text: colors and attributes are not preserved, and a crash loses changes since the last clean save.
 - Drag gestures work, but their GTK wiring is not covered by tests (the model operations they call are).
@@ -162,7 +164,7 @@ An unpaired client gets `401` before its body is read, so it cannot make the lis
 
 **A network client can never be assigned Operator.** The listener forwards to the agent socket only, and the agent carrier's mode is pinned at GUI launch by `--agent-consent`. This module has no path to the operator socket at all, so the guarantee is structural rather than a check that could be forgotten. A `consent_mode` field in the JSON-RPC body is ignored, exactly as it is refused on the Unix envelope.
 
-This is a bounded slice. Each request is stateless: there is no MCP session id, so the name sent in `initialize` does not persist and every call is audited as `http-peer`. SSE streaming, session management, and `DELETE` are not implemented.
+This is a bounded slice. Each request is stateless: there is no MCP session id, so the name sent in `initialize` does not persist and every call is audited under the peer's configured label (or `http-peer` when `--http-token` is used without `--http-peer`). SSE streaming, session management, and `DELETE` are not implemented.
 
 HTTP has no `SO_PEERCRED` equivalent, so the pairing token is the peer credential. Name each peer and give it its own token:
 
@@ -202,9 +204,9 @@ curl -s http://127.0.0.1:18740/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}'
 ```
 
-What that run showed: no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
+What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 33 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
 
-Every one of those calls audited against the mutiny process's own pid, which is the shared-identity gap above observed from a real remote client rather than inferred.
+Every one of those single-token calls audited against the mutiny process's own pid, which was the shared-identity gap before `--http-peer` added per-token peer identities.
 
 The same run was repeated over WireGuard, with the listener bound to the workstation's own tunnel address rather than loopback:
 
@@ -212,7 +214,7 @@ The same run was repeated over WireGuard, with the listener bound to the worksta
 mutiny --http-bind 10.1.0.4:18740 --agent-consent paired
 ```
 
-The phone, a peer on the same gateway-hosted WG server, reached `http://10.1.0.4:18740/mcp` directly with no SSH forward involved. Unpaired and wrong-token requests got `401`, the paired token got `200`, all 18 tools and all 6 resources listed (4 static plus one snapshot per live pane), a command sent from the phone executed on the desktop, and `spawn_pane` added a second pane. The audit again showed `carrier=paired` and never `operator`.
+The phone, a peer on the same gateway-hosted WG server, reached `http://10.1.0.4:18740/mcp` directly with no SSH forward involved. Unpaired and wrong-token requests got `401`, the paired token got `200`, all 18 tools at that milestone and all 6 resources listed (4 static plus one snapshot per live pane), a command sent from the phone executed on the desktop, and `spawn_pane` added a second pane. The audit again showed `carrier=paired` and never `operator`.
 
 A split tunnel is enough: routing only the tunnel subnet to the WG interface leaves the default route alone, so nothing else on the workstation changes.
 
@@ -256,7 +258,7 @@ A trusted agent can propose a scoped grant so it stops prompting for every actio
 
 A policy names the verbs it covers (an empty scope is refused, never treated as "everything"), optionally pins scalar arguments to exact values, and carries a rate ceiling per rolling minute and an expiry. Beyond the ceiling, or outside the scope, calls fall back to the normal per-action prompt. Every covered call is still audited, as `approved-policy` rather than a prompt approval.
 
-A policy **cannot escalate a carrier**: it only substitutes for the prompt an `ask` carrier would raise. An `observe-only` peer stays read-only no matter what is installed, and a policy is bound to the kernel-verified peer that proposed it, so another process cannot use it.
+A policy **cannot escalate a carrier** and **cannot cover policy-management or Tier-4 irreversible verbs** (`end-session`, `quit`): it only substitutes for the prompt an `ask` carrier would raise on Tier-2 `Act` verbs. An `observe-only` peer stays read-only no matter what is installed, and a policy is bound to the kernel-verified peer that proposed it, so another process cannot use it.
 
 ```sh
 mutiny ctl propose-policy --description "open tabs" --verbs spawn-tab,split \
@@ -266,7 +268,7 @@ mutiny ctl install-policy 1      # operator-side
 mutiny ctl revoke-policy 1
 ```
 
-The MCP surface mirrors Haven's vocabulary: `propose_policy`, `list_policies`, `install_policy`, `revoke_policy`. An agent cannot install its own proposal, because `install_policy` is itself an Act verb and needs consent.
+The MCP surface mirrors Haven's vocabulary: `propose_policy`, `list_policies`, `install_policy`, `revoke_policy`. An agent cannot install its own proposal: `install_policy` and `revoke_policy` never ride on an `Allow Session` grant and cannot be included in a policy scope.
 
 ## Settings
 
@@ -406,6 +408,8 @@ Not implemented: animation frames, file and shared-memory transmission, unicode 
 | Toggle menu bar | `Ctrl+Shift+M` |
 | Command palette | `Ctrl+Shift+P` |
 | Multiplexer session picker | `Ctrl+Shift+S` |
+| Quick terminal (summon or dismiss) | ``Ctrl+Shift+` `` |
+| Settings | `Ctrl+Shift+,` |
 | Agent activity and audit log | `Ctrl+Shift+J` |
 | Keybind cheatsheet | `Ctrl+Shift+?` |
 
@@ -420,7 +424,7 @@ The tier is a property of the verb, not the caller. A human running `mutiny ctl`
 | 1 | Observe. Read-only tools and resources, no prompt. | shipped |
 | 2 | Act once. One-shot writes, per-action consent in window chrome. | shipped |
 | 3 | Standing policy. A scoped, rate-capped, expiring grant installed once. | shipped |
-| 4 | Irreversible. Always per-action, never standing. | planned |
+| 4 | Irreversible. Always per-action, never standing (`end-session`, `quit`). | shipped |
 
 Consent mode is assigned by the carrier that accepted the connection, never claimed by the client. An envelope carrying `consent_mode` is refused. Peer identity comes from the kernel via `SO_PEERCRED`, and a peer whose uid differs from the server's is refused outright.
 
@@ -439,7 +443,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 200 tests, no display required
+cargo test                    # 208 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline
