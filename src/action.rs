@@ -91,24 +91,18 @@ impl ActionId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// Four non-overlapping archetypes. Every action has exactly one home:
+/// Five non-overlapping archetypes. Every action has exactly one home:
 ///
-/// - `Session`: the lifecycle of a session context. New window, new tab, and
-///   attaching to a multiplexer session.
-/// - `Edit`: operations on the focused pane's CONTENT. Clipboard, find, and
-///   moving between commands in that content.
-/// - `Pane`: the STRUCTURE and focus of panes. Split, detach, close, focus,
-///   and jumping to a pane that needs attention.
-/// - `View`: chrome and introspection. Menu bar, palette, agent audit,
-///   cheatsheet.
-///
-/// The old Shell/Panes/View split overlapped: "Shell" held pane closing,
-/// "View" held session attaching, and "Panes" mixed structure with content
-/// navigation. Help existed for one item, which now lives in View.
+/// - `Session`: the lifecycle of a session context and its top-level windows.
+/// - `Edit`: operations on the focused pane's CONTENT and app settings.
+/// - `Pane`: the STRUCTURE and focus of panes.
+/// - `Haven`: cross-limb actions, pairing, TOTP, and alerts for paired Haven peers.
+/// - `View`: chrome and introspection. Menu bar, palette, agent audit, cheatsheet.
 pub enum MenuCategory {
     Session,
     Edit,
     Pane,
+    Haven,
     View,
 }
 
@@ -117,6 +111,7 @@ impl MenuCategory {
         MenuCategory::Session,
         MenuCategory::Edit,
         MenuCategory::Pane,
+        MenuCategory::Haven,
         MenuCategory::View,
     ];
 
@@ -125,6 +120,7 @@ impl MenuCategory {
             MenuCategory::Session => "_Session",
             MenuCategory::Edit => "_Edit",
             MenuCategory::Pane => "_Pane",
+            MenuCategory::Haven => "_Haven",
             MenuCategory::View => "_View",
         }
     }
@@ -209,7 +205,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::InsertPeerTotp,
         slug: "insert-peer-totp",
         title: "Insert Haven TOTP Code",
-        category: MenuCategory::Edit,
+        category: MenuCategory::Haven,
         consent_tier: ConsentTier::PolicyChange,
         default_accel: Some("<Control><Shift>y"),
         human_chord: "Ctrl+Shift+Y",
@@ -384,7 +380,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::NewSession,
         slug: "new-session",
-        title: "New Session",
+        title: "New Session…",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: None,
@@ -407,7 +403,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::HandoffToPeer,
         slug: "handoff-to-peer",
         title: "Hand Off Pane to Haven",
-        category: MenuCategory::Session,
+        category: MenuCategory::Haven,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>h"),
         human_chord: "Ctrl+Shift+H",
@@ -418,7 +414,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::PresentToPeer,
         slug: "present-to-peer",
         title: "Present to Haven…",
-        category: MenuCategory::Session,
+        category: MenuCategory::Haven,
         consent_tier: ConsentTier::Act,
         default_accel: None,
         human_chord: "",
@@ -429,7 +425,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::PairHaven,
         slug: "pair-haven",
         title: "Pair Haven Limb…",
-        category: MenuCategory::Session,
+        category: MenuCategory::Haven,
         consent_tier: ConsentTier::PolicyChange,
         default_accel: None,
         human_chord: "",
@@ -473,7 +469,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         id: ActionId::ClearPeerAlerts,
         slug: "clear-peer-alerts",
         title: "Clear Haven Alerts",
-        category: MenuCategory::View,
+        category: MenuCategory::Haven,
         consent_tier: ConsentTier::Act,
         default_accel: None,
         human_chord: "",
@@ -544,21 +540,48 @@ pub fn build_window_menubar_model() -> (gio::Menu, gio::Menu, gio::Menu, gio::Me
     let pane_close = gio::Menu::new();
     sync_close_menu_sections(&session_close, &pane_close, false, false, false);
 
+    let append_action = |menu: &gio::Menu, id: ActionId| {
+        let a = spec(id);
+        menu.append(Some(a.title), Some(&a.gtk_detailed_name()));
+    };
+
     for &cat in MenuCategory::ORDERED {
         let submenu = gio::Menu::new();
         match cat {
             MenuCategory::Session => {
-                for action in ACTIONS.iter().filter(|a| {
-                    a.category == MenuCategory::Session
-                        && !matches!(
-                            a.id,
-                            ActionId::SessionPicker | ActionId::CloseTab | ActionId::CloseWindow
-                        )
-                }) {
-                    submenu.append(Some(action.title), Some(&action.gtk_detailed_name()));
-                }
-                submenu.append_submenu(Some("Open Session"), &sessions);
+                // Section 1: creating and opening multiplexer/shell sessions.
+                let sessions_sec = gio::Menu::new();
+                append_action(&sessions_sec, ActionId::NewTab);
+                append_action(&sessions_sec, ActionId::NewSession);
+                sessions_sec.append_submenu(Some("Open Session"), &sessions);
+                append_action(&sessions_sec, ActionId::OpenSessionGrid);
+
+                // Section 2: top-level windows and layout persistence.
+                let windows_sec = gio::Menu::new();
+                append_action(&windows_sec, ActionId::NewWindow);
+                append_action(&windows_sec, ActionId::QuickTerminal);
+                append_action(&windows_sec, ActionId::SaveSession);
+
+                submenu.append_section(None, &sessions_sec);
+                submenu.append_section(None, &windows_sec);
                 submenu.append_section(None, &session_close);
+            }
+            MenuCategory::Edit => {
+                let clip_sec = gio::Menu::new();
+                append_action(&clip_sec, ActionId::Copy);
+                append_action(&clip_sec, ActionId::Paste);
+
+                let nav_sec = gio::Menu::new();
+                append_action(&nav_sec, ActionId::Search);
+                append_action(&nav_sec, ActionId::JumpPrevPrompt);
+                append_action(&nav_sec, ActionId::JumpNextPrompt);
+
+                let prefs_sec = gio::Menu::new();
+                append_action(&prefs_sec, ActionId::Settings);
+
+                submenu.append_section(None, &clip_sec);
+                submenu.append_section(None, &nav_sec);
+                submenu.append_section(None, &prefs_sec);
             }
             MenuCategory::Pane => {
                 let before = gio::Menu::new();
@@ -579,8 +602,21 @@ pub fn build_window_menubar_model() -> (gio::Menu, gio::Menu, gio::Menu, gio::Me
                 submenu.append_section(None, &pane_close);
                 submenu.append_section(None, &after);
             }
-            _ => {
-                for action in ACTIONS.iter().filter(|a| a.category == cat) {
+            MenuCategory::Haven => {
+                let throw_sec = gio::Menu::new();
+                append_action(&throw_sec, ActionId::HandoffToPeer);
+                append_action(&throw_sec, ActionId::PresentToPeer);
+                append_action(&throw_sec, ActionId::InsertPeerTotp);
+
+                let admin_sec = gio::Menu::new();
+                append_action(&admin_sec, ActionId::PairHaven);
+                append_action(&admin_sec, ActionId::ClearPeerAlerts);
+
+                submenu.append_section(None, &throw_sec);
+                submenu.append_section(None, &admin_sec);
+            }
+            MenuCategory::View => {
+                for action in ACTIONS.iter().filter(|a| a.category == MenuCategory::View) {
                     submenu.append(Some(action.title), Some(&action.gtk_detailed_name()));
                 }
             }

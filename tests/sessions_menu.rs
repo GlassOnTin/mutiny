@@ -74,7 +74,7 @@ fn sessions_submenu_fills_without_opening_the_picker() {
     ctrl.attach_gtk_app(&app);
 
     let (root, sessions) = mutiny::action::build_menubar_model();
-    assert_eq!(root.n_items(), 4);
+    assert_eq!(root.n_items(), 5);
     ctrl.register_sessions_menu(sessions.clone());
     assert_eq!(
         labels(&sessions),

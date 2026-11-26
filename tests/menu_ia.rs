@@ -1,4 +1,4 @@
-//! The menu information architecture: four non-overlapping archetypes, every
+//! The menu information architecture: five non-overlapping archetypes, every
 //! action in exactly one home, and the action slugs and keybinds unchanged by
 //! the redesign.
 //!
@@ -22,9 +22,9 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     // No chord: reachable from the Session menu, the tab menu, and the palette.
     ("new-session", "", "Session"),
     ("open-session-grid", "", "Session"),
-    ("handoff-to-peer", "Ctrl+Shift+H", "Session"),
-    ("present-to-peer", "", "Session"),
-    ("pair-haven", "", "Session"),
+    ("handoff-to-peer", "Ctrl+Shift+H", "Haven"),
+    ("present-to-peer", "", "Haven"),
+    ("pair-haven", "", "Haven"),
     ("settings", "Ctrl+Shift+,", "Edit"),
     ("quick-terminal", "Ctrl+Shift+`", "Session"),
     ("save-session", "", "Session"),
@@ -32,7 +32,7 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("close-window", "", "Session"),
     ("copy", "Ctrl+Shift+C", "Edit"),
     ("paste", "Ctrl+Shift+V", "Edit"),
-    ("insert-peer-totp", "Ctrl+Shift+Y", "Edit"),
+    ("insert-peer-totp", "Ctrl+Shift+Y", "Haven"),
     ("search", "Ctrl+Shift+F", "Edit"),
     ("jump-prev-prompt", "Ctrl+Shift+Up", "Edit"),
     ("jump-next-prompt", "Ctrl+Shift+Down", "Edit"),
@@ -46,7 +46,7 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("toggle-menubar", "Ctrl+Shift+M", "View"),
     ("command-palette", "Ctrl+Shift+P", "View"),
     ("agent-audit", "Ctrl+Shift+J", "View"),
-    ("clear-peer-alerts", "", "View"),
+    ("clear-peer-alerts", "", "Haven"),
     ("keybind-cheatsheet", "Ctrl+Shift+?", "View"),
 ];
 
@@ -55,6 +55,7 @@ fn home(cat: MenuCategory) -> &'static str {
         MenuCategory::Session => "Session",
         MenuCategory::Edit => "Edit",
         MenuCategory::Pane => "Pane",
+        MenuCategory::Haven => "Haven",
         MenuCategory::View => "View",
     }
 }
@@ -77,9 +78,12 @@ fn every_action_keeps_its_slug_and_chord_and_has_one_home() {
             "home for {slug} changed"
         );
     }
-    // Exactly the four archetypes, in order, with no leftover Shell/Help.
+    // Five non-overlapping archetypes, in order, with distinct mnemonics.
     let labels: Vec<&str> = MenuCategory::ORDERED.iter().map(|c| c.label()).collect();
-    assert_eq!(labels, vec!["_Session", "_Edit", "_Pane", "_View"]);
+    assert_eq!(
+        labels,
+        vec!["_Session", "_Edit", "_Pane", "_Haven", "_View"]
+    );
 }
 
 #[test]
@@ -116,7 +120,28 @@ fn session(name: &str, host: Option<&str>, exited: bool) -> MuxSession {
 #[test]
 fn sessions_submenu_lists_sessions_inline_and_keeps_the_picker_reachable() {
     let (root, sessions) = build_menubar_model();
-    assert!(root.n_items() == 4, "four top-level menus");
+    assert_eq!(root.n_items(), 5, "five top-level menus");
+
+    // Session is split into 3 sections (sessions, windows/layout, close) and
+    // Haven into 2 sections (cross-limb actions, pairing/alerts).
+    let session_menu = root.item_link(0, "submenu").expect("Session submenu");
+    assert_eq!(session_menu.n_items(), 3, "Session must have 3 sections");
+    let haven_menu = root.item_link(3, "submenu").expect("Haven submenu");
+    assert_eq!(haven_menu.n_items(), 2, "Haven must have 2 sections");
+    let haven_items: Vec<String> = flatten(&haven_menu)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(
+        haven_items,
+        vec![
+            "Hand Off Pane to Haven",
+            "Present to Haven…",
+            "Insert Haven TOTP Code",
+            "Pair Haven Limb…",
+            "Clear Haven Alerts",
+        ]
+    );
 
     let inventory = MuxInventory {
         sessions: vec![

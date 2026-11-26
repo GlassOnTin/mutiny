@@ -231,14 +231,15 @@ A split tunnel is enough: routing only the tunnel subnet to the WG interface lea
 
 ## Menus and labels
 
-Four menus, each an archetype with no overlap. Every action lives in exactly one:
+Five menus, each an archetype with no overlap. Every action lives in exactly one:
 
 | Menu | Covers | Actions |
 | --- | --- | --- |
-| **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Open Session Grid, Handoff Session to Haven, Present to Haven, Pair Haven Limb, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
-| **Edit** | the focused pane's content, and settings | Copy, Paste, Insert Haven TOTP Code, Search, Previous/Next Command, Settings |
-| **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
-| **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Clear Haven Alerts, Keybind Cheatsheet |
+| **Session** | sessions, top-level windows, and layout | New Session Tab, New Session, Open Session (submenu), Open Session Grid \| New Window, Quick Terminal, Save Session Layout \| Close Tab, Close Window |
+| **Edit** | the focused pane's content, and settings | Copy, Paste \| Search, Previous/Next Command \| Settings |
+| **Pane** | pane structure and focus | Split Right/Down, Move Pane to New Window \| Close Pane \| Focus Next/Prev, Next Urgent |
+| **Haven** | cross-limb actions, pairing, TOTP, and alerts | Hand Off Pane to Haven, Present to Haven, Insert Haven TOTP Code \| Pair Haven Limb, Clear Haven Alerts |
+| **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Keybind Cheatsheet |
 
 The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View" held session attaching, and "Panes" mixed structure with content navigation. Help existed for one item, which now sits in View. Action slugs and keybinds are unchanged; `tests/menu_ia.rs` holds a golden list so a rename or rebound chord fails a test.
 

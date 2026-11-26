@@ -355,9 +355,9 @@ The Sessions submenu used to be empty until the picker window was opened, becaus
 
 `begin_discovery` must NOT clear `cache.sessions`. Each target's result replaces its own (host, kind) slice in `record_discovery_result`, so keeping the old sessions until then is what stops the submenu flashing "No sessions found" at the start of every refresh.
 
-### Menu IA: four archetypes, one home per action
+### Menu IA: five archetypes, one home per action
 
-`MenuCategory` is Session / Edit / Pane / View. Session is session-context lifecycle, Edit is the focused pane's CONTENT (clipboard, find, command navigation), Pane is STRUCTURE and focus, View is chrome and introspection. The old File("Shell")/Pane("Panes")/View split overlapped, and Help held one item.
+`MenuCategory` is Session / Edit / Pane / Haven / View. Session is session-context and window lifecycle (grouped into create/attach, windows/layout, and close sections), Edit is the focused pane's CONTENT and settings (clipboard, find/prompt navigation, settings), Pane is STRUCTURE and focus, Haven is cross-limb actions, TOTP, pairing, and peer alerts, and View is chrome and introspection. The old File("Shell")/Pane("Panes")/View split overlapped, and Help held one item.
 
 `tests/menu_ia.rs` carries a golden slug/chord/home table. Slugs and chords are contract: agents call `run_action` by slug and humans have muscle memory, so the IA change must not move them. Category is presentation and is not on the wire (`ActionCatalogItem` has no category field).
 
