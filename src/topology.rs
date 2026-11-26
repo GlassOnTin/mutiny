@@ -667,6 +667,70 @@ impl Workspace {
         Ok(())
     }
 
+    /// Moves `tab_id` (including its entire split tree and running `PaneEngine`s)
+    /// into `dst_win_id` at `dst_index` (`None` appends at the end). If `tab_id`
+    /// already lives in `dst_win_id`, reorders it within that window. If moving
+    /// the last tab out of a non-quick source window leaves that source window
+    /// empty, removes the empty source window and returns its `WindowId` so the
+    /// controller can close or reconcile it.
+    pub fn move_tab_to_window(
+        &mut self,
+        tab_id: TabId,
+        dst_win_id: WindowId,
+        dst_index: Option<usize>,
+    ) -> Result<WindowId, TopologyError> {
+        let Some((src_win_idx, src_tab_pos)) =
+            self.windows.iter().enumerate().find_map(|(wi, w)| {
+                w.tabs
+                    .iter()
+                    .position(|t| t.id == tab_id)
+                    .map(|ti| (wi, ti))
+            })
+        else {
+            return Err(TopologyError::TabNotFound(tab_id));
+        };
+        let Some(dst_is_quick) = self.window(dst_win_id).map(|w| w.quick) else {
+            return Err(TopologyError::WindowNotFound(dst_win_id));
+        };
+
+        let src_win_id = self.windows[src_win_idx].id;
+        if src_win_id == dst_win_id {
+            let len = self.windows[src_win_idx].tabs.len();
+            let target = dst_index.map_or(len.saturating_sub(1), |i| i.min(len.saturating_sub(1)));
+            self.reorder_tab(dst_win_id, tab_id, target)?;
+            self.windows[src_win_idx].active_tab = tab_id;
+            self.active_window = Some(dst_win_id);
+            return Ok(src_win_id);
+        }
+
+        // Never move tabs into or out of the hidden scratch quick terminal's
+        // sole tab slot.
+        if dst_is_quick {
+            return Err(TopologyError::WindowNotFound(dst_win_id));
+        }
+        if self.windows[src_win_idx].quick && self.windows[src_win_idx].tabs.len() == 1 {
+            let pid = self.windows[src_win_idx].tabs[0].active_pane;
+            return Err(TopologyError::AlreadyStandaloneWindow(pid));
+        }
+
+        let moved_tab = self.windows[src_win_idx].tabs.remove(src_tab_pos);
+        if self.windows[src_win_idx].tabs.is_empty() {
+            self.windows.remove(src_win_idx);
+        } else if self.windows[src_win_idx].active_tab == tab_id {
+            let next_idx = src_tab_pos.min(self.windows[src_win_idx].tabs.len() - 1);
+            self.windows[src_win_idx].active_tab = self.windows[src_win_idx].tabs[next_idx].id;
+        }
+
+        let dst_win = self
+            .window_mut(dst_win_id)
+            .expect("dst_win_id verified above");
+        let insert_at = dst_index.map_or(dst_win.tabs.len(), |i| i.min(dst_win.tabs.len()));
+        dst_win.tabs.insert(insert_at, moved_tab);
+        dst_win.active_tab = tab_id;
+        self.active_window = Some(dst_win_id);
+        Ok(src_win_id)
+    }
+
     pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<(WindowId, TabId), TopologyError> {
         let Some((win_id, tab_id)) = self.locate_pane(pane_id) else {
             return Err(TopologyError::PaneNotFound(pane_id));
@@ -1110,6 +1174,67 @@ mod tests {
 
         assert!(ws.reorder_tab(w1, TabId(999), 0).is_err());
         assert!(ws.reorder_tab(WindowId(999), t1, 0).is_err());
+    }
+
+    #[test]
+    fn move_tab_to_window_redocks_split_trees_and_closes_empty_source_window() {
+        let mut ws = Workspace::new();
+        let p1 = ws.reserve_pane_id();
+        let (w1, t1) = ws.insert_window_with_pane(p1, PaneEngine::new_headless(20, 5), true);
+        let p1_split = ws.reserve_pane_id();
+        ws.split_pane_with(
+            p1,
+            SplitAxis::Horizontal,
+            p1_split,
+            PaneEngine::new_headless(20, 5),
+        )
+        .unwrap();
+        ws.set_split_ratio(t1, &[], 0.35);
+
+        let p2 = ws.reserve_pane_id();
+        let t2 = ws
+            .insert_tab_with_pane(w1, p2, PaneEngine::new_headless(20, 5))
+            .unwrap();
+
+        let p3 = ws.reserve_pane_id();
+        let (w2, t3) = ws.insert_window_with_pane(p3, PaneEngine::new_headless(20, 5), true);
+
+        // 1. Redock `t1` (with its 2-pane split + 0.35 ratio) from `w1` to slot 0 of `w2`.
+        let src = ws.move_tab_to_window(t1, w2, Some(0)).unwrap();
+        assert_eq!(src, w1);
+        assert_eq!(ws.window(w1).unwrap().tabs.len(), 1);
+        assert_eq!(ws.window(w1).unwrap().active_tab, t2);
+        assert_eq!(
+            ws.window(w2)
+                .unwrap()
+                .tabs
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t1, t3]
+        );
+        assert_eq!(ws.window(w2).unwrap().active_tab, t1);
+        assert_eq!(
+            ws.window(w2).unwrap().tabs[0].root.leaves(),
+            vec![p1, p1_split]
+        );
+        assert!(ws.pane(p1).is_some() && ws.pane(p1_split).is_some());
+
+        // 2. Redock `t2` (the last remaining tab in `w1`) onto the end of `w2` ->
+        //    `w1` is now empty and removed automatically.
+        let src2 = ws.move_tab_to_window(t2, w2, None).unwrap();
+        assert_eq!(src2, w1);
+        assert!(ws.window(w1).is_none(), "empty source window must close");
+        assert_eq!(
+            ws.window(w2)
+                .unwrap()
+                .tabs
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![t1, t3, t2]
+        );
+        assert_eq!(ws.window(w2).unwrap().active_tab, t2);
     }
 
     #[test]

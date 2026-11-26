@@ -3461,6 +3461,34 @@ impl AppController {
         }
     }
 
+    /// Drag-to-redock (or reorder): moves `tab_id` into `dst_win_id` at
+    /// `dst_index` (`None` appends at the end) without restarting any shell or
+    /// multiplexer client, closing the source window if its last tab moved out.
+    pub fn move_tab_to_window(
+        self: &Rc<Self>,
+        tab_id: TabId,
+        dst_win_id: WindowId,
+        dst_index: Option<usize>,
+    ) -> bool {
+        let Ok(src_win_id) = self
+            .workspace
+            .borrow_mut()
+            .move_tab_to_window(tab_id, dst_win_id, dst_index)
+        else {
+            return false;
+        };
+        if src_win_id != dst_win_id {
+            self.reconcile_or_close_ui_window(src_win_id);
+        }
+        self.sync_ui_window(dst_win_id);
+        if src_win_id != dst_win_id
+            && let Some(ui_win) = self.ui_windows.borrow().get(&dst_win_id).cloned()
+        {
+            ui_win.present();
+        }
+        true
+    }
+
     pub fn close_pane(self: &Rc<Self>, pane_id: PaneId) {
         self.save_before_last_window_goes();
         let src_win = self.workspace.borrow().locate_pane(pane_id).map(|(w, _)| w);

@@ -184,5 +184,14 @@ fn drag_operations_work_through_the_controller() {
     // The detached pane keeps its identity and its engine.
     assert!(ctrl.workspace.borrow().pane(p2).is_some());
 
+    // Cross-window drag-to-redock: drop the detached window's sole tab back onto
+    // slot 1 of window `w` -> redocks without restarting `p2` and closes the
+    // now-empty detached window.
+    assert!(ctrl.move_tab_to_window(detached.1, w, Some(1)));
+    assert_eq!(ctrl.workspace.borrow().windows().len(), before);
+    assert!(ctrl.workspace.borrow().window(detached.0).is_none());
+    assert_eq!(order(), vec![t3, detached.1, t1, t2]);
+    assert!(ctrl.workspace.borrow().pane(p2).is_some());
+
     let _ = std::fs::remove_dir_all(&dir);
 }

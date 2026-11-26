@@ -184,6 +184,16 @@ impl MutinyWindow {
             toolbar_box.append(&btn);
         }
         chrome_bar.append(&toolbar_box);
+        {
+            let ctrl_chrome_drop = Rc::downgrade(&controller);
+            let win_for_chrome_drop = window_id;
+            attach_tab_drop_target(&chrome_bar, move |dragged_tab| {
+                let Some(c) = ctrl_chrome_drop.upgrade() else {
+                    return false;
+                };
+                c.move_tab_to_window(dragged_tab, win_for_chrome_drop, None)
+            });
+        }
 
         // Symmetric inbound `initialize` tap-to-pair bar
         let pairing_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -325,32 +335,42 @@ impl MutinyWindow {
         content_slot.set_hexpand(true);
         content_slot.set_vexpand(true);
 
-        // Drag-to-detach: dropping a tab on the terminal area detaches that
-        // tab's active pane into its own window, via the existing detach verb.
-        let detach_drop = gtk4::DropTarget::new(glib::Type::U64, gdk::DragAction::MOVE);
-        let ctrl_detach = Rc::downgrade(&controller);
-        let win_for_detach = window_id;
-        detach_drop.connect_drop(move |_, value, _, _| {
-            let Ok(dragged) = value.get::<u64>() else {
-                return false;
-            };
-            let Some(c) = ctrl_detach.upgrade() else {
-                return false;
-            };
-            let pane = c
-                .workspace
-                .borrow()
-                .window(win_for_detach)
-                .and_then(|w| w.tabs.iter().find(|t| t.id == TabId(dragged)))
-                .map(|t| t.active_pane);
-            match pane {
-                // A sole pane in a sole window has nothing to detach from;
-                // detach_split reports that and the drop is a no-op.
-                Some(p) => c.detach_split(Some(p)).is_ok(),
-                None => false,
-            }
-        });
-        content_slot.add_controller(detach_drop);
+        // Drag-to-redock / drag-to-detach: dropping a tab from ANOTHER Mutiny
+        // window onto this terminal area redocks that tab into this window;
+        // dropping a tab from THIS window onto its own terminal area detaches
+        // its active pane into a fresh window.
+        {
+            let ctrl_detach = Rc::downgrade(&controller);
+            let win_for_detach = window_id;
+            attach_tab_drop_target(&content_slot, move |dragged_tab| {
+                let Some(c) = ctrl_detach.upgrade() else {
+                    return false;
+                };
+                let (src_win, active_pane) = {
+                    let ws = c.workspace.borrow();
+                    let found = ws.windows().iter().find_map(|w| {
+                        w.tabs
+                            .iter()
+                            .find(|t| t.id == dragged_tab)
+                            .map(|t| (w.id, t.active_pane))
+                    });
+                    match found {
+                        Some((w, p)) => (Some(w), Some(p)),
+                        None => (None, None),
+                    }
+                };
+                match src_win {
+                    Some(w) if w != win_for_detach => {
+                        c.move_tab_to_window(dragged_tab, win_for_detach, None)
+                    }
+                    Some(_) => match active_pane {
+                        Some(p) => c.detach_split(Some(p)).is_ok(),
+                        None => false,
+                    },
+                    None => false,
+                }
+            });
+        }
 
         let root_vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root_vbox.append(&menubar);
@@ -1149,32 +1169,23 @@ impl MutinyWindow {
                     }
                 }
             });
-            // Drag-to-reorder: the tab carries its id, and dropping it on
-            // another tab moves it to that index. Same model operation the
-            // keyboard verbs use, so behavior cannot diverge.
-            let drag = gtk4::DragSource::new();
-            drag.set_actions(gdk::DragAction::MOVE);
-            let dragged_id = tid.0;
-            drag.connect_prepare(move |_, _, _| {
-                Some(gdk::ContentProvider::for_value(&glib::Value::from(
-                    dragged_id,
-                )))
-            });
-            btn.add_controller(drag);
-
-            let drop = gtk4::DropTarget::new(glib::Type::U64, gdk::DragAction::MOVE);
-            let ctrl_drop = Rc::downgrade(&ctrl);
-            let win_for_drop = self.inner.window_id;
-            drop.connect_drop(move |_, value, _, _| {
-                if let Ok(dragged) = value.get::<u64>()
-                    && let Some(c) = ctrl_drop.upgrade()
-                {
-                    c.reorder_tab(win_for_drop, TabId(dragged), idx);
-                    return true;
-                }
-                false
-            });
-            btn.add_controller(drop);
+            // Drag-to-reorder and cross-window drag-to-redock: the tab carries
+            // both an in-process GValue(u64) and a private Wayland/X11 MIME
+            // payload (`application/x-mutiny-tab`) so compositors negotiate
+            // cross-surface MOVE cleanly without exposing text/plain to other
+            // apps. Dropping on a tab in the same or another window moves it to
+            // that slot.
+            attach_tab_drag_source(&btn, tid);
+            {
+                let ctrl_drop = Rc::downgrade(&ctrl);
+                let win_for_drop = self.inner.window_id;
+                attach_tab_drop_target(&btn, move |dragged_tab| {
+                    let Some(c) = ctrl_drop.upgrade() else {
+                        return false;
+                    };
+                    c.move_tab_to_window(dragged_tab, win_for_drop, Some(idx))
+                });
+            }
 
             // Right-click opens a per-tab menu. The tab DragSource is
             // primary-button only, so a secondary GestureClick does not fight
@@ -3821,8 +3832,90 @@ fn attach_escape_to_close(dialog: &gtk4::Window) {
     dialog.add_controller(key_escape);
 }
 
-/// Tight padding for the glyph-only toolbar buttons. Installed once per
-/// display; GTK deduplicates providers by pointer, so a guard keeps it cheap.
+const TAB_DND_MIME: &str = "application/x-mutiny-tab";
+
+fn attach_tab_drag_source(btn: &gtk4::Button, tid: TabId) {
+    let drag = gtk4::DragSource::new();
+    drag.set_actions(gdk::DragAction::MOVE);
+    let dragged_id = tid.0;
+    drag.connect_prepare(move |_, _, _| {
+        let val_provider = gdk::ContentProvider::for_value(&glib::Value::from(dragged_id));
+        let mime_provider = gdk::ContentProvider::for_bytes(
+            TAB_DND_MIME,
+            &glib::Bytes::from(&dragged_id.to_le_bytes()),
+        );
+        Some(gdk::ContentProvider::new_union(&[
+            val_provider,
+            mime_provider,
+        ]))
+    });
+    let btn_for_icon = btn.clone();
+    drag.connect_drag_begin(move |src, _| {
+        let paintable = gtk4::WidgetPaintable::new(Some(&btn_for_icon));
+        src.set_icon(Some(&paintable), 12, 12);
+    });
+    btn.add_controller(drag);
+}
+
+fn attach_tab_drop_target<W, F>(widget: &W, on_drop: F)
+where
+    W: IsA<gtk4::Widget>,
+    F: Fn(TabId) -> bool + 'static,
+{
+    let on_drop = Rc::new(on_drop);
+    let formats = gdk::ContentFormatsBuilder::new()
+        .add_type(glib::Type::U64)
+        .add_mime_type(TAB_DND_MIME)
+        .build();
+    let target = gtk4::DropTargetAsync::new(Some(formats), gdk::DragAction::MOVE);
+    target.connect_drop(move |_, drop, _, _| {
+        // Fast in-process path when GDK preserves the local GdkDrag object.
+        if let Some(local_drag) = drop.drag()
+            && let Ok(val) = local_drag.content().value(glib::Type::U64)
+            && let Ok(raw_id) = val.get::<u64>()
+        {
+            let ok = on_drop(TabId(raw_id));
+            drop.finish(if ok {
+                gdk::DragAction::MOVE
+            } else {
+                gdk::DragAction::empty()
+            });
+            return ok;
+        }
+        // Wayland/X11 compositor pipe fallback over `application/x-mutiny-tab`.
+        if !drop.formats().contain_mime_type(TAB_DND_MIME) {
+            drop.finish(gdk::DragAction::empty());
+            return false;
+        }
+        let drop_cl = drop.clone();
+        let on_drop_cl = Rc::clone(&on_drop);
+        drop.read_async(
+            &[TAB_DND_MIME],
+            glib::Priority::DEFAULT,
+            None::<&gtk4::gio::Cancellable>,
+            move |res| {
+                let ok = match res {
+                    Ok((stream, _)) => stream
+                        .read_bytes(8, None::<&gtk4::gio::Cancellable>)
+                        .ok()
+                        .and_then(|b| <[u8; 8]>::try_from(b.as_ref()).ok())
+                        .is_some_and(|arr| on_drop_cl(TabId(u64::from_le_bytes(arr)))),
+                    Err(_) => false,
+                };
+                drop_cl.finish(if ok {
+                    gdk::DragAction::MOVE
+                } else {
+                    gdk::DragAction::empty()
+                });
+            },
+        );
+        true
+    });
+    widget.add_controller(target);
+}
+
+/// Tight padding for the glyph-only toolbar buttons and subtle drop-target
+/// highlight when dragging tabs within or across windows.
 fn ensure_compact_toolbar_css() {
     use std::cell::Cell;
     thread_local! { static INSTALLED: Cell<bool> = const { Cell::new(false) }; }
@@ -3836,7 +3929,8 @@ fn ensure_compact_toolbar_css() {
     provider.load_from_string(
         "button.compact-toolbar { padding-left: 6px; padding-right: 6px; \
          padding-top: 2px; padding-bottom: 2px; min-width: 0; } \
-         label.tab-subtitle { font-size: 0.82em; }",
+         label.tab-subtitle { font-size: 0.82em; } \
+         *:drop(active) { outline: 1px solid @theme_selected_bg_color; outline-offset: -1px; }",
     );
     gtk4::style_context_add_provider_for_display(
         &display,
