@@ -2579,7 +2579,10 @@ impl AppController {
                             Some(mut stream) => {
                                 let _ = write_response(&mut stream, &IpcResponse::err(msg));
                             }
-                            None => eprintln!("warning: {msg}"),
+                            None => {
+                                eprintln!("warning: {msg}");
+                                self.surface_window_notice(None, msg);
+                            }
                         }
                     }
                 }
@@ -2608,6 +2611,27 @@ impl AppController {
                             None => {
                                 if !new.is_empty() {
                                     eprintln!("warning: {msg}");
+                                    let target_pane = {
+                                        let ws = self.workspace.borrow();
+                                        ws.pane_ids().into_iter().find(|&pid| {
+                                            ws.pane(pid).and_then(|e| e.mux_session()).is_some_and(
+                                                |s| {
+                                                    s.kind == kind
+                                                        && s.host.as_deref() == host.as_deref()
+                                                        && s.name == old
+                                                },
+                                            )
+                                        })
+                                    };
+                                    if let Some(pid) = target_pane {
+                                        if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid)
+                                        {
+                                            eng.set_agent_notice(Some(msg));
+                                        }
+                                        changed = true;
+                                    } else {
+                                        self.surface_window_notice(None, msg);
+                                    }
                                 }
                             }
                         }
@@ -2642,16 +2666,111 @@ impl AppController {
         }
     }
 
-    /// Smallest free `mutiny-N` from the last discovery pass.
+    /// Smallest free `mutiny-N` across the discovery cache and live workspace panes.
     pub fn suggested_session_name(&self) -> String {
-        let taken: Vec<String> = self
+        let mut taken: Vec<String> = self
             .session_cache
             .borrow()
             .sessions
             .iter()
             .map(|s| s.name.clone())
             .collect();
+        {
+            let ws = self.workspace.borrow();
+            for pid in ws.pane_ids() {
+                if let Some(m) = ws.pane(pid).and_then(|e| e.mux_session())
+                    && !taken.iter().any(|t| t == &m.name)
+                {
+                    taken.push(m.name.clone());
+                }
+            }
+        }
         mux::free_session_name(&taken)
+    }
+
+    /// Checks whether a local multiplexer session named `name` already exists
+    /// (live, not exited), consulting `session_cache` first and falling back to a
+    /// bounded (<250 ms) local discovery probe so `New Session` in the GUI can
+    /// offer to attach instead of failing silently on a duplicate name.
+    pub fn local_session_exists(&self, kind: MuxKind, name: &str) -> bool {
+        let wanted = name.trim();
+        if wanted.is_empty() {
+            return false;
+        }
+        if self
+            .session_cache
+            .borrow()
+            .sessions
+            .iter()
+            .any(|s| s.host.is_none() && s.kind == kind && s.name == wanted && !s.exited)
+        {
+            return true;
+        }
+        let opts = self.config.borrow().sessions.clone();
+        let program = mux::local_program(kind, &opts);
+        let argv = mux::discovery_argv(kind, &opts);
+        let Ok(mut child) = Command::new(&program)
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(out) = child.stdout.as_ref() {
+            set_nonblocking(out.as_raw_fd());
+        }
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let mut budget = DISCOVERY_BYTES_PER_TICK;
+            if let Some(out) = child.stdout.as_mut() {
+                drain_bounded(out, &mut buf, &mut budget);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut budget = DISCOVERY_BYTES_PER_TICK;
+                    if let Some(out) = child.stdout.as_mut() {
+                        drain_bounded(out, &mut buf, &mut budget);
+                    }
+                    if !status.success() {
+                        return false;
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let sessions = match kind {
+                        MuxKind::Tmux => mux::parse_tmux(&text, None),
+                        MuxKind::Zellij => mux::parse_zellij(&text, None),
+                    };
+                    return sessions.iter().any(|s| s.name == wanted && !s.exited);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Surfaces an operator-facing error or diagnostic notice on the active pane
+    /// of `preferred_win` (or the workspace active pane) and refreshes banners.
+    pub fn surface_window_notice(&self, preferred_win: Option<WindowId>, message: String) {
+        let target_pane = {
+            let ws = self.workspace.borrow();
+            preferred_win
+                .and_then(|wid| ws.window(wid).and_then(|w| w.active_pane()))
+                .or_else(|| ws.active_pane_id())
+        };
+        if let Some(pid) = target_pane {
+            if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid) {
+                eng.set_agent_notice(Some(message));
+            }
+            self.refresh_all_window_chromes();
+        }
     }
 
     fn attach_or_create(
@@ -3922,8 +4041,8 @@ impl AppController {
                             }
                         }
                     }
-                    EngineNotification::ChildExited(_) => {
-                        panes_exited.push(pid);
+                    EngineNotification::ChildExited(code) => {
+                        panes_exited.push((pid, code));
                     }
                 }
             }
@@ -3946,8 +4065,45 @@ impl AppController {
         self.refresh_sessions_periodically();
         self.expire_pending_consents();
 
-        for pid in panes_exited {
+        for (pid, reported_code) in panes_exited {
+            let failed_mux = {
+                let ws = self.workspace.borrow();
+                ws.pane(pid).and_then(|eng| {
+                    let code = reported_code.or_else(|| eng.last_child_exit_code())?;
+                    if code == 0 {
+                        return None;
+                    }
+                    let mux_ref = eng.mux_session()?.clone();
+                    let src_win = ws.locate_pane(pid).map(|(w, _)| w);
+                    let detail = eng
+                        .snapshot(Some(8))
+                        .lines
+                        .into_iter()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .map(|l| mux::sanitize_text(l.trim(), 160))
+                        .unwrap_or_default();
+                    Some((src_win, mux_ref, code, detail))
+                })
+            };
             self.close_pane(pid);
+            if let Some((src_win, mux_ref, code, detail)) = failed_mux {
+                let clean_name = mux::sanitize_text(&mux_ref.name, 64);
+                let msg = if detail.is_empty() {
+                    format!(
+                        "{} session {:?} exited with status {code}",
+                        mux_ref.kind.label(),
+                        clean_name
+                    )
+                } else {
+                    format!(
+                        "{} session {:?} exited (status {code}): {detail}",
+                        mux_ref.kind.label(),
+                        clean_name
+                    )
+                };
+                self.surface_window_notice(src_win, msg);
+            }
         }
 
         self.accept_ipc_clients();

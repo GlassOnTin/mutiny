@@ -14,7 +14,7 @@ Doc style: VISION.md follows the structure of Haven's `~/Code/Haven/VISION.md` (
 
 ```bash
 cargo build                              # requires GTK 4.22+ dev libs (pkg-config gtk4)
-cargo test                               # 237 tests: 122 unit + 7 config + 12 e2e + 7 http + 17 m3 + 10 mux + 5 menuia + 7 manage + 4 mouse + 3 quick + 1 sessmenu + 1 restoregui + 1 settings + 4 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
+cargo test                               # 240 tests: 124 unit + 7 config + 12 e2e + 7 http + 17 m3 + 10 mux + 5 menuia + 8 manage + 4 mouse + 3 quick + 1 sessmenu + 1 restoregui + 1 settings + 4 policy + 1 tabact + 4 smoke + 1 picker + 1 tabstrip + 1 appicon + 1 agenticon + 1 cursor + 1 damage + 1 ime + 5 graphics + 5 osc777 + 2 ratios + 4 session + 1 shell + 7 queries
 cargo test --test e2e_ipc_pty            # integration only (live PTYs, carriers, audit, MCP)
 cargo test --test http_mcp_carrier       # HTTP carrier: pairing refusal, never-Operator, observe-only
 cargo test --test mux_sessions           # session discovery/attach (private tmux sockets; skips without tmux)
@@ -315,7 +315,7 @@ Rate limiting is a rolling 60 s window per policy, pruned and bounded in `prune_
 
 ### Closing a view versus ending a session
 
-With a multiplexer these are different operations and the vocabulary must not blur them. `close_pane` / `close_tab` / `close_window` end a CLIENT; the session keeps running. `end_session` runs the multiplexer's kill command and stops everything inside it, on every device. Menu labels say which ("Close Tab (session keeps running)"), and End Session sits in its own menu section behind a confirmation whose default button is the safe one.
+With a multiplexer these are different operations and the vocabulary must not blur them. `close_pane` / `close_tab` / `close_window` end a CLIENT when mux-backed (so the multiplexer session keeps running), whereas on a plain shell they exit that shell. `end_session` runs the multiplexer's kill command and stops everything inside it, on every device. Menu labels reflect the actual backing: attached tabs, panes, and windows show `"Close Tab (session keeps running)"` / `"Close Pane (session keeps running)"` / `"Close Window (sessions keep running)"`, while plain shells show plain `"Close Tab"` / `"Close Pane"` / `"Close Window"`, and End Session sits in its own menu section behind a confirmation whose default button is the safe one.
 
 `ListSessions { unattached_only }` is a VIEW for deliberate pruning, not a cleanup. The picker marks a live tmux session with no clients as "no clients" so an orphan is distinguishable from an attached one; zellij reports no count, so it is not guessed at.
 

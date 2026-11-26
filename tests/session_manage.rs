@@ -555,3 +555,87 @@ fn ipc_rename_and_end_session_propagate_exit_errors_and_wait_for_completion() {
     let _ = server.join();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn collision_in_new_or_rename_session_surfaces_notice_and_local_exists_detects() {
+    let Some(tmux) = find_tmux() else {
+        eprintln!("skipping: tmux not installed");
+        return;
+    };
+    let env = Env::new("collision-ui", tmux, "tmux");
+    assert!(
+        env.tmux(&["new-session", "-d", "-s", "esp138d"])
+            .status
+            .success()
+    );
+    assert!(
+        env.tmux(&["new-session", "-d", "-s", "fresh-tab"])
+            .status
+            .success()
+    );
+
+    let ctrl = env.controller();
+    let (_win_id, _plain_tab, _plain_pane) = ctrl.create_window(None).expect("window");
+
+    // 1. Even before any background discovery pass populates `session_cache`,
+    //    `local_session_exists` detects the pre-existing `"esp138d"` session so
+    //    the GUI `New Session` dialog can offer `Open Existing Session`.
+    assert!(ctrl.local_session_exists(MuxKind::Tmux, "esp138d"));
+    assert!(!ctrl.local_session_exists(MuxKind::Tmux, "brand-new"));
+
+    // 2. Attach a live tab to `"fresh-tab"`, then attempt a GUI-style
+    //    `rename_session(..., "esp138d")` -> fails on duplicate name and
+    //    surfaces the error notice on `fresh_pane` instead of failing silently.
+    let (_w, _t, fresh_pane) = ctrl
+        .open_session(
+            MuxKind::Tmux,
+            "fresh-tab",
+            None,
+            SessionMode::Tab,
+            None,
+            None,
+        )
+        .expect("open fresh-tab");
+    pump(&ctrl, 800);
+
+    ctrl.rename_session(MuxKind::Tmux, "fresh-tab", "esp138d", None)
+        .expect("launch rename");
+    pump(&ctrl, 1200);
+    {
+        let ws = ctrl.workspace.borrow();
+        let eng = ws.pane(fresh_pane).expect("fresh_pane");
+        assert_eq!(eng.mux_session().unwrap().name, "fresh-tab");
+        let notice = eng
+            .agent_notice()
+            .expect("rename collision must surface a pane notice");
+        assert!(
+            notice.contains("rename") && notice.contains("esp138d"),
+            "unexpected rename notice: {notice}"
+        );
+    }
+    ctrl.clear_pane_notice(fresh_pane);
+
+    // 3. Direct programmatic `new_session` collision on `"esp138d"` closes the
+    //    exited client AND surfaces an error notice on the surviving active pane.
+    ctrl.new_session(
+        Some(MuxKind::Tmux),
+        Some("esp138d".into()),
+        SessionMode::Tab,
+        None,
+    )
+    .expect("launch colliding new_session");
+    pump(&ctrl, 1200);
+    {
+        let ws = ctrl.workspace.borrow();
+        let eng = ws.pane(fresh_pane).expect("surviving active pane");
+        let notice = eng
+            .agent_notice()
+            .expect("failed mux create must surface a pane notice");
+        assert!(
+            notice.contains("esp138d") && notice.contains("exited"),
+            "unexpected mux exit notice: {notice}"
+        );
+    }
+
+    ctrl.shutdown_ipc();
+}

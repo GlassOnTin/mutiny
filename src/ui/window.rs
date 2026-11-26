@@ -7,7 +7,9 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use crate::action::{ACTIONS, ActionId, build_menubar_model, filter_palette};
+use crate::action::{
+    ACTIONS, ActionId, build_window_menubar_model, filter_palette, sync_close_menu_sections,
+};
 use crate::app::{AppController, ConsentResolution};
 use crate::engine::AttentionReason;
 use crate::mux::{HostState, MuxInventory, MuxKind, SessionMode};
@@ -23,6 +25,9 @@ struct MutinyWindowInner {
     window_id: WindowId,
     gtk_window: gtk4::ApplicationWindow,
     menubar: gtk4::PopoverMenuBar,
+    session_close_menu: gio::Menu,
+    pane_close_menu: gio::Menu,
+    last_close_menu_state: Cell<Option<(bool, bool, bool)>>,
     /// A FlowBox, not a horizontal Box: a Box's minimum width is the sum of
     /// its children, so enough tabs stretched the whole window. A FlowBox's
     /// minimum is its widest child, so it wraps within the window instead.
@@ -93,7 +98,8 @@ impl MutinyWindow {
             .handle_menubar_accel(false)
             .build();
 
-        let (menu_model, sessions_menu) = build_menubar_model();
+        let (menu_model, sessions_menu, session_close_menu, pane_close_menu) =
+            build_window_menubar_model();
         let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
         controller.register_window_sessions_menu(window_id, sessions_menu);
 
@@ -363,6 +369,9 @@ impl MutinyWindow {
                 window_id,
                 gtk_window: gtk_window.clone(),
                 menubar,
+                session_close_menu,
+                pane_close_menu,
+                last_close_menu_state: Cell::new(Some((false, false, false))),
                 tab_buttons_box,
                 tab_scroller,
                 toolbar_box,
@@ -1170,16 +1179,12 @@ impl MutinyWindow {
             // Right-click opens a per-tab menu. The tab DragSource is
             // primary-button only, so a secondary GestureClick does not fight
             // it, and connect_clicked fires on primary release only.
-            let attached = ctrl
-                .workspace
-                .borrow()
-                .pane(first_pane)
-                .is_some_and(|e| e.mux_session().is_some());
             let click = gtk4::GestureClick::new();
             click.set_button(gdk::BUTTON_SECONDARY);
             let ctrl_menu = Rc::downgrade(&ctrl);
             let menu = self.inner.tab_menu.clone();
             let win_for_menu = self.inner.gtk_window.clone();
+            let win_id_for_menu = self.inner.window_id;
             let btn_for_menu = btn.clone();
             click.connect_pressed(move |_, _, x, y| {
                 let Some(c) = ctrl_menu.upgrade() else {
@@ -1188,6 +1193,16 @@ impl MutinyWindow {
                 // Focus the tab first, so the parameterless New Session action
                 // and any active-pane verb target the tab that was clicked.
                 let _ = c.workspace.borrow_mut().focus_pane(first_pane);
+                let tab_leaves = c
+                    .workspace
+                    .borrow()
+                    .window(win_id_for_menu)
+                    .and_then(|w| w.tabs.iter().find(|t| t.id == tid))
+                    .map(|t| t.root.leaves())
+                    .unwrap_or_else(|| vec![first_pane]);
+                let attached = tab_leaves
+                    .into_iter()
+                    .any(|pid| c.detect_pane_mux_backing(pid).ok().flatten().is_some());
                 let model = crate::action::build_tab_menu_model(attached, tid.0);
                 menu.set_menu_model(Some(&model));
                 // The gesture gives button-relative coordinates; the popover is
@@ -1272,6 +1287,41 @@ impl MutinyWindow {
     }
 
     fn sync_banners(&self, ctrl: &Rc<AppController>) {
+        let close_state = {
+            let ws = ctrl.workspace.borrow();
+            if let Some(wm) = ws.window(self.inner.window_id) {
+                let pane_attached = wm
+                    .active_pane()
+                    .and_then(|pid| ws.pane(pid))
+                    .is_some_and(|e| e.mux_session().is_some());
+                let tab_attached = wm.active_tab_ref().is_some_and(|t| {
+                    t.root
+                        .leaves()
+                        .into_iter()
+                        .any(|pid| ws.pane(pid).is_some_and(|e| e.mux_session().is_some()))
+                });
+                let window_has_mux = wm.tabs.iter().any(|t| {
+                    t.root
+                        .leaves()
+                        .into_iter()
+                        .any(|pid| ws.pane(pid).is_some_and(|e| e.mux_session().is_some()))
+                });
+                (tab_attached, window_has_mux, pane_attached)
+            } else {
+                (false, false, false)
+            }
+        };
+        if self.inner.last_close_menu_state.get() != Some(close_state) {
+            self.inner.last_close_menu_state.set(Some(close_state));
+            sync_close_menu_sections(
+                &self.inner.session_close_menu,
+                &self.inner.pane_close_menu,
+                close_state.0,
+                close_state.1,
+                close_state.2,
+            );
+        }
+
         if let Some((pill_label, pill_tip)) = ctrl.limb_pill_summary() {
             self.inner.limb_pill_btn.set_label(&pill_label);
             self.inner.limb_pill_btn.set_tooltip_text(Some(&pill_tip));
@@ -1568,12 +1618,15 @@ impl MutinyWindow {
         let old = session.name.clone();
         let prompt = format!("New name for {} session:", session.kind.label());
         let ctrl_ok = Rc::downgrade(&ctrl);
+        let win_id = self.inner.window_id;
         let initial = old.clone();
         self.name_prompt("Rename Session", &prompt, &initial, None, move |new| {
             if let Some(c) = ctrl_ok.upgrade()
                 && let Err(err) = c.rename_session(session.kind, &old, new, session.host.as_deref())
             {
-                eprintln!("failed to rename session: {err}");
+                let msg = format!("failed to rename session: {err}");
+                eprintln!("{msg}");
+                c.surface_window_notice(Some(win_id), msg);
             }
         });
     }
@@ -1684,6 +1737,7 @@ impl MutinyWindow {
         extra.append(&in_window);
 
         let ctrl_ok = Rc::downgrade(&ctrl);
+        let win_self = self.clone();
         let win_id = self.inner.window_id;
         self.name_prompt(
             "New Session",
@@ -1703,13 +1757,93 @@ impl MutinyWindow {
                 } else {
                     SessionMode::Tab
                 };
-                if let Some(c) = ctrl_ok.upgrade()
-                    && let Err(err) = c.new_session(kind, Some(name.to_owned()), mode, Some(win_id))
+                let Some(c) = ctrl_ok.upgrade() else {
+                    return;
+                };
+                let trimmed = name.trim();
+                if let Some(mux_kind) = kind
+                    && !trimmed.is_empty()
+                    && c.local_session_exists(mux_kind, trimmed)
                 {
-                    eprintln!("failed to create session: {err}");
+                    win_self.show_existing_session_prompt(mux_kind, trimmed.to_owned(), mode);
+                    return;
+                }
+                if let Err(err) = c.new_session(kind, Some(name.to_owned()), mode, Some(win_id)) {
+                    let msg = format!("failed to create session: {err}");
+                    eprintln!("{msg}");
+                    c.surface_window_notice(Some(win_id), msg);
                 }
             },
         );
+    }
+
+    /// Offered when `New Session` names a local multiplexer session that is
+    /// already running: never attaches behind the operator's back, and avoids
+    /// spawning a `tmux new-session` pane that exits in milliseconds with a
+    /// duplicate-session error.
+    fn show_existing_session_prompt(&self, kind: MuxKind, name: String, mode: SessionMode) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("Session Already Exists")
+            .default_width(440)
+            .build();
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        vbox.set_margin_top(14);
+        vbox.set_margin_bottom(14);
+        vbox.set_margin_start(14);
+        vbox.set_margin_end(14);
+        let heading = gtk4::Label::new(None);
+        heading.set_markup(&format!(
+            "<b>{} session \"{}\" already exists</b>",
+            kind.label(),
+            glib::markup_escape_text(&name)
+        ));
+        heading.set_xalign(0.0);
+        vbox.append(&heading);
+        let body = gtk4::Label::new(Some(&format!(
+            "A {} session named \"{name}\" is already running on this machine. \
+             Open the existing session instead?",
+            kind.label()
+        )));
+        body.set_xalign(0.0);
+        body.set_wrap(true);
+        vbox.append(&body);
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let open_existing = gtk4::Button::with_label("Open Existing Session");
+        open_existing.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&open_existing);
+        vbox.append(&buttons);
+        dialog.set_child(Some(&vbox));
+        dialog.set_default_widget(Some(&open_existing));
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| dialog.close());
+        }
+        {
+            let dialog = dialog.clone();
+            let ctrl = Rc::downgrade(&ctrl);
+            let win_id = self.inner.window_id;
+            open_existing.connect_clicked(move |_| {
+                dialog.close();
+                if let Some(c) = ctrl.upgrade()
+                    && let Err(err) = c.open_session(kind, &name, None, mode, Some(win_id), None)
+                {
+                    let msg = format!("failed to open session: {err}");
+                    eprintln!("{msg}");
+                    c.surface_window_notice(Some(win_id), msg);
+                }
+            });
+        }
+        attach_escape_to_close(&dialog);
+        dialog.present();
     }
 
     /// Settings: every key in the config store, grouped by its TOML table.

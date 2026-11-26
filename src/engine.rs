@@ -1312,7 +1312,11 @@ impl PaneEngine {
                     out.push(EngineNotification::Bell);
                 }
                 Event::ChildExit(status) => {
-                    out.push(EngineNotification::ChildExited(status.code()));
+                    let code = status.code();
+                    if self.last_child_exit_code.is_none() {
+                        self.last_child_exit_code = code;
+                    }
+                    out.push(EngineNotification::ChildExited(code));
                 }
                 _ => {}
             }

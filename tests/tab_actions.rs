@@ -169,6 +169,24 @@ esac
     menu.popdown();
     settle(&ctrl, 6);
 
+    // And a plain shell tab must render plain "Close Tab", never claiming a
+    // session keeps running.
+    let plain_model = mutiny::action::build_tab_menu_model(false, t_plain.0);
+    menu.set_menu_model(Some(&plain_model));
+    menu.popup();
+    settle(&ctrl, 12);
+    let plain_rendered = rendered_menu_items(&menu);
+    assert!(
+        plain_rendered.iter().any(|r| r == "Close Tab"),
+        "plain tab must render Close Tab, got {plain_rendered:?}"
+    );
+    assert!(
+        !plain_rendered.iter().any(|r| r.contains("keeps running")),
+        "plain tab must not claim a session keeps running, got {plain_rendered:?}"
+    );
+    menu.popdown();
+    settle(&ctrl, 6);
+
     // Rename on an attached tab must open a dialog window.
     let before = gtk4::Window::toplevels().n_items();
     gtk4::prelude::WidgetExt::activate_action(

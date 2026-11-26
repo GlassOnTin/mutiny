@@ -234,7 +234,14 @@ fn tab_menu_separates_closing_a_view_from_ending_a_session() {
         !plain.iter().any(|l| l.contains("End Session")),
         "a plain tab has no session to end: {plain:?}"
     );
-    assert!(plain.iter().any(|l| l.starts_with("Close Tab")));
+    assert!(
+        plain.iter().any(|l| l == "Close Tab"),
+        "a plain shell tab must say Close Tab, not claim a session keeps running: {plain:?}"
+    );
+    assert!(
+        !plain.iter().any(|l| l.contains("keeps running")),
+        "a plain shell tab must not claim a session keeps running: {plain:?}"
+    );
 }
 
 /// A parameterised action needs its target ON THE MENU ITEM. Without it GTK

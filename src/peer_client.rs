@@ -35,6 +35,7 @@ pub const PAIRING_READ_TIMEOUT: Duration = Duration::from_secs(65);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_INTERACTIVE_RPCS: usize = 4;
 const DEFAULT_TOTP_ROLLOVER_SLEEP: Duration = Duration::from_millis(2500);
+pub const LOOPBACK_AUTO_TRUST_TOKEN: &str = "loopback-auto-trust";
 
 #[derive(Debug, Clone)]
 pub struct PeerPollConfig {
@@ -498,7 +499,10 @@ pub fn http_post_json(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: application/json\r\n",
         parsed.path, parsed.host_header
     );
-    if let Some(tok) = bearer_token {
+    if let Some(tok) = bearer_token
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != LOOPBACK_AUTO_TRUST_TOKEN)
+    {
         req_head.push_str(&format!("Authorization: Bearer {tok}\r\n"));
     }
     req_head.push_str(&format!(
@@ -2081,18 +2085,50 @@ fn run_pair_outbound(
 
     let token = match explicit_token {
         Some(t) if !t.trim().is_empty() => t.trim().to_owned(),
-        _ => result
+        _ => match result
             .get("_meta")
             .and_then(|m| m.get("sh.haven/pairingToken"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                String::from(
-                    "peer completed `initialize` without issuing `_meta[\"sh.haven/pairingToken\"]`; supply `--token` or enable tap-to-pair on Haven",
+        {
+            Some(minted) => minted.to_owned(),
+            None => {
+                // Haven's `DEVICE` loopback binder (`127.0.0.1:8730`, e.g. over
+                // `adb forward` with `trustLoopbackEnabled == true`) completes
+                // `initialize` without minting a pairing token and permits
+                // unauthenticated `tools/call` on that loopback socket. Verify
+                // with `get_app_info` before accepting loopback auto-trust.
+                let auto_trusted = jsonrpc_call(
+                    clean_url,
+                    None,
+                    rpc_id.wrapping_add(1),
+                    "tools/call",
+                    json!({ "name": "get_app_info", "arguments": {} }),
+                    NORMAL_READ_TIMEOUT,
+                    allow_lan,
                 )
-            })?,
+                .ok()
+                .and_then(|val| {
+                    let is_err = val.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                    (!is_err)
+                        .then(|| extract_mcp_tool_json(&val).ok())
+                        .flatten()
+                })
+                .is_some_and(|info| {
+                    info.get("app").is_some()
+                        || info.get("version").is_some()
+                        || info.get("versionName").is_some()
+                });
+                if auto_trusted {
+                    String::from(LOOPBACK_AUTO_TRUST_TOKEN)
+                } else {
+                    return Err(String::from(
+                        "peer completed `initialize` without issuing `_meta[\"sh.haven/pairingToken\"]`; supply `--token` or enable tap-to-pair on Haven",
+                    ));
+                }
+            }
+        },
     };
 
     let remote_version = result
@@ -2834,15 +2870,21 @@ fn resolve_haven_ssh_profile(
     }
 
     let target_host = mux_host.map(strip_ssh_user).unwrap_or(local_host);
-    if !target_host.is_empty()
-        && let Some(found) = ssh_conns.iter().find(|c| {
+    if !target_host.is_empty() {
+        // Pass 1: exact host or profile label match (for example `"msi-z790"`),
+        // or FQDN short-hostname prefix (`"msi-z790.lan"`). Must run before any
+        // fallback so a phone-local USB/loopback SSH profile (`127.0.0.1`)
+        // listed earlier in `list_connections` never steals the workstation match.
+        if let Some(found) = ssh_conns.iter().find(|c| {
             c.host.eq_ignore_ascii_case(target_host)
                 || c.label.eq_ignore_ascii_case(target_host)
-                || (mux_host.is_none()
-                    && (c.host.eq_ignore_ascii_case("localhost") || c.host == "127.0.0.1"))
-        })
-    {
-        return Some(found.id.clone());
+                || c.host
+                    .split('.')
+                    .next()
+                    .is_some_and(|stem| !stem.is_empty() && stem.eq_ignore_ascii_case(target_host))
+        }) {
+            return Some(found.id.clone());
+        }
     }
 
     if mux_host.is_none() && ssh_conns.len() == 1 {
@@ -3224,5 +3266,148 @@ mod tests {
             classify_present_target(None, Some(Path::new("relative.png")), None, None, None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn resolve_haven_ssh_profile_prefers_hostname_label_over_phone_loopback_usb_profiles() {
+        let conns = vec![
+            HavenConnectionCandidate {
+                id: String::from("usb-pluto"),
+                label: String::from("USB: PlutoSDR (ADALM-PLUTO)"),
+                host: String::from("127.0.0.1"),
+                conn_type: String::from("SSH"),
+            },
+            HavenConnectionCandidate {
+                id: String::from("prof-workstation"),
+                label: String::from("msi-z790"),
+                host: String::from("192.168.0.180"),
+                conn_type: String::from("SSH"),
+            },
+        ];
+        assert_eq!(
+            resolve_haven_ssh_profile(&conns, None, None, "msi-z790").as_deref(),
+            Some("prof-workstation")
+        );
+    }
+
+    #[test]
+    fn run_pair_outbound_accepts_verified_device_loopback_auto_trust_and_fails_closed_otherwise() {
+        use std::net::TcpListener;
+
+        fn spawn_one_shot_mcp(app_info_authorized: bool) -> (String, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = thread::spawn(move || {
+                // Expect 2 requests: `initialize` (no pairingToken) then `tools/call` `get_app_info`.
+                for _ in 0..2 {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let mut raw = Vec::with_capacity(1024);
+                    let mut tmp = [0u8; 512];
+                    loop {
+                        let n = stream.read(&mut tmp).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let hdr = String::from_utf8_lossy(&raw[..pos]);
+                            let cl = hdr
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= pos + 4 + cl {
+                                break;
+                            }
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw);
+                    assert!(
+                        !req.to_ascii_lowercase().contains("authorization:"),
+                        "loopback auto-trust probe must omit Authorization header: {req}"
+                    );
+                    let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let parsed: Value =
+                        serde_json::from_str(body_str).unwrap_or_else(|_| json!({}));
+                    let id = parsed.get("id").cloned().unwrap_or(json!(1));
+                    let method = parsed
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let (status_line, resp_json) = if method == "initialize" {
+                        (
+                            "HTTP/1.1 200 OK",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "protocolVersion": "2025-03-26",
+                                    "capabilities": { "tools": {} },
+                                    "serverInfo": { "name": "haven", "version": "5.94.72" }
+                                }
+                            }),
+                        )
+                    } else if app_info_authorized {
+                        (
+                            "HTTP/1.1 200 OK",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{
+                                        "type": "text",
+                                        "text": "{\"app\":\"Haven\",\"versionName\":\"5.94.72\"}"
+                                    }],
+                                    "isError": false
+                                }
+                            }),
+                        )
+                    } else {
+                        (
+                            "HTTP/1.1 401 Unauthorized",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32001, "message": "Pairing required" }
+                            }),
+                        )
+                    };
+                    let bytes = serde_json::to_vec(&resp_json).unwrap();
+                    let http = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(http.as_bytes());
+                    let _ = stream.write_all(&bytes);
+                }
+            });
+            (format!("http://{addr}/mcp"), handle)
+        }
+
+        let (trusted_url, j1) = spawn_one_shot_mcp(true);
+        let (peer, status) =
+            run_pair_outbound(1, "pixel-adb", &trusted_url, None, false, false).unwrap();
+        j1.join().unwrap();
+        assert_eq!(peer.bearer_token, LOOPBACK_AUTO_TRUST_TOKEN);
+        assert!(matches!(
+            status,
+            OutboundLimbStatus::Connected {
+                ref remote_version,
+                ..
+            } if remote_version.as_deref() == Some("5.94.72")
+        ));
+
+        let (untrusted_url, j2) = spawn_one_shot_mcp(false);
+        let err = run_pair_outbound(10, "pixel-untrusted", &untrusted_url, None, false, false)
+            .expect_err("server rejecting unauthenticated get_app_info must fail closed");
+        j2.join().unwrap();
+        assert!(err.contains("pairingToken"));
     }
 }

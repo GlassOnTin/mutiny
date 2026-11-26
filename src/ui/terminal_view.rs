@@ -13,7 +13,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 
-use crate::action::build_context_menu_model;
+use crate::action::{build_context_menu_model, build_context_menu_model_for_pane};
 use crate::app::AppController;
 use crate::config::ResolvedConfig;
 use crate::engine::{GridSize, KeyInput, KeyKind};
@@ -465,10 +465,13 @@ impl TerminalView {
                 return;
             };
             view.grab_focus();
+            let mut attached = false;
             if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
                 let _ = ctrl.workspace.borrow_mut().focus_pane(pid);
+                attached = ctrl.detect_pane_mux_backing(pid).ok().flatten().is_some();
             }
             if let Some(popover) = view.imp().context_popover.borrow().as_ref() {
+                popover.set_menu_model(Some(&build_context_menu_model_for_pane(attached)));
                 popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
                 popover.popup();
             }

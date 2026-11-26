@@ -175,13 +175,13 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::ClosePane,
         slug: "close-pane",
-        title: "Close Pane (session keeps running)",
+        title: "Close Pane",
         category: MenuCategory::Pane,
         consent_tier: ConsentTier::Act,
         default_accel: Some("<Control><Shift>w"),
         human_chord: "Ctrl+Shift+W",
         in_context_menu: true,
-        summary: "Close focused split pane or tab",
+        summary: "Close focused split pane or tab; attached multiplexer sessions keep running, plain shells exit",
     },
     ActionSpec {
         id: ActionId::Copy,
@@ -362,24 +362,24 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: ActionId::CloseTab,
         slug: "close-tab",
-        title: "Close Tab (session keeps running)",
+        title: "Close Tab",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: None,
         human_chord: "",
         in_context_menu: false,
-        summary: "Close the active tab; a multiplexer session keeps running, only its client ends",
+        summary: "Close the active tab; attached multiplexer sessions keep running, plain shells exit",
     },
     ActionSpec {
         id: ActionId::CloseWindow,
         slug: "close-window",
-        title: "Close Window (sessions keep running)",
+        title: "Close Window",
         category: MenuCategory::Session,
         consent_tier: ConsentTier::Act,
         default_accel: None,
         human_chord: "",
         in_context_menu: false,
-        summary: "Close the active window and every pane in it",
+        summary: "Close the active window; attached multiplexer sessions keep running, plain shells exit",
     },
     ActionSpec {
         id: ActionId::NewSession,
@@ -529,25 +529,95 @@ pub fn filter_palette(query: &str) -> Vec<&'static ActionSpec> {
 /// so the controller can fill in discovered sessions without rebuilding the
 /// whole bar.
 pub fn build_menubar_model() -> (gio::Menu, gio::Menu) {
+    let (root, sessions, _, _) = build_window_menubar_model();
+    (root, sessions)
+}
+
+/// Builds a window's menu bar along with its live-updated submenus/sections:
+/// `(root, sessions_submenu, session_close_section, pane_close_section)`.
+/// Close labels show `(session keeps running)` only when the active tab, pane,
+/// or window actually holds a multiplexer session, never on plain shells.
+pub fn build_window_menubar_model() -> (gio::Menu, gio::Menu, gio::Menu, gio::Menu) {
     let root = gio::Menu::new();
     let sessions = gio::Menu::new();
+    let session_close = gio::Menu::new();
+    let pane_close = gio::Menu::new();
+    sync_close_menu_sections(&session_close, &pane_close, false, false, false);
+
     for &cat in MenuCategory::ORDERED {
         let submenu = gio::Menu::new();
-        for action in ACTIONS
-            .iter()
-            .filter(|a| a.category == cat && a.id != ActionId::SessionPicker)
-        {
-            submenu.append(Some(action.title), Some(&action.gtk_detailed_name()));
-        }
-        if cat == MenuCategory::Session {
-            // The session list is a submenu, not a pop-up: Ian wants to see and
-            // pick a session inline. The full picker stays reachable from here
-            // and from Ctrl+Shift+S.
-            submenu.append_submenu(Some("Open Session"), &sessions);
+        match cat {
+            MenuCategory::Session => {
+                for action in ACTIONS.iter().filter(|a| {
+                    a.category == MenuCategory::Session
+                        && !matches!(
+                            a.id,
+                            ActionId::SessionPicker | ActionId::CloseTab | ActionId::CloseWindow
+                        )
+                }) {
+                    submenu.append(Some(action.title), Some(&action.gtk_detailed_name()));
+                }
+                submenu.append_submenu(Some("Open Session"), &sessions);
+                submenu.append_section(None, &session_close);
+            }
+            MenuCategory::Pane => {
+                let before = gio::Menu::new();
+                let after = gio::Menu::new();
+                let mut seen_close = false;
+                for action in ACTIONS.iter().filter(|a| a.category == MenuCategory::Pane) {
+                    if action.id == ActionId::ClosePane {
+                        seen_close = true;
+                        continue;
+                    }
+                    if !seen_close {
+                        before.append(Some(action.title), Some(&action.gtk_detailed_name()));
+                    } else {
+                        after.append(Some(action.title), Some(&action.gtk_detailed_name()));
+                    }
+                }
+                submenu.append_section(None, &before);
+                submenu.append_section(None, &pane_close);
+                submenu.append_section(None, &after);
+            }
+            _ => {
+                for action in ACTIONS.iter().filter(|a| a.category == cat) {
+                    submenu.append(Some(action.title), Some(&action.gtk_detailed_name()));
+                }
+            }
         }
         root.append_submenu(Some(cat.label()), &submenu);
     }
-    (root, sessions)
+    (root, sessions, session_close, pane_close)
+}
+
+pub fn sync_close_menu_sections(
+    session_close: &gio::Menu,
+    pane_close: &gio::Menu,
+    tab_attached: bool,
+    window_has_mux: bool,
+    pane_attached: bool,
+) {
+    session_close.remove_all();
+    let close_tab_lbl = if tab_attached {
+        "Close Tab (session keeps running)"
+    } else {
+        "Close Tab"
+    };
+    let close_win_lbl = if window_has_mux {
+        "Close Window (sessions keep running)"
+    } else {
+        "Close Window"
+    };
+    session_close.append(Some(close_tab_lbl), Some("win.close-tab"));
+    session_close.append(Some(close_win_lbl), Some("win.close-window"));
+
+    pane_close.remove_all();
+    let close_pane_lbl = if pane_attached {
+        "Close Pane (session keeps running)"
+    } else {
+        "Close Pane"
+    };
+    pane_close.append(Some(close_pane_lbl), Some("win.close-pane"));
 }
 
 /// Action name for opening a specific discovered session. Parameterised, so it
@@ -608,15 +678,16 @@ pub fn build_tab_menu_model(attached: bool, tab: u64) -> gio::Menu {
         menu.append_section(None, &identity);
     }
 
-    // Closing a VIEW. The wording says what survives, because with a
-    // multiplexer "close" and "end" are different operations and a tmux user
-    // must not have to guess which one this is.
+    // Closing a VIEW. Attached tabs note that the multiplexer session keeps
+    // running (contrasting with End Session below); plain shell tabs say plain
+    // "Close Tab" because closing the tab exits the shell.
     let views = gio::Menu::new();
-    targeted(
-        &views,
-        "Close Tab (session keeps running)",
-        CLOSE_TAB_TARGET,
-    );
+    let close_label = if attached {
+        "Close Tab (session keeps running)"
+    } else {
+        "Close Tab"
+    };
+    targeted(&views, close_label, CLOSE_TAB_TARGET);
     // Not "Detach": to a tmux user that means detaching a CLIENT, while this
     // moves a pane to another window.
     targeted(&views, "Move to New Window", DETACH_TAB_TARGET);
@@ -663,9 +734,18 @@ pub fn populate_sessions_menu(menu: &gio::Menu, inventory: &crate::mux::MuxInven
 }
 
 pub fn build_context_menu_model() -> gio::Menu {
+    build_context_menu_model_for_pane(false)
+}
+
+pub fn build_context_menu_model_for_pane(attached: bool) -> gio::Menu {
     let menu = gio::Menu::new();
     for action in ACTIONS.iter().filter(|a| a.in_context_menu) {
-        menu.append(Some(action.title), Some(&action.gtk_detailed_name()));
+        let label = if action.id == ActionId::ClosePane && attached {
+            "Close Pane (session keeps running)"
+        } else {
+            action.title
+        };
+        menu.append(Some(label), Some(&action.gtk_detailed_name()));
     }
     menu
 }

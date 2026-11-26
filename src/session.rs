@@ -685,10 +685,16 @@ pub fn build_session_tree(
                 if hs.is_agent_repl {
                     detail_parts.push(String::from("[agent]"));
                 }
+                let base_name = match &hs.chosen_session_name {
+                    Some(chosen) if !chosen.eq_ignore_ascii_case(&hs.label) => {
+                        format!("{} ({chosen})", hs.label)
+                    }
+                    _ => hs.label.clone(),
+                };
                 let display_name = if hs.is_agent_repl {
-                    format!("{} [agent]", hs.label)
+                    format!("{base_name} [agent]")
                 } else {
-                    hs.label.clone()
+                    base_name
                 };
                 let subtitle = match &hs.chosen_session_name {
                     Some(chosen) => format!("haven:{} · {transport_lc} ({chosen})", out.label),
