@@ -199,6 +199,7 @@ pub struct AppController {
     next_pair_req_id: Cell<u64>,
     consent_replay_cache: RefCell<crypto::GrantReplayCache>,
     haven_auth_prompts: RefCell<HashMap<String, (String, HavenAuthPrompt)>>,
+    in_flight_auth_answers: RefCell<HashSet<String>>,
     dismissed_auth_prompts: RefCell<HashSet<(String, String)>>,
     remote_consent_prompts: RefCell<HashMap<String, String>>,
     outbound_rate_limiters: RefCell<HashMap<String, TokenBucket>>,
@@ -353,6 +354,7 @@ impl AppController {
             next_pair_req_id: Cell::new(1),
             consent_replay_cache: RefCell::new(crypto::GrantReplayCache::default()),
             haven_auth_prompts: RefCell::new(HashMap::new()),
+            in_flight_auth_answers: RefCell::new(HashSet::new()),
             dismissed_auth_prompts: RefCell::new(HashSet::new()),
             remote_consent_prompts: RefCell::new(HashMap::new()),
             outbound_rate_limiters: RefCell::new(HashMap::new()),
@@ -1450,6 +1452,7 @@ impl AppController {
             self.peer_shade_statuses.borrow_mut().remove(out_id);
             self.remote_consent_prompts.borrow_mut().remove(out_id);
             self.haven_auth_prompts.borrow_mut().remove(out_id);
+            self.in_flight_auth_answers.borrow_mut().remove(out_id);
             self.dismissed_auth_prompts
                 .borrow_mut()
                 .retain(|(pid, _)| pid != out_id);
@@ -1699,12 +1702,18 @@ impl AppController {
             .borrow_mut()
             .remove(&(peer_id.to_owned(), profile_id.to_owned()));
         self.mark_peer_alerts_read_by_kind(peer_id, PeerAlertKind::AuthPrompt);
+        self.in_flight_auth_answers
+            .borrow_mut()
+            .insert(peer_id.to_owned());
         let res = match self.peer_client.borrow().as_ref() {
             Some(client) => {
                 client.answer_auth_prompt(peer_id.to_owned(), password, remember_password)
             }
             None => Err(String::from("no outbound Haven peer client active")),
         };
+        if res.is_err() {
+            self.in_flight_auth_answers.borrow_mut().remove(peer_id);
+        }
         self.refresh_all_window_chromes();
         res
     }
@@ -5153,18 +5162,69 @@ impl AppController {
                     peer_id,
                     peer_label,
                     prompt,
-                } => match prompt {
-                    Some(p) => {
-                        let changed = {
-                            let mut map = self.haven_auth_prompts.borrow_mut();
-                            let c = map
-                                .get(&peer_id)
-                                .map(|(lbl, old)| lbl != &peer_label || old != &p)
-                                .unwrap_or(true);
-                            map.insert(peer_id.clone(), (peer_label.clone(), p.clone()));
-                            c
-                        };
-                        if changed {
+                } => {
+                    if self.in_flight_auth_answers.borrow().contains(&peer_id) {
+                        // Suppress stale pre-submit liveness polls until the
+                        // in-flight `answer_auth_prompt` call finishes.
+                        continue;
+                    }
+                    match prompt {
+                        Some(p) => {
+                            let changed = {
+                                let mut map = self.haven_auth_prompts.borrow_mut();
+                                let c = map
+                                    .get(&peer_id)
+                                    .map(|(lbl, old)| lbl != &peer_label || old != &p)
+                                    .unwrap_or(true);
+                                map.insert(peer_id.clone(), (peer_label.clone(), p.clone()));
+                                c
+                            };
+                            if changed {
+                                self.mark_peer_alerts_read_by_kind(
+                                    &peer_id,
+                                    PeerAlertKind::AuthPrompt,
+                                );
+                                self.push_peer_alert(
+                                    peer_id,
+                                    peer_label.clone(),
+                                    PeerAlertKind::AuthPrompt,
+                                    None,
+                                    format!("SSH auth needed on '{peer_label}'"),
+                                    format!("Profile '{}' awaits credentials", p.label),
+                                    now_ms(),
+                                    true,
+                                );
+                                refresh_ui = true;
+                            }
+                        }
+                        None => {
+                            let removed = self
+                                .haven_auth_prompts
+                                .borrow_mut()
+                                .remove(&peer_id)
+                                .is_some();
+                            let cleared = self
+                                .mark_peer_alerts_read_by_kind(&peer_id, PeerAlertKind::AuthPrompt);
+                            if removed || cleared {
+                                refresh_ui = true;
+                            }
+                            self.dismissed_auth_prompts
+                                .borrow_mut()
+                                .retain(|(pid, _)| pid != &peer_id);
+                        }
+                    }
+                }
+                PeerClientEvent::AuthAnswerCompleted {
+                    peer_id,
+                    peer_label,
+                    prompt,
+                } => {
+                    self.in_flight_auth_answers.borrow_mut().remove(&peer_id);
+                    match prompt {
+                        Some(p) => {
+                            self.haven_auth_prompts
+                                .borrow_mut()
+                                .insert(peer_id.clone(), (peer_label.clone(), p.clone()));
                             self.mark_peer_alerts_read_by_kind(&peer_id, PeerAlertKind::AuthPrompt);
                             self.push_peer_alert(
                                 peer_id,
@@ -5178,23 +5238,22 @@ impl AppController {
                             );
                             refresh_ui = true;
                         }
-                    }
-                    None => {
-                        let removed = self
-                            .haven_auth_prompts
-                            .borrow_mut()
-                            .remove(&peer_id)
-                            .is_some();
-                        let cleared =
+                        None => {
+                            if self
+                                .haven_auth_prompts
+                                .borrow_mut()
+                                .remove(&peer_id)
+                                .is_some()
+                            {
+                                refresh_ui = true;
+                            }
                             self.mark_peer_alerts_read_by_kind(&peer_id, PeerAlertKind::AuthPrompt);
-                        if removed || cleared {
-                            refresh_ui = true;
+                            self.dismissed_auth_prompts
+                                .borrow_mut()
+                                .retain(|(pid, _)| pid != &peer_id);
                         }
-                        self.dismissed_auth_prompts
-                            .borrow_mut()
-                            .retain(|(pid, _)| pid != &peer_id);
                     }
-                },
+                }
                 PeerClientEvent::RemoteConsentPromptChanged {
                     peer_id,
                     peer_label,

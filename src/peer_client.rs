@@ -668,6 +668,11 @@ pub enum PeerClientEvent {
         peer_label: String,
         prompt: Option<HavenAuthPrompt>,
     },
+    AuthAnswerCompleted {
+        peer_id: String,
+        peer_label: String,
+        prompt: Option<HavenAuthPrompt>,
+    },
     RemoteConsentPromptChanged {
         peer_id: String,
         peer_label: String,
@@ -1237,7 +1242,27 @@ fn worker_loop(
                         }),
                         cfg.allow_lan,
                     );
-                    entry.next_poll = Instant::now();
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    let post_prompt = poll_pending_auth_prompt(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        cfg.allow_lan,
+                    )
+                    .ok()
+                    .flatten();
+                    let _ = evt_tx.try_send(PeerClientEvent::AuthAnswerCompleted {
+                        peer_id: entry.peer.id.clone(),
+                        peer_label: entry.peer.label.clone(),
+                        prompt: post_prompt,
+                    });
+                    entry.next_poll = Instant::now() + cfg.connected_interval;
+                } else {
+                    let _ = evt_tx.try_send(PeerClientEvent::AuthAnswerCompleted {
+                        peer_id,
+                        peer_label: String::new(),
+                        prompt: None,
+                    });
                 }
             }
             Ok(PeerClientCommand::ListTotpSecrets {
