@@ -75,7 +75,11 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::AwaitTurn { .. } => Some(McpSurface::Tool("await_turn")),
         IpcRequest::PresentMedia { .. } => Some(McpSurface::Tool("present_media")),
         IpcRequest::ListSessions { .. } => Some(McpSurface::Tool("list_sessions")),
+        IpcRequest::SessionTree { .. } => Some(McpSurface::Tool("session_tree")),
         IpcRequest::OpenSession { .. } => Some(McpSurface::Tool("open_session")),
+        IpcRequest::OpenSessionGrid { .. } => Some(McpSurface::Tool("open_session_grid")),
+        IpcRequest::HandoffToPeer { .. } => Some(McpSurface::Tool("handoff_to_peer")),
+        IpcRequest::PresentToPeer { .. } => Some(McpSurface::Tool("present_to_peer")),
         IpcRequest::SaveSession => Some(McpSurface::Tool("save_session")),
         IpcRequest::ToggleQuick => Some(McpSurface::Tool("toggle_quick")),
         IpcRequest::NewSession { .. } => Some(McpSurface::Tool("new_session")),
@@ -831,6 +835,75 @@ impl McpBridge {
                     timeout,
                 )
             }
+            "session_tree" => (
+                IpcRequest::SessionTree {
+                    refresh: args
+                        .get("refresh")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                },
+                Duration::from_secs(15),
+            ),
+            "open_session_grid" => {
+                let sessions = args
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let kind = match args.get("kind").and_then(Value::as_str) {
+                    None => None,
+                    Some("tmux") => Some(crate::mux::MuxKind::Tmux),
+                    Some("zellij") => Some(crate::mux::MuxKind::Zellij),
+                    Some(other) => {
+                        return Err((-32602, format!("unknown kind {other:?}: tmux or zellij")));
+                    }
+                };
+                (
+                    IpcRequest::OpenSessionGrid {
+                        sessions,
+                        kind,
+                        host: args.get("host").and_then(Value::as_str).map(str::to_owned),
+                    },
+                    Duration::from_secs(70),
+                )
+            }
+            "handoff_to_peer" => (
+                IpcRequest::HandoffToPeer {
+                    pane: opt_pane("pane"),
+                    peer: args.get("peer").and_then(Value::as_str).map(str::to_owned),
+                    profile_id: args
+                        .get("profile_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+                Duration::from_secs(70),
+            ),
+            "present_to_peer" => (
+                IpcRequest::PresentToPeer {
+                    peer: args.get("peer").and_then(Value::as_str).map(str::to_owned),
+                    url: args.get("url").and_then(Value::as_str).map(str::to_owned),
+                    path: args.get("path").and_then(Value::as_str).map(PathBuf::from),
+                    text: args.get("text").and_then(Value::as_str).map(str::to_owned),
+                    clipboard: args
+                        .get("clipboard")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    profile_id: args
+                        .get("profile_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    caption: args
+                        .get("caption")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+                Duration::from_secs(70),
+            ),
             "open_session" => {
                 let name = args
                     .get("name")
@@ -1333,6 +1406,60 @@ pub fn tool_definitions() -> Value {
         }
     ]) {
         tools.extend(rest);
+    }
+    if let Value::Array(rest2) = json!([
+        {
+            "name": "session_tree",
+            "description": "Tier-1 Observe: hierarchical session tree across Local Sessions (nesting organs under the constellation root when present), SSH Hosts, and Paired Haven Limbs (live phone sessions, [agent] REPL indicators, and active bridges), with active/busy/!attention group rollups.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": { "type": "boolean", "description": "Trigger a fresh local scan and Haven limb inventory refresh before replying." }
+                }
+            }
+        },
+        {
+            "name": "open_session_grid",
+            "description": "Tier-2 Act: open a tiled multi-pane overview window attached to multiple multiplexer sessions (defaults to unattached or live local sessions up to 9 panes).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sessions": { "type": "array", "items": { "type": "string" }, "description": "Explicit session names to tile (up to 9); omit to tile live local sessions." },
+                    "kind": { "type": "string", "enum": ["tmux", "zellij"] },
+                    "host": { "type": "string", "description": "Optional SSH host; omit for local sessions." }
+                }
+            }
+        },
+        {
+            "name": "handoff_to_peer",
+            "description": "Tier-2 Act: hand off a mux-backed pane (tmux/zellij) to a connected Haven limb. Focuses the tab immediately via focus_terminal_session if already connected on Haven, else connects via connect_profile with sessionName. Bare non-mux shells return an honest actionable error.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pane": { "type": "integer", "description": "Target pane id; omit for the active pane." },
+                    "peer": { "type": "string", "description": "Outbound Haven peer id or label; omit for the primary connected limb." },
+                    "profile_id": { "type": "string", "description": "Haven SSH profile id or label; omit to match automatically from list_connections." }
+                }
+            }
+        },
+        {
+            "name": "present_to_peer",
+            "description": "Tier-2 Act: throw media (image/* or audio/* -> present_media), web/HTML/SVG/PDF (http(s) URL or .html/.svg/.pdf path -> present_web), or clipboard text (--text / selection -> write_clipboard) to a connected Haven limb.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "peer": { "type": "string", "description": "Outbound Haven peer id or label; omit for the primary connected limb." },
+                    "url": { "type": "string", "description": "http:// or https:// URL to present on Haven." },
+                    "path": { "type": "string", "description": "Absolute file path (.png/.jpg/.mp3 -> present_media, .html/.svg/.pdf -> present_web)." },
+                    "text": { "type": "string", "description": "Plain text to write to Haven's clipboard." },
+                    "clipboard": { "type": "boolean", "description": "Send the active pane's current selection to Haven's clipboard." },
+                    "profile_id": { "type": "string", "description": "Haven backend profileId for path streaming (defaults to matching workstation SSH profile or 'local')." },
+                    "caption": { "type": "string", "description": "Optional caption shown in Haven's bottom sheet." }
+                }
+            }
+        }
+    ]) {
+        tools.extend(rest2);
     }
     Value::Array(tools)
 }

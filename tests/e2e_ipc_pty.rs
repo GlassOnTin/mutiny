@@ -597,6 +597,10 @@ fn every_advertised_mcp_tool_dispatches() {
             "list_peers" => json!({}),
             "list_peer_alerts" => json!({}),
             "clear_peer_alerts" => json!({}),
+            "session_tree" => json!({}),
+            "open_session_grid" => json!({}),
+            "handoff_to_peer" => json!({"pane": p1.0}),
+            "present_to_peer" => json!({"text": "probe"}),
             "pair_haven" => {
                 json!({"label": "probe", "url": "http://127.0.0.1:1/mcp", "token": "probe"})
             }

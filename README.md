@@ -9,7 +9,7 @@ Wayland-first with X11 support, built for KDE Plasma and GTK desktops. No libadw
 
 ## Status
 
-Early, and honest about it. M0, M0.5, M1, M2 (save for an unscheduled system-wide global shortcut), and M3 (`0.2.0` Paired-Limb cycle: M3.1 bilateral peer pairing, M3.2 mirrored authentication and HMAC-signed cross-limb consent, and M3.3 focus-aware bidirectional notifications) are shipped: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair and durable `peers.json` (`0600`, SHA-256 inbound hashes only), the outbound `HavenPeerClient` with HMAC-SHA256 cross-limb consent co-signing, focus-aware notification mirroring (`CompositeNotifier` + burst-5 `TokenBucket`) and unfocused `OSC 133;D` long-command alerts, the `!haven` Limb Status Pill and Haven Alerts inbox, the inline Haven stalled SSH Auth Bar, Operator-only `insert-peer-totp` (`Ctrl+Shift+Y`), the tmux/zellij session picker, the Settings dialog, Tier-3 standing policies, `PolicyChange` and Tier-4 irreversible per-action gating, and the summonable scratch quick terminal all work today. The engine, pane mobility, peer pairing, cross-limb auth/consent/notifications, and agent surface are covered by 229 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
+Early, and honest about it. M0, M0.5, M1, M2 (save for an unscheduled system-wide global shortcut), and M3 (`0.2.0` Paired-Limb cycle: M3.1 bilateral peer pairing, M3.2 mirrored authentication and HMAC-signed cross-limb consent, M3.3 focus-aware bidirectional notifications, and M3.4 unified constellation + paired-Haven session tree, cross-limb pane handoff, and symmetric media/web/clipboard throw) are shipped: session restore (including re-attaching multiplexer sessions in order), the authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair and durable `peers.json` (`0600`, SHA-256 inbound hashes only), the outbound `HavenPeerClient` with HMAC-SHA256 cross-limb consent co-signing, focus-aware notification mirroring (`CompositeNotifier` + burst-5 `TokenBucket`) and unfocused `OSC 133;D` long-command alerts, the `!haven` Limb Status Pill and Haven Alerts inbox, the inline Haven stalled SSH Auth Bar, Operator-only `insert-peer-totp` (`Ctrl+Shift+Y`), the hierarchical `session-tree` picker (`Ctrl+Shift+S`) and one-click tiled `open-session-grid`, cross-limb `handoff-to-peer` (`Ctrl+Shift+H`), symmetric `present-to-peer` (`present_media`, `present_web`, `write_clipboard`), the Settings dialog, Tier-3 standing policies, `PolicyChange` and Tier-4 irreversible per-action gating, and the summonable scratch quick terminal all work today. The engine, pane mobility, peer pairing, cross-limb auth/consent/notifications/handoff, and agent surface are covered by 237 tests. Most run with no display at all; the GTK widget tests run under Xvfb in CI. GPU compositing to a physical Wayland output is still not exercised by the suite.
 
 Working today:
 
@@ -22,16 +22,16 @@ Working today:
 - Viewport search (`Ctrl+Shift+F`) over visible lines and scrollback, with match navigation. The scan is chunked across ticks so a full-history search never stalls the UI.
 - Linux selection model: primary selection on drag, middle-click paste, separate `Ctrl+Shift+C` / `Ctrl+Shift+V` clipboard, sanitized bracketed paste.
 - Mouse reporting: when a program asks for mouse events (tmux with `mouse on`, vim, less), the wheel and clicks go to it instead of mutiny's scrollback and selection. Hold Shift to override back to local scrollback and selection.
-- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 43 IPC verbs, 39 MCP tools, 28 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
+- One binary serving the GUI, `mutiny ctl`, and `mutiny mcp`. 47 IPC verbs, 43 MCP tools, 31 GUI actions, 4 static MCP resources plus a per-pane snapshot resource, held at parity by tests.
 - Carrier-assigned consent across Tiers 1 through 4 plus `PolicyChange` with kernel-verified peer identity, Tier-3 standing policies, per-action `PolicyChange` (`install-policy`, `revoke-policy`, `pair-haven`, `enroll-haven-signer`, `revoke-peer`) and Tier-4 (`end-session`, `quit`) gating, and a durable redacted audit trail.
-- Bilateral peer pairing, mirrored authentication, and focus-aware bidirectional notifications (`peers.json`, mode `0600`): an authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair (inbound tokens stored only as SHA-256 hashes at rest), an outbound stdlib `HavenPeerClient` over loopback or WireGuard/Yggdrasil tunnels, `list-peers` / `pair-haven` / `enroll-haven-signer` / `revoke-peer` / `list-peer-alerts` / `clear-peer-alerts`, unfocused cross-limb HMAC-SHA256 consent co-signing on Haven across Tiers 2 through 4 (with strict one-shot enforcement on `PolicyChange` and Tier-4 `Irreversible`), an inline GTK4 Haven Auth Bar for stalled phone SSH prompts (physical widget interaction only), `insert-peer-totp` (`Ctrl+Shift+Y`, local Operator/GUI only, typed straight into the PTY without touching the clipboard), focus-aware outbound notification relay (`OSC 777`, local `present-notice`, and unfocused `OSC 133;D` long commands with per-peer burst-5 `TokenBucket` rate limiting and zero scrollback leakage), and a chrome Limb Status Pill (`!haven:<label>` badge + Haven Alerts inbox, with zero unprompted `list_notifications` calls by default and opt-in `inbound_shade_allowlist` polling). See [Remote agents over HTTP](#remote-agents-over-http).
+- Bilateral peer pairing, mirrored authentication, focus-aware bidirectional notifications, and cross-limb session handoff (`peers.json`, mode `0600`): an authenticated HTTP MCP listener with symmetric `initialize` tap-to-pair (inbound tokens stored only as SHA-256 hashes at rest), an outbound stdlib `HavenPeerClient` over loopback or WireGuard/Yggdrasil tunnels, `list-peers` / `pair-haven` / `enroll-haven-signer` / `revoke-peer` / `list-peer-alerts` / `clear-peer-alerts` / `session-tree` / `handoff-to-peer` / `present-to-peer`, unfocused cross-limb HMAC-SHA256 consent co-signing on Haven across Tiers 2 through 4 (with strict one-shot enforcement on `PolicyChange` and Tier-4 `Irreversible`), an inline GTK4 Haven Auth Bar for stalled phone SSH prompts (physical widget interaction only), `insert-peer-totp` (`Ctrl+Shift+Y`, local Operator/GUI only, typed straight into the PTY without touching the clipboard), focus-aware outbound notification relay (`OSC 777`, local `present-notice`, and unfocused `OSC 133;D` long commands with per-peer burst-5 `TokenBucket` rate limiting and zero scrollback leakage), a chrome Limb Status Pill (`!haven:<label>` badge + Haven Alerts inbox, with zero unprompted `list_notifications` calls by default and opt-in `inbound_shade_allowlist` polling), one-action mux session handoff to Haven (`Ctrl+Shift+H`), and symmetric media/web/clipboard presentation on Haven (`present-to-peer`). See [Remote agents over HTTP](#remote-agents-over-http).
 - TOML config with live reload for font, colors, palette, geometry, scrollback depth, and notification thresholds. See [Configuration](#configuration).
 - Terminal capability queries answered (XTVERSION, OSC 10/11 colors, DCS terminfo), so modern shells like fish 4 start without blocking.
 - OSC 777 notifications and unfocused `OSC 133;D` long-command completions reach the desktop via `org.freedesktop.Notifications`, badge the notifying tab, and mirror to paired Haven limbs when Mutiny is unfocused.
 - Damage-driven redraw: only changed rows are re-rendered. An idle frame is about 19x cheaper than a full repaint, measured under Xvfb.
 - Text is placed one glyph cluster per cell, so the drawn cursor sits exactly on the emulator's grid cursor instead of drifting past the end of the line.
 - Session restore: layout, split ratios, working directories, and scrollback survive a restart. See [Session restore](#session-restore).
-- A session picker (`Ctrl+Shift+S`) lists tmux and zellij sessions, local and over SSH, and opens one in a new tab or window. See [Multiplexer sessions](#multiplexer-sessions).
+- A hierarchical session picker (`Ctrl+Shift+S`, `mutiny ctl session-tree`) groups local tmux/zellij sessions (nesting organ sessions under `[sessions] root_session = "meta"` with active, busy `OSC 133;C`, and `!attention` rollups), configured SSH hosts, and paired Haven limb sessions and hardware/audio/USB bridges, plus one-click tiled multi-pane grid windows (`open-session-grid`). See [Multiplexer sessions](#multiplexer-sessions).
 - IME input through GtkIMContext: CJK, dead keys, and compose sequences, with preedit shown at the cursor. Font fallback for CJK, emoji, and box-drawing glyphs.
 - Kitty graphics images render inline as texture nodes, and a `present-media` verb lets an agent place an image in a pane. See [Inline images](#inline-images).
 - Summonable scratch quick terminal (``Ctrl+Shift+` ``) that hides on dismiss or window-manager close while keeping its shell alive, plus an in-app Settings dialog (`Ctrl+Shift+,`) covering every key in `config.toml`.
@@ -153,6 +153,9 @@ A wildcard bind (`0.0.0.0` or `[::]`) is refused, because the listener is meant 
 mutiny ctl pair-haven --label pixel --url http://127.0.0.1:8740/mcp --enroll-signer
 mutiny ctl enroll-haven-signer --id-or-label pixel
 mutiny ctl list-peers
+mutiny ctl session-tree --refresh
+mutiny ctl handoff-to-peer
+mutiny ctl present-to-peer --path /abs/path/chart.png --caption "Latency"
 mutiny ctl list-peer-alerts
 mutiny ctl clear-peer-alerts
 mutiny ctl revoke-peer --id-or-label pixel
@@ -212,7 +215,7 @@ curl -s http://127.0.0.1:18740/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_workspace","arguments":{}}}'
 ```
 
-What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 39 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
+What that initial M2 run showed (against the 18-tool surface at that milestone; the surface has since grown to 43 tools): no token and a wrong token both `401`, the right token `200`, `initialize` negotiating `2025-06-18`, all 18 tools listed, a command sent with `send_terminal_input` and its output read back with `read_screen_text`, `spawn_pane` creating a second pane, and `present_notice` reaching the desktop. Restarting with `--agent-consent observe-only` allowed reads and denied both Act verbs, and the denied command never ran. The audit recorded `carrier=paired` then `carrier=observe-only` with `denied` decisions, and never `operator`.
 
 Every one of those single-token calls audited against the mutiny process's own pid, which was the shared-identity gap before `--http-peer` added per-token peer identities.
 
@@ -232,7 +235,7 @@ Four menus, each an archetype with no overlap. Every action lives in exactly one
 
 | Menu | Covers | Actions |
 | --- | --- | --- |
-| **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Pair Haven Limb, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
+| **Session** | the lifecycle of a session context | New Session Tab, New Window, New Session, Open Session Grid, Handoff Session to Haven, Present to Haven, Pair Haven Limb, Open Session (submenu), Save Session Layout, Close Tab, Close Window |
 | **Edit** | the focused pane's content, and settings | Copy, Paste, Insert Haven TOTP Code, Search, Previous/Next Command, Settings |
 | **Pane** | pane structure and focus | Split Right/Down, Detach, Close Pane, Focus Next/Prev, Next Urgent |
 | **View** | chrome and introspection | Menu Bar, Command Palette, Agent Activity, Clear Haven Alerts, Keybind Cheatsheet |
@@ -252,7 +255,7 @@ The old Shell / Panes / View split overlapped: "Shell" held pane closing, "View"
 
 End Session sits in its own menu section, behind a confirmation that names the session and defaults to **Keep It Running**, so Enter cannot destroy anything. Sessions outliving tabs is the point of using a multiplexer, so nothing is cleaned up automatically. A New Tab does leave an auto-named session behind when its tab closes; those are marked **"no clients"** in the picker, and `mutiny ctl sessions --unattached-only` lists them so you can prune deliberately with `end-session`. Your persistent detached sessions appear there too, which is exactly why it is a view and not a cleanup.
 
-**Right-click a tab** for Rename Session, Copy Session Name, Close Tab (session keeps running), Move to New Window, and End Session. "Move to New Window" is deliberately not called "Detach": to a tmux user, detaching means detaching a client. Rename runs the multiplexer's own command (`tmux rename-session`, `zellij action rename-session`) and updates every Mutiny pane attached to that session, so labels, window titles, and the saved layout all follow. Rename and Copy Name appear only on attached tabs. The menu never kills a session: closing a tab kills only its client.
+**Right-click a tab** for Handoff Session to Haven, Rename Session, Copy Session Name, Close Tab (session keeps running), Move to New Window, and End Session. "Move to New Window" is deliberately not called "Detach": to a tmux user, detaching means detaching a client. Rename runs the multiplexer's own command (`tmux rename-session`, `zellij action rename-session`) and updates every Mutiny pane attached to that session, so labels, window titles, and the saved layout all follow. Handoff, Rename, and Copy Name appear only on attached tabs. The menu never kills a session: closing a tab kills only its client.
 
 **Open Session** is a submenu listing discovered sessions inline, not a pop-up. It is filled at startup and re-listed every `refresh_interval_s` seconds, so it is populated before you open it and reflects sessions that came and went. A refresh keeps the sessions it already knows until each host's new result replaces them, so the list never flashes empty. `Ctrl+Shift+S` still opens the full picker, which is also the last item in that submenu.
 
@@ -353,10 +356,12 @@ ignore_size = false            # true adds tmux -f ignore-size, so this client c
 show_exited = true             # show zellij's resurrectable EXITED sessions, badged
 refresh_interval_s = 15        # re-list sessions so the submenu stays current; 0 disables
 preferred = "tmux"             # what New Tab uses: tmux, zellij, or none for a plain shell
+root_session = "meta"          # constellation root session nesting sibling organ sessions; blank disables
 
 [peer]
 relay_unfocused_consent = true # auto-relay parked consent prompts to a connected Haven signer when unfocused
 unfocused_grace_ms = 1500      # clamped 0..60000; delay before unfocused consent auto-relays
+# default_haven_ssh_profile = "workstation"   # optional Haven SSH profile ID for handoff-to-peer / present-to-peer
 
 [notifications]
 long_command_secs = 20         # unfocused OSC 133;D command threshold in seconds; 0 disables
@@ -426,6 +431,7 @@ Not implemented: animation frames, file and shared-memory transmission, unicode 
 | Toggle menu bar | `Ctrl+Shift+M` |
 | Command palette | `Ctrl+Shift+P` |
 | Multiplexer session picker | `Ctrl+Shift+S` |
+| Handoff mux session to Haven | `Ctrl+Shift+H` |
 | Quick terminal (summon or dismiss) | ``Ctrl+Shift+` `` |
 | Settings | `Ctrl+Shift+,` |
 | Agent activity and audit log | `Ctrl+Shift+J` |
@@ -461,7 +467,7 @@ The HTTP carrier adds a third path with a lower ceiling. It reaches the agent so
 ## Development
 
 ```sh
-cargo test                    # 229 tests, no display required
+cargo test                    # 237 tests, no display required
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo bench                   # headless engine baseline

@@ -595,6 +595,131 @@ pub fn attach_argv(kind: MuxKind, name: &str, opts: &MuxOptions) -> (String, Vec
     )
 }
 
+/// Inspects a command's argv (for example from `/proc/<pgrp>/cmdline` or a
+/// shell command line) to detect an active `tmux` or `zellij` attach/create
+/// client and extract its session name.
+pub fn detect_mux_from_argv(argv: &[String]) -> Option<(MuxKind, String)> {
+    let prog = argv.first()?;
+    let base = std::path::Path::new(prog)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(prog.as_str());
+    match base {
+        "tmux" => detect_tmux_session_arg(&argv[1..]).map(|s| (MuxKind::Tmux, s)),
+        "zellij" => detect_zellij_session_arg(&argv[1..]).map(|s| (MuxKind::Zellij, s)),
+        _ => None,
+    }
+}
+
+fn clean_detected_session_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    // Unescape trailing `\;` that `tmux_escape_name` adds.
+    let unescaped = trimmed
+        .strip_suffix("\\;")
+        .map(|prefix| format!("{prefix};"))
+        .unwrap_or_else(|| trimmed.to_owned());
+    // Strip tmux `:window.pane` target suffix when present on `-t session:0`.
+    let base = unescaped.split(':').next().unwrap_or(&unescaped).trim();
+    if base.is_empty() || base.chars().any(char::is_control) {
+        None
+    } else {
+        Some(base.to_owned())
+    }
+}
+
+fn detect_tmux_session_arg(args: &[String]) -> Option<String> {
+    let mut i = 0usize;
+    let mut saw_subcmd = false;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if matches!(arg, "-S" | "-L" | "-f" | "-c" | "-F") {
+            i += 2;
+            continue;
+        }
+        if matches!(
+            arg,
+            "attach" | "attach-session" | "a" | "at" | "new" | "new-session"
+        ) {
+            saw_subcmd = true;
+            i += 1;
+            continue;
+        }
+        if (arg == "-t" || arg == "-s") && i + 1 < args.len() {
+            return clean_detected_session_name(&args[i + 1]);
+        }
+        if let Some(rest) = arg.strip_prefix("-t=").or_else(|| arg.strip_prefix("-s=")) {
+            return clean_detected_session_name(rest);
+        }
+        if arg.len() > 2
+            && (arg.starts_with("-t") || arg.starts_with("-s"))
+            && !arg.starts_with("--")
+        {
+            return clean_detected_session_name(&arg[2..]);
+        }
+        i += 1;
+    }
+    let _ = saw_subcmd;
+    None
+}
+
+fn detect_zellij_session_arg(args: &[String]) -> Option<String> {
+    let mut i = 0usize;
+    let mut after_attach = false;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if (arg == "-s" || arg == "--session") && i + 1 < args.len() {
+            return clean_detected_session_name(&args[i + 1]);
+        }
+        if let Some(rest) = arg.strip_prefix("--session=") {
+            return clean_detected_session_name(rest);
+        }
+        if arg == "attach" || arg == "a" {
+            after_attach = true;
+            i += 1;
+            continue;
+        }
+        if after_attach && !arg.starts_with('-') {
+            return clean_detected_session_name(arg);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parses a pane title or shell command string for an explicit `tmux` or
+/// `zellij` session client invocation. Bare shell titles (`sh`, `user@host:~`)
+/// return `None`.
+pub fn detect_mux_from_text(text: &str) -> Option<(MuxKind, String)> {
+    let tokens: Vec<String> = text
+        .split_whitespace()
+        .map(|tok| tok.trim_matches('"').trim_matches('\'').to_owned())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    for start in 0..tokens.len() {
+        if let Some(found) = detect_mux_from_argv(&tokens[start..]) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Queries the foreground process group on a Linux PTY (`tcgetpgrp` ->
+/// `/proc/<pgrp>/cmdline`) to detect whether the user ran `tmux attach -t ...`
+/// or `zellij attach ...` interactively inside an otherwise plain shell pane.
+pub fn detect_foreground_mux_on_pty(pty_fd: i32) -> Option<(MuxKind, String)> {
+    let pgrp = unsafe { libc::tcgetpgrp(pty_fd) };
+    if pgrp <= 0 {
+        return None;
+    }
+    let raw = std::fs::read(format!("/proc/{pgrp}/cmdline")).ok()?;
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    detect_mux_from_argv(&argv)
+}
+
 /// Builds the string the remote login shell will parse. The program name is
 /// part of it: quoting only the arguments would leave a command with no verb.
 fn remote_command(program: &str, inner: &[String], term: Option<&str>) -> String {
@@ -1133,5 +1258,47 @@ mod tests {
     fn session_parsing_is_bounded() {
         let many = "s\t1\t0\t0\t/p\n".repeat(MAX_SESSIONS_PER_HOST + 50);
         assert_eq!(parse_tmux(&many, None).len(), MAX_SESSIONS_PER_HOST);
+    }
+
+    #[test]
+    fn detect_mux_from_argv_and_text_handles_tmux_zellij_and_bare_shells() {
+        let argv_tmux: Vec<String> = vec!["/usr/bin/tmux", "new-session", "-A", "-s", "mutiny-7"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            detect_mux_from_argv(&argv_tmux),
+            Some((MuxKind::Tmux, String::from("mutiny-7")))
+        );
+
+        let argv_attach: Vec<String> =
+            vec!["tmux", "-S", "/tmp/custom.sock", "attach", "-t", "meta:0"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(
+            detect_mux_from_argv(&argv_attach),
+            Some((MuxKind::Tmux, String::from("meta")))
+        );
+
+        let argv_zellij: Vec<String> = vec!["zellij", "attach", "-c", "field-ops"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            detect_mux_from_argv(&argv_zellij),
+            Some((MuxKind::Zellij, String::from("field-ops")))
+        );
+
+        assert_eq!(
+            detect_mux_from_text("tmux attach -t constellation"),
+            Some((MuxKind::Tmux, String::from("constellation")))
+        );
+        assert_eq!(
+            detect_mux_from_text("zellij --session lab-rig"),
+            Some((MuxKind::Zellij, String::from("lab-rig")))
+        );
+        assert_eq!(detect_mux_from_text("bash"), None);
+        assert_eq!(detect_mux_from_text("ian@workstation:~/Code/mutiny"), None);
     }
 }

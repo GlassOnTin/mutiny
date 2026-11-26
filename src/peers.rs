@@ -185,6 +185,56 @@ pub struct PeerAlert {
     pub unread: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HavenRemoteSession {
+    pub session_id: String,
+    pub profile_id: String,
+    pub label: String,
+    pub status: String,
+    pub transport: String,
+    pub is_agent_repl: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_manager: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_session_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HavenBridgeSummary {
+    pub source: String,
+    pub source_kind: String,
+    pub sink: String,
+    pub transport: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HavenLimbInventory {
+    pub sessions: Vec<HavenRemoteSession>,
+    pub bridges: Vec<HavenBridgeSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerHandoffSummary {
+    pub action: String,
+    pub peer_id: String,
+    pub peer_label: String,
+    pub session_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haven_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPresentSummary {
+    pub tool: String,
+    pub peer_id: String,
+    pub peer_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeersListing {
     pub inbound: Vec<InboundPeerSummary>,

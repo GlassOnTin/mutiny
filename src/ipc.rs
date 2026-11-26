@@ -228,6 +228,51 @@ pub enum IpcRequest {
     ListPeerAlerts,
     /// Marks all unread Haven limb and notification alerts as read.
     ClearPeerAlerts,
+    /// Returns the unified hierarchical session tree across Local Sessions
+    /// (with constellation root nesting and busy/attention rollups), Configured
+    /// SSH Hosts, and Paired Haven Limbs (`list_sessions` + `list_bridges`).
+    SessionTree {
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Opens a balanced tiled multi-pane window attached to up to 9 multiplexer
+    /// sessions in one operation.
+    OpenSessionGrid {
+        #[serde(default)]
+        sessions: Vec<String>,
+        #[serde(default)]
+        kind: Option<crate::mux::MuxKind>,
+        #[serde(default)]
+        host: Option<String>,
+    },
+    /// Hands off a mux-backed pane to a paired Haven limb (`focus_terminal_session`
+    /// when already live, or `connect_profile` with `sessionName` otherwise).
+    HandoffToPeer {
+        #[serde(default)]
+        pane: Option<PaneId>,
+        #[serde(default)]
+        peer: Option<String>,
+        #[serde(default)]
+        profile_id: Option<String>,
+    },
+    /// Presents media (`present_media`), web/HTML/SVG/PDF (`present_web`), or
+    /// clipboard text (`write_clipboard`) on a paired Haven limb.
+    PresentToPeer {
+        #[serde(default)]
+        peer: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        path: Option<PathBuf>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        clipboard: bool,
+        #[serde(default)]
+        profile_id: Option<String>,
+        #[serde(default)]
+        caption: Option<String>,
+    },
     /// ENDS a multiplexer session. Destructive: everything running inside it
     /// stops, on every device. Distinct from closing a tab, which only ends
     /// this client and leaves the session running. Tier-4 Irreversible: never
@@ -377,6 +422,10 @@ impl IpcRequest {
             IpcRequest::ListPeers => ConsentTier::Observe,
             IpcRequest::ListPeerAlerts => ConsentTier::Observe,
             IpcRequest::ClearPeerAlerts => ConsentTier::Act,
+            IpcRequest::SessionTree { .. } => ConsentTier::Observe,
+            IpcRequest::OpenSessionGrid { .. } => ConsentTier::Act,
+            IpcRequest::HandoffToPeer { .. } => ConsentTier::Act,
+            IpcRequest::PresentToPeer { .. } => ConsentTier::Act,
             IpcRequest::PairHaven { .. } => ConsentTier::PolicyChange,
             IpcRequest::EnrollHavenSigner { .. } => ConsentTier::PolicyChange,
             IpcRequest::RevokePeer { .. } => ConsentTier::PolicyChange,
@@ -442,6 +491,25 @@ impl IpcRequest {
             IpcRequest::RunAction { action, .. } => {
                 put("action", crate::action::spec(*action).slug.to_owned());
             }
+            IpcRequest::OpenSessionGrid { kind, host, .. } => {
+                put("kind", kind.map(|k| k.label()).unwrap_or("auto").to_owned());
+                put("host", host.clone().unwrap_or_default());
+            }
+            IpcRequest::HandoffToPeer {
+                pane,
+                peer,
+                profile_id,
+            } => {
+                pane.map(|p| put("pane", p.0.to_string()));
+                put("peer", peer.clone().unwrap_or_default());
+                put("profile_id", profile_id.clone().unwrap_or_default());
+            }
+            IpcRequest::PresentToPeer {
+                peer, profile_id, ..
+            } => {
+                put("peer", peer.clone().unwrap_or_default());
+                put("profile_id", profile_id.clone().unwrap_or_default());
+            }
             _ => {}
         }
         m
@@ -463,6 +531,10 @@ impl IpcRequest {
             IpcRequest::ListPeers => "list-peers",
             IpcRequest::ListPeerAlerts => "list-peer-alerts",
             IpcRequest::ClearPeerAlerts => "clear-peer-alerts",
+            IpcRequest::SessionTree { .. } => "session-tree",
+            IpcRequest::OpenSessionGrid { .. } => "open-session-grid",
+            IpcRequest::HandoffToPeer { .. } => "handoff-to-peer",
+            IpcRequest::PresentToPeer { .. } => "present-to-peer",
             IpcRequest::PairHaven { .. } => "pair-haven",
             IpcRequest::EnrollHavenSigner { .. } => "enroll-haven-signer",
             IpcRequest::RevokePeer { .. } => "revoke-peer",
@@ -581,6 +653,42 @@ impl IpcRequest {
             | IpcRequest::RevokePeer { id_or_label } => {
                 format!("target={:?}", crate::mux::sanitize_text(id_or_label, 64))
             }
+            IpcRequest::SessionTree { refresh } => format!("refresh={refresh}"),
+            IpcRequest::OpenSessionGrid {
+                sessions,
+                kind,
+                host,
+            } => format!("sessions={} kind={kind:?} host={host:?}", sessions.len()),
+            IpcRequest::HandoffToPeer {
+                pane,
+                peer,
+                profile_id,
+            } => format!(
+                "pane={pane:?} peer={:?} profile_id={:?}",
+                peer.as_deref().map(|s| crate::mux::sanitize_text(s, 48)),
+                profile_id
+                    .as_deref()
+                    .map(|s| crate::mux::sanitize_text(s, 48))
+            ),
+            IpcRequest::PresentToPeer {
+                peer,
+                url,
+                path,
+                text,
+                clipboard,
+                profile_id,
+                caption,
+            } => format!(
+                "peer={:?} has_url={} path={:?} text_bytes={} clipboard={clipboard} profile_id={:?} has_caption={}",
+                peer.as_deref().map(|s| crate::mux::sanitize_text(s, 48)),
+                url.is_some(),
+                path.as_ref().map(|p| p.display().to_string()),
+                text.as_ref().map_or(0, String::len),
+                profile_id
+                    .as_deref()
+                    .map(|s| crate::mux::sanitize_text(s, 48)),
+                caption.is_some()
+            ),
             IpcRequest::EndSession { kind, name, host } => format!(
                 "kind={kind:?} host={host:?} name={:?}",
                 crate::mux::sanitize_text(name, 64)
@@ -723,6 +831,12 @@ pub enum IpcResponse {
         outbound_peer: Option<crate::peers::OutboundPeerSummary>,
         #[serde(skip_serializing_if = "Option::is_none")]
         peer_alerts: Option<Vec<crate::peers::PeerAlert>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_tree: Option<crate::session::SessionTree>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        handoff: Option<crate::peers::PeerHandoffSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presented: Option<crate::peers::PeerPresentSummary>,
         /// Whether a toggled window is now showing rather than dismissed.
         #[serde(skip_serializing_if = "Option::is_none")]
         visible: Option<bool>,
@@ -759,6 +873,9 @@ impl IpcResponse {
             peers: None,
             outbound_peer: None,
             peer_alerts: None,
+            session_tree: None,
+            handoff: None,
+            presented: None,
             visible: None,
         }
     }
@@ -1334,6 +1451,26 @@ pub fn verb_samples() -> Vec<IpcRequest> {
         },
         IpcRequest::ListPeerAlerts,
         IpcRequest::ClearPeerAlerts,
+        IpcRequest::SessionTree { refresh: false },
+        IpcRequest::OpenSessionGrid {
+            sessions: vec![String::from("mutiny-grid-probe")],
+            kind: Some(crate::mux::MuxKind::Tmux),
+            host: None,
+        },
+        IpcRequest::HandoffToPeer {
+            pane: None,
+            peer: Some(String::from("absent-peer")),
+            profile_id: None,
+        },
+        IpcRequest::PresentToPeer {
+            peer: Some(String::from("absent-peer")),
+            url: Some(String::from("https://example.com")),
+            path: None,
+            text: None,
+            clipboard: false,
+            profile_id: None,
+            caption: None,
+        },
     ]
 }
 
@@ -1381,6 +1518,10 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::EnrollHavenSigner { .. } => 40,
         IpcRequest::ListPeerAlerts => 41,
         IpcRequest::ClearPeerAlerts => 42,
+        IpcRequest::SessionTree { .. } => 43,
+        IpcRequest::OpenSessionGrid { .. } => 44,
+        IpcRequest::HandoffToPeer { .. } => 45,
+        IpcRequest::PresentToPeer { .. } => 46,
         IpcRequest::EndSession { .. } => 31,
         IpcRequest::ClosePane { .. } => 25,
         IpcRequest::CloseTab { .. } => 27,

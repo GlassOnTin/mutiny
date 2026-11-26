@@ -139,6 +139,10 @@ pub struct SessionsConfig {
     /// shell. The New Session dialog can override it per session. This changes
     /// what Ctrl+Shift+T does; "none" restores the plain-shell behaviour.
     pub preferred: String,
+    /// Optional conductor/root session name (default "meta") under which
+    /// sibling local multiplexer sessions nest in `session-tree` and the
+    /// Session Picker; set to "" for a flat local session list.
+    pub root_session: String,
 }
 
 impl Default for SessionsConfig {
@@ -157,6 +161,7 @@ impl Default for SessionsConfig {
             show_exited: true,
             refresh_interval_s: 15,
             preferred: String::from("tmux"),
+            root_session: String::from("meta"),
         }
     }
 }
@@ -169,6 +174,9 @@ pub struct PeerConfig {
     pub relay_unfocused_consent: bool,
     /// Grace window in milliseconds before an unfocused prompt relays to Haven.
     pub unfocused_grace_ms: u64,
+    /// Optional default Haven SSH profile id or label for `handoff-to-peer` and
+    /// workstation file streaming in `present-to-peer`.
+    pub default_haven_ssh_profile: Option<String>,
 }
 
 impl Default for PeerConfig {
@@ -176,6 +184,7 @@ impl Default for PeerConfig {
         Self {
             relay_unfocused_consent: true,
             unfocused_grace_ms: 1_500,
+            default_haven_ssh_profile: None,
         }
     }
 }
@@ -277,9 +286,11 @@ pub struct ResolvedConfig {
     pub session_refresh_interval_s: u32,
     /// `None` means New Tab opens a plain shell.
     pub preferred_mux: Option<crate::mux::MuxKind>,
+    pub root_session: Option<String>,
     pub discovery_timeout_ms: u64,
     pub relay_unfocused_consent: bool,
     pub unfocused_grace_ms: u64,
+    pub default_haven_ssh_profile: Option<String>,
     pub long_command_secs: u64,
     pub peer_relay_mode: PeerRelayMode,
     pub inbound_shade_allowlist: Vec<String>,
@@ -491,9 +502,24 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
         show_exited_sessions: config.sessions.show_exited,
         session_refresh_interval_s: config.sessions.refresh_interval_s.min(3600),
         preferred_mux: parse_preferred(&config.sessions.preferred),
+        root_session: {
+            let trimmed = config.sessions.root_session.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        },
         discovery_timeout_ms: config.sessions.discovery_timeout_ms.clamp(200, 60_000),
         relay_unfocused_consent: config.peer.relay_unfocused_consent,
         unfocused_grace_ms: config.peer.unfocused_grace_ms.min(60_000),
+        default_haven_ssh_profile: config
+            .peer
+            .default_haven_ssh_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         long_command_secs: config.notifications.long_command_secs.min(86_400),
         peer_relay_mode: parse_peer_relay_mode(&config.notifications.peer_relay_mode),
         inbound_shade_allowlist: {

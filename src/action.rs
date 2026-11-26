@@ -40,6 +40,9 @@ pub enum ActionId {
     ClearPeerAlerts,
     SessionPicker,
     NewSession,
+    OpenSessionGrid,
+    HandoffToPeer,
+    PresentToPeer,
     PairHaven,
     QuickTerminal,
     SaveSession,
@@ -72,6 +75,9 @@ impl ActionId {
         ActionId::ClearPeerAlerts,
         ActionId::SessionPicker,
         ActionId::NewSession,
+        ActionId::OpenSessionGrid,
+        ActionId::HandoffToPeer,
+        ActionId::PresentToPeer,
         ActionId::PairHaven,
         ActionId::QuickTerminal,
         ActionId::SaveSession,
@@ -387,6 +393,39 @@ pub const ACTIONS: &[ActionSpec] = &[
         summary: "Create a new tmux or zellij session, or a plain shell, with a name you choose",
     },
     ActionSpec {
+        id: ActionId::OpenSessionGrid,
+        slug: "open-session-grid",
+        title: "Open Session Grid Window",
+        category: MenuCategory::Session,
+        consent_tier: ConsentTier::Act,
+        default_accel: None,
+        human_chord: "",
+        in_context_menu: false,
+        summary: "Open a tiled multi-pane window attached to local multiplexer sessions",
+    },
+    ActionSpec {
+        id: ActionId::HandoffToPeer,
+        slug: "handoff-to-peer",
+        title: "Hand Off Pane to Haven",
+        category: MenuCategory::Session,
+        consent_tier: ConsentTier::Act,
+        default_accel: Some("<Control><Shift>h"),
+        human_chord: "Ctrl+Shift+H",
+        in_context_menu: true,
+        summary: "Focus or attach the active multiplexer session on the paired Haven limb",
+    },
+    ActionSpec {
+        id: ActionId::PresentToPeer,
+        slug: "present-to-peer",
+        title: "Present to Haven…",
+        category: MenuCategory::Session,
+        consent_tier: ConsentTier::Act,
+        default_accel: None,
+        human_chord: "",
+        in_context_menu: false,
+        summary: "Send media, web/HTML/SVG/PDF, or clipboard text to the paired Haven limb",
+    },
+    ActionSpec {
         id: ActionId::PairHaven,
         slug: "pair-haven",
         title: "Pair Haven Limb…",
@@ -543,6 +582,7 @@ pub const CLOSE_TAB_TARGET: &str = "win.close-tab-target";
 pub const DETACH_TAB_TARGET: &str = "win.detach-tab-target";
 pub const RENAME_TAB_TARGET: &str = "win.rename-session-tab";
 pub const COPY_NAME_TAB_TARGET: &str = "win.copy-session-name-tab";
+pub const HANDOFF_TAB_TARGET: &str = "win.handoff-session-tab";
 pub const END_TAB_TARGET: &str = "win.end-session-tab";
 
 /// The right-click menu for one tab. Rename and Copy Name only appear when the
@@ -564,6 +604,7 @@ pub fn build_tab_menu_model(attached: bool, tab: u64) -> gio::Menu {
         let identity = gio::Menu::new();
         targeted(&identity, "Rename Session…", RENAME_TAB_TARGET);
         targeted(&identity, "Copy Session Name", COPY_NAME_TAB_TARGET);
+        targeted(&identity, "Hand Off Session to Haven", HANDOFF_TAB_TARGET);
         menu.append_section(None, &identity);
     }
 

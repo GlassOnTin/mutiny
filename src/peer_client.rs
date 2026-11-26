@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::crypto;
-use crate::peers::{InboundNotifyScope, OutboundHavenPeer, OutboundLimbStatus, unix_now_secs};
+use crate::peers::{
+    HavenBridgeSummary, HavenLimbInventory, HavenRemoteSession, InboundNotifyScope,
+    OutboundHavenPeer, OutboundLimbStatus, PeerHandoffSummary, PeerPresentSummary, unix_now_secs,
+};
 use crate::topology::{PaneId, WindowId};
 
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -83,6 +86,160 @@ pub struct HavenShadeRecord {
     pub title: String,
     pub text: String,
     pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PresentPlan {
+    Clipboard {
+        text: String,
+    },
+    MediaUrl {
+        url: String,
+        mime_type: Option<String>,
+        caption: Option<String>,
+    },
+    MediaPath {
+        path: String,
+        mime_type: String,
+        explicit_profile_id: Option<String>,
+        caption: Option<String>,
+    },
+    WebUrl {
+        url: String,
+        caption: Option<String>,
+    },
+    WebPath {
+        path: String,
+        explicit_profile_id: Option<String>,
+        caption: Option<String>,
+    },
+}
+
+fn infer_media_mime(ext_lc: &str) -> Option<&'static str> {
+    match ext_lc {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        "avif" => Some("image/avif"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "flac" => Some("audio/flac"),
+        "m4a" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        _ => None,
+    }
+}
+
+fn is_web_doc_ext(ext_lc: &str) -> bool {
+    matches!(ext_lc, "html" | "htm" | "svg" | "pdf")
+}
+
+/// Classifies `present-to-peer` arguments into the exact Haven tool plan
+/// (`present_media`, `present_web`, or `write_clipboard`).
+pub fn classify_present_target(
+    url: Option<&str>,
+    path: Option<&std::path::Path>,
+    text: Option<&str>,
+    profile_id: Option<&str>,
+    caption: Option<&str>,
+) -> Result<PresentPlan, String> {
+    let clean_url = url.map(str::trim).filter(|s| !s.is_empty());
+    let clean_prof = profile_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let clean_cap = caption
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    let count = usize::from(clean_url.is_some())
+        + usize::from(path.is_some())
+        + usize::from(text.is_some());
+    if count == 0 {
+        return Err(String::from(
+            "present-to-peer requires one of --url, --path, --text, or --clipboard",
+        ));
+    }
+    if count > 1 {
+        return Err(String::from(
+            "present-to-peer accepts only one target (--url, --path, or --text/--clipboard)",
+        ));
+    }
+
+    if let Some(t) = text {
+        return Ok(PresentPlan::Clipboard { text: t.to_owned() });
+    }
+
+    if let Some(u) = clean_url {
+        let rest = u
+            .strip_prefix("http://")
+            .or_else(|| u.strip_prefix("https://"))
+            .ok_or_else(|| {
+                String::from("present-to-peer --url must start with http:// or https://")
+            })?;
+        let host_part = rest.split('/').next().unwrap_or("");
+        if host_part.is_empty() {
+            return Err(String::from("present-to-peer --url is missing a host"));
+        }
+        let without_query = u.split(['?', '#']).next().unwrap_or(u);
+        let ext_lc = without_query
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !is_web_doc_ext(&ext_lc)
+            && let Some(mime) = infer_media_mime(&ext_lc)
+        {
+            return Ok(PresentPlan::MediaUrl {
+                url: u.to_owned(),
+                mime_type: Some(mime.to_owned()),
+                caption: clean_cap,
+            });
+        }
+        return Ok(PresentPlan::WebUrl {
+            url: u.to_owned(),
+            caption: clean_cap,
+        });
+    }
+
+    let p = path.expect("checked count == 1");
+    if !p.is_absolute() {
+        return Err(format!(
+            "present-to-peer --path must be an absolute path, got {}",
+            p.display()
+        ));
+    }
+    let ext_lc = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let path_str = p.to_string_lossy().into_owned();
+    if is_web_doc_ext(&ext_lc) {
+        return Ok(PresentPlan::WebPath {
+            path: path_str,
+            explicit_profile_id: clean_prof,
+            caption: clean_cap,
+        });
+    }
+    if let Some(mime) = infer_media_mime(&ext_lc) {
+        return Ok(PresentPlan::MediaPath {
+            path: path_str,
+            mime_type: mime.to_owned(),
+            explicit_profile_id: clean_prof,
+            caption: clean_cap,
+        });
+    }
+    Err(format!(
+        "unsupported file extension {:?} on {}; expected image/*, audio/*, .html, .svg, or .pdf",
+        ext_lc,
+        p.display()
+    ))
 }
 
 /// Checks whether a plaintext HTTP target IP is permitted.
@@ -632,6 +789,27 @@ pub enum PeerClientCommand {
         allowlist: Vec<String>,
         window_active: bool,
     },
+    RefreshLimbInventories,
+    FocusRemoteSession {
+        peer_id: String,
+        session_id: String,
+    },
+    HandoffToPeer {
+        req_id: u64,
+        peer_id: String,
+        session_name: String,
+        mux_host: Option<String>,
+        explicit_profile_id: Option<String>,
+        default_ssh_profile: Option<String>,
+        local_host: String,
+    },
+    PresentToPeer {
+        req_id: u64,
+        peer_id: String,
+        plan: PresentPlan,
+        default_ssh_profile: Option<String>,
+        local_host: String,
+    },
     PollNow,
     CallTool {
         req_id: u64,
@@ -686,6 +864,19 @@ pub enum PeerClientEvent {
     ShadeStatusChanged {
         peer_id: String,
         status_note: Option<String>,
+    },
+    LimbInventoryUpdated {
+        peer_id: String,
+        inventory: HavenLimbInventory,
+    },
+    LimbInventoriesRefreshed,
+    HandoffCompleted {
+        req_id: u64,
+        result: Result<PeerHandoffSummary, String>,
+    },
+    PresentCompleted {
+        req_id: u64,
+        result: Result<PeerPresentSummary, String>,
     },
     TotpChoicesReady {
         peer_id: String,
@@ -861,6 +1052,64 @@ impl HavenPeerClientHandle {
             allowlist,
             window_active,
         });
+    }
+
+    pub fn refresh_limb_inventories(&self) {
+        let _ = self
+            .cmd_tx
+            .try_send(PeerClientCommand::RefreshLimbInventories);
+    }
+
+    pub fn focus_remote_session(&self, peer_id: String, session_id: String) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::FocusRemoteSession {
+                peer_id,
+                session_id,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handoff_to_peer(
+        &self,
+        req_id: u64,
+        peer_id: String,
+        session_name: String,
+        mux_host: Option<String>,
+        explicit_profile_id: Option<String>,
+        default_ssh_profile: Option<String>,
+        local_host: String,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::HandoffToPeer {
+                req_id,
+                peer_id,
+                session_name,
+                mux_host,
+                explicit_profile_id,
+                default_ssh_profile,
+                local_host,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    pub fn present_to_peer(
+        &self,
+        req_id: u64,
+        peer_id: String,
+        plan: PresentPlan,
+        default_ssh_profile: Option<String>,
+        local_host: String,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::PresentToPeer {
+                req_id,
+                peer_id,
+                plan,
+                default_ssh_profile,
+                local_host,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
     }
 
     /// Asynchronous non-blocking `tools/call` dispatch whose result arrives via
@@ -1420,6 +1669,146 @@ fn worker_loop(
                     }
                 }
             }
+            Ok(PeerClientCommand::RefreshLimbInventories) => {
+                for entry in tracked.values() {
+                    if let Some(inv) = poll_limb_inventory(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        &mut rpc_seq,
+                        cfg.allow_lan,
+                    ) {
+                        let _ = evt_tx.try_send(PeerClientEvent::LimbInventoryUpdated {
+                            peer_id: entry.peer.id.clone(),
+                            inventory: inv,
+                        });
+                    }
+                }
+                let _ = evt_tx.try_send(PeerClientEvent::LimbInventoriesRefreshed);
+            }
+            Ok(PeerClientCommand::FocusRemoteSession {
+                peer_id,
+                session_id,
+            }) => {
+                if let Some(entry) = find_tracked(&tracked, &peer_id) {
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    let _ = call_remote_tool(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        "focus_terminal_session",
+                        json!({ "sessionId": session_id }),
+                        cfg.allow_lan,
+                    );
+                }
+            }
+            Ok(PeerClientCommand::HandoffToPeer {
+                req_id,
+                peer_id,
+                session_name,
+                mux_host,
+                explicit_profile_id,
+                default_ssh_profile,
+                local_host,
+            }) => {
+                let Some(entry) = find_tracked(&tracked, &peer_id) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::HandoffCompleted {
+                        req_id,
+                        result: Err(format!(
+                            "no paired outbound Haven peer matching {peer_id:?}"
+                        )),
+                    });
+                    continue;
+                };
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::HandoffCompleted {
+                        req_id,
+                        result: Err(String::from("too many interactive peer requests in flight")),
+                    });
+                    continue;
+                };
+                rpc_seq = rpc_seq.wrapping_add(4);
+                let seq = rpc_seq;
+                let resolved_peer_id = entry.peer.id.clone();
+                let resolved_peer_label = entry.peer.label.clone();
+                let url = entry.peer.url.clone();
+                let tok = entry.peer.bearer_token.clone();
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                let cmd_cl = cmd_tx_self.clone();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    let res = execute_handoff_to_peer(
+                        &url,
+                        &tok,
+                        seq,
+                        allow_lan,
+                        &resolved_peer_id,
+                        &resolved_peer_label,
+                        &session_name,
+                        mux_host.as_deref(),
+                        explicit_profile_id.as_deref(),
+                        default_ssh_profile.as_deref(),
+                        &local_host,
+                    );
+                    if res.is_ok() {
+                        let _ = cmd_cl.try_send(PeerClientCommand::PollNow);
+                    }
+                    let _ = evt_cl.try_send(PeerClientEvent::HandoffCompleted {
+                        req_id,
+                        result: res,
+                    });
+                });
+            }
+            Ok(PeerClientCommand::PresentToPeer {
+                req_id,
+                peer_id,
+                plan,
+                default_ssh_profile,
+                local_host,
+            }) => {
+                let Some(entry) = find_tracked(&tracked, &peer_id) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::PresentCompleted {
+                        req_id,
+                        result: Err(format!(
+                            "no paired outbound Haven peer matching {peer_id:?}"
+                        )),
+                    });
+                    continue;
+                };
+                let Some(slot) = try_acquire_interactive_slot(&interactive_inflight) else {
+                    let _ = evt_tx.try_send(PeerClientEvent::PresentCompleted {
+                        req_id,
+                        result: Err(String::from("too many interactive peer requests in flight")),
+                    });
+                    continue;
+                };
+                rpc_seq = rpc_seq.wrapping_add(3);
+                let seq = rpc_seq;
+                let resolved_peer_id = entry.peer.id.clone();
+                let resolved_peer_label = entry.peer.label.clone();
+                let url = entry.peer.url.clone();
+                let tok = entry.peer.bearer_token.clone();
+                let allow_lan = cfg.allow_lan;
+                let evt_cl = evt_tx.clone();
+                thread::spawn(move || {
+                    let _guard = slot;
+                    let res = execute_present_to_peer(
+                        &url,
+                        &tok,
+                        seq,
+                        allow_lan,
+                        &resolved_peer_id,
+                        &resolved_peer_label,
+                        plan,
+                        default_ssh_profile.as_deref(),
+                        &local_host,
+                    );
+                    let _ = evt_cl.try_send(PeerClientEvent::PresentCompleted {
+                        req_id,
+                        result: res,
+                    });
+                });
+            }
             Ok(PeerClientCommand::CallTool {
                 req_id,
                 peer_id,
@@ -1527,6 +1916,19 @@ fn worker_loop(
                             peer_id: entry.peer.id.clone(),
                             peer_label: entry.peer.label.clone(),
                             summary: summary_opt,
+                        });
+                    }
+
+                    // Poll read-only `list_sessions` and `list_bridges` (`ConsentLevel.NEVER`).
+                    if let Some(inv) = poll_limb_inventory(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        &mut rpc_seq,
+                        cfg.allow_lan,
+                    ) {
+                        let _ = evt_tx.try_send(PeerClientEvent::LimbInventoryUpdated {
+                            peer_id: entry.peer.id.clone(),
+                            inventory: inv,
                         });
                     }
 
@@ -2150,7 +2552,27 @@ fn call_remote_tool(
     arguments: Value,
     allow_lan: bool,
 ) -> Result<Value, String> {
-    jsonrpc_call(
+    call_remote_tool_with_timeout(
+        url,
+        bearer_token,
+        rpc_id,
+        tool_name,
+        arguments,
+        NORMAL_READ_TIMEOUT,
+        allow_lan,
+    )
+}
+
+fn call_remote_tool_with_timeout(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    tool_name: &str,
+    arguments: Value,
+    read_timeout: Duration,
+    allow_lan: bool,
+) -> Result<Value, String> {
+    let raw = jsonrpc_call(
         url,
         Some(bearer_token),
         rpc_id,
@@ -2159,10 +2581,533 @@ fn call_remote_tool(
             "name": tool_name,
             "arguments": arguments,
         }),
-        NORMAL_READ_TIMEOUT,
+        read_timeout,
         allow_lan,
     )
-    .map_err(|(_, msg)| msg)
+    .map_err(|(_, msg)| msg)?;
+    if raw.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+        let msg = raw
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("remote tool reported isError=true");
+        return Err(crate::mux::sanitize_text(msg, 160));
+    }
+    Ok(raw)
+}
+
+fn parse_haven_sessions(obj: &Value) -> Vec<HavenRemoteSession> {
+    let Some(arr) = obj.get("sessions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(64)
+        .filter_map(|item| {
+            let session_id = item
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 64))
+                .filter(|s| !s.is_empty())?;
+            let profile_id = item
+                .get("profileId")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 64))
+                .unwrap_or_default();
+            let label = item
+                .get("label")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 64))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| session_id.clone());
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 32).to_ascii_lowercase())
+                .unwrap_or_else(|| String::from("unknown"));
+            let transport = item
+                .get("transport")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 32).to_ascii_lowercase())
+                .unwrap_or_else(|| String::from("ssh"));
+            let is_agent_repl = item
+                .get("isAgentRepl")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let session_manager = item
+                .get("sessionManager")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 32))
+                .filter(|s| !s.is_empty());
+            let chosen_session_name = item
+                .get("chosenSessionName")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 64))
+                .filter(|s| !s.is_empty());
+            Some(HavenRemoteSession {
+                session_id,
+                profile_id,
+                label,
+                status,
+                transport,
+                is_agent_repl,
+                session_manager,
+                chosen_session_name,
+            })
+        })
+        .collect()
+}
+
+fn parse_haven_bridges(obj: &Value) -> Vec<HavenBridgeSummary> {
+    let Some(arr) = obj.get("bridges").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(32)
+        .filter_map(|item| {
+            let source = item
+                .get("source")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 64))
+                .filter(|s| !s.is_empty())?;
+            let source_kind = item
+                .get("sourceKind")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 32))
+                .unwrap_or_else(|| String::from("device"));
+            let sink = item
+                .get("sink")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 64))
+                .unwrap_or_else(|| String::from("guest"));
+            let transport = item
+                .get("transport")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 32))
+                .unwrap_or_else(|| String::from("local"));
+            let state = item
+                .get("state")
+                .and_then(Value::as_str)
+                .map(|s| crate::mux::sanitize_text(s.trim(), 32))
+                .unwrap_or_else(|| String::from("active"));
+            Some(HavenBridgeSummary {
+                source,
+                source_kind,
+                sink,
+                transport,
+                state,
+            })
+        })
+        .collect()
+}
+
+fn poll_limb_inventory(
+    url: &str,
+    bearer_token: &str,
+    rpc_seq: &mut u64,
+    allow_lan: bool,
+) -> Option<HavenLimbInventory> {
+    *rpc_seq = rpc_seq.wrapping_add(1);
+    let sess_res = call_remote_tool(
+        url,
+        bearer_token,
+        *rpc_seq,
+        "list_sessions",
+        json!({}),
+        allow_lan,
+    )
+    .and_then(|v| extract_mcp_tool_json(&v));
+    *rpc_seq = rpc_seq.wrapping_add(1);
+    let br_res = call_remote_tool(
+        url,
+        bearer_token,
+        *rpc_seq,
+        "list_bridges",
+        json!({}),
+        allow_lan,
+    )
+    .and_then(|v| extract_mcp_tool_json(&v));
+    if sess_res.is_err() && br_res.is_err() {
+        return None;
+    }
+    Some(HavenLimbInventory {
+        sessions: sess_res
+            .as_ref()
+            .map_or_else(|_| Vec::new(), parse_haven_sessions),
+        bridges: br_res
+            .as_ref()
+            .map_or_else(|_| Vec::new(), parse_haven_bridges),
+    })
+}
+
+struct HavenConnectionCandidate {
+    id: String,
+    label: String,
+    host: String,
+    conn_type: String,
+}
+
+fn fetch_haven_connections(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    allow_lan: bool,
+) -> Result<Vec<HavenConnectionCandidate>, String> {
+    let raw = call_remote_tool(
+        url,
+        bearer_token,
+        rpc_id,
+        "list_connections",
+        json!({}),
+        allow_lan,
+    )?;
+    let obj = extract_mcp_tool_json(&raw)?;
+    let arr = obj
+        .get("connections")
+        .or_else(|| obj.get("profiles"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(arr
+        .into_iter()
+        .filter_map(|c| {
+            let id = c.get("id")?.as_str()?.trim().to_owned();
+            if id.is_empty() {
+                return None;
+            }
+            let label = c
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .trim()
+                .to_owned();
+            let host = c
+                .get("host")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let conn_type = c
+                .get("connectionType")
+                .or_else(|| c.get("transport"))
+                .and_then(Value::as_str)
+                .unwrap_or("SSH")
+                .trim()
+                .to_ascii_uppercase();
+            Some(HavenConnectionCandidate {
+                id,
+                label,
+                host,
+                conn_type,
+            })
+        })
+        .collect())
+}
+
+fn strip_ssh_user(host: &str) -> &str {
+    host.rsplit_once('@').map_or(host, |(_, h)| h)
+}
+
+fn resolve_haven_ssh_profile(
+    connections: &[HavenConnectionCandidate],
+    explicit_or_default: Option<&str>,
+    mux_host: Option<&str>,
+    local_host: &str,
+) -> Option<String> {
+    if let Some(wanted) = explicit_or_default.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(found) = connections
+            .iter()
+            .find(|c| c.id == wanted || c.label.eq_ignore_ascii_case(wanted))
+        {
+            return Some(found.id.clone());
+        }
+        return Some(wanted.to_owned());
+    }
+
+    let ssh_conns: Vec<&HavenConnectionCandidate> = connections
+        .iter()
+        .filter(|c| matches!(c.conn_type.as_str(), "SSH" | "MOSH" | "ET"))
+        .collect();
+    if ssh_conns.is_empty() {
+        return None;
+    }
+
+    let target_host = mux_host.map(strip_ssh_user).unwrap_or(local_host);
+    if !target_host.is_empty()
+        && let Some(found) = ssh_conns.iter().find(|c| {
+            c.host.eq_ignore_ascii_case(target_host)
+                || c.label.eq_ignore_ascii_case(target_host)
+                || (mux_host.is_none()
+                    && (c.host.eq_ignore_ascii_case("localhost") || c.host == "127.0.0.1"))
+        })
+    {
+        return Some(found.id.clone());
+    }
+
+    if mux_host.is_none() && ssh_conns.len() == 1 {
+        return Some(ssh_conns[0].id.clone());
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_handoff_to_peer(
+    url: &str,
+    bearer_token: &str,
+    rpc_seq: u64,
+    allow_lan: bool,
+    peer_id: &str,
+    peer_label: &str,
+    session_name: &str,
+    mux_host: Option<&str>,
+    explicit_profile_id: Option<&str>,
+    default_ssh_profile: Option<&str>,
+    local_host: &str,
+) -> Result<PeerHandoffSummary, String> {
+    // 1. Check `list_sessions` on Haven (`ConsentLevel.NEVER`) for an already
+    //    connected session attached to `session_name`.
+    let sessions_raw = call_remote_tool(
+        url,
+        bearer_token,
+        rpc_seq,
+        "list_sessions",
+        json!({}),
+        allow_lan,
+    )?;
+    let sessions_obj = extract_mcp_tool_json(&sessions_raw)?;
+    let live_sessions = parse_haven_sessions(&sessions_obj);
+
+    if let Some(existing) = live_sessions.iter().find(|s| {
+        s.status.eq_ignore_ascii_case("connected")
+            && s.chosen_session_name.as_deref() == Some(session_name)
+    }) {
+        call_remote_tool(
+            url,
+            bearer_token,
+            rpc_seq.wrapping_add(1),
+            "focus_terminal_session",
+            json!({ "sessionId": existing.session_id }),
+            allow_lan,
+        )?;
+        return Ok(PeerHandoffSummary {
+            action: String::from("focused"),
+            peer_id: peer_id.to_owned(),
+            peer_label: peer_label.to_owned(),
+            session_name: session_name.to_owned(),
+            haven_session_id: Some(existing.session_id.clone()),
+            profile_id: (!existing.profile_id.is_empty()).then(|| existing.profile_id.clone()),
+        });
+    }
+
+    // 2. Otherwise resolve the target SSH profile and invoke `connect_profile`
+    //    with `sessionName` (`65 s` window for `ConsentLevel.ONCE_PER_SESSION`).
+    let profile_id = if let Some(exp) = explicit_profile_id.map(str::trim).filter(|s| !s.is_empty())
+    {
+        exp.to_owned()
+    } else {
+        let conns = fetch_haven_connections(url, bearer_token, rpc_seq.wrapping_add(1), allow_lan)?;
+        resolve_haven_ssh_profile(&conns, default_ssh_profile, mux_host, local_host).ok_or_else(
+            || {
+                let names: Vec<String> = conns
+                    .iter()
+                    .filter(|c| matches!(c.conn_type.as_str(), "SSH" | "MOSH" | "ET"))
+                    .map(|c| format!("{} ({})", c.label, c.id))
+                    .collect();
+                if names.is_empty() {
+                    String::from(
+                        "Haven has no saved SSH connection profiles; create an SSH profile on Haven or pass --profile-id",
+                    )
+                } else {
+                    format!(
+                        "could not match a Haven SSH profile for {:?}; pass --profile-id or set [peer] default_haven_ssh_profile (available: {})",
+                        mux_host.unwrap_or(local_host),
+                        names.join(", ")
+                    )
+                }
+            },
+        )?
+    };
+
+    call_remote_tool_with_timeout(
+        url,
+        bearer_token,
+        rpc_seq.wrapping_add(2),
+        "connect_profile",
+        json!({
+            "profileId": profile_id,
+            "sessionName": session_name,
+        }),
+        PAIRING_READ_TIMEOUT,
+        allow_lan,
+    )?;
+
+    Ok(PeerHandoffSummary {
+        action: String::from("connected"),
+        peer_id: peer_id.to_owned(),
+        peer_label: peer_label.to_owned(),
+        session_name: session_name.to_owned(),
+        haven_session_id: None,
+        profile_id: Some(profile_id),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_present_to_peer(
+    url: &str,
+    bearer_token: &str,
+    rpc_seq: u64,
+    allow_lan: bool,
+    peer_id: &str,
+    peer_label: &str,
+    plan: PresentPlan,
+    default_ssh_profile: Option<&str>,
+    local_host: &str,
+) -> Result<PeerPresentSummary, String> {
+    let resolve_backend_profile = |explicit: Option<&str>| -> String {
+        if let Some(exp) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return exp.to_owned();
+        }
+        if let Ok(conns) = fetch_haven_connections(url, bearer_token, rpc_seq, allow_lan)
+            && let Some(prof) =
+                resolve_haven_ssh_profile(&conns, default_ssh_profile, None, local_host)
+        {
+            return prof;
+        }
+        default_ssh_profile
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("local")
+            .to_owned()
+    };
+
+    match plan {
+        PresentPlan::Clipboard { text } => {
+            call_remote_tool_with_timeout(
+                url,
+                bearer_token,
+                rpc_seq.wrapping_add(1),
+                "write_clipboard",
+                json!({ "text": text }),
+                PAIRING_READ_TIMEOUT,
+                allow_lan,
+            )?;
+            Ok(PeerPresentSummary {
+                tool: String::from("write_clipboard"),
+                peer_id: peer_id.to_owned(),
+                peer_label: peer_label.to_owned(),
+                profile_id: None,
+            })
+        }
+        PresentPlan::MediaUrl {
+            url: media_url,
+            mime_type,
+            caption,
+        } => {
+            let mut args = json!({ "url": media_url });
+            if let Some(m) = mime_type {
+                args["mimeType"] = Value::String(m);
+            }
+            if let Some(c) = caption {
+                args["caption"] = Value::String(c);
+            }
+            call_remote_tool(
+                url,
+                bearer_token,
+                rpc_seq.wrapping_add(1),
+                "present_media",
+                args,
+                allow_lan,
+            )?;
+            Ok(PeerPresentSummary {
+                tool: String::from("present_media"),
+                peer_id: peer_id.to_owned(),
+                peer_label: peer_label.to_owned(),
+                profile_id: None,
+            })
+        }
+        PresentPlan::MediaPath {
+            path,
+            mime_type,
+            explicit_profile_id,
+            caption,
+        } => {
+            let profile_id = resolve_backend_profile(explicit_profile_id.as_deref());
+            let mut args = json!({
+                "profileId": profile_id,
+                "path": path,
+                "mimeType": mime_type,
+            });
+            if let Some(c) = caption {
+                args["caption"] = Value::String(c);
+            }
+            call_remote_tool(
+                url,
+                bearer_token,
+                rpc_seq.wrapping_add(1),
+                "present_media",
+                args,
+                allow_lan,
+            )?;
+            Ok(PeerPresentSummary {
+                tool: String::from("present_media"),
+                peer_id: peer_id.to_owned(),
+                peer_label: peer_label.to_owned(),
+                profile_id: Some(profile_id),
+            })
+        }
+        PresentPlan::WebUrl {
+            url: web_url,
+            caption,
+        } => {
+            let mut args = json!({ "url": web_url });
+            if let Some(c) = caption {
+                args["caption"] = Value::String(c);
+            }
+            call_remote_tool(
+                url,
+                bearer_token,
+                rpc_seq.wrapping_add(1),
+                "present_web",
+                args,
+                allow_lan,
+            )?;
+            Ok(PeerPresentSummary {
+                tool: String::from("present_web"),
+                peer_id: peer_id.to_owned(),
+                peer_label: peer_label.to_owned(),
+                profile_id: None,
+            })
+        }
+        PresentPlan::WebPath {
+            path,
+            explicit_profile_id,
+            caption,
+        } => {
+            let profile_id = resolve_backend_profile(explicit_profile_id.as_deref());
+            let mut args = json!({
+                "profileId": profile_id,
+                "path": path,
+            });
+            if let Some(c) = caption {
+                args["caption"] = Value::String(c);
+            }
+            call_remote_tool(
+                url,
+                bearer_token,
+                rpc_seq.wrapping_add(1),
+                "present_web",
+                args,
+                allow_lan,
+            )?;
+            Ok(PeerPresentSummary {
+                tool: String::from("present_web"),
+                peer_id: peer_id.to_owned(),
+                peer_label: peer_label.to_owned(),
+                profile_id: Some(profile_id),
+            })
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -2215,5 +3160,69 @@ mod tests {
         assert!(parse_and_validate_peer_url("http://169.254.1.2:8740/mcp", false).is_err());
         assert!(parse_and_validate_peer_url("http://169.254.1.2:8740/mcp", true).is_ok());
         assert!(parse_and_validate_peer_url("http://8.8.8.8:8740/mcp", true).is_err());
+    }
+
+    #[test]
+    fn classify_present_target_routes_media_web_and_clipboard_and_rejects_ambiguous() {
+        use std::path::Path;
+
+        assert_eq!(
+            classify_present_target(
+                None,
+                Some(Path::new("/tmp/chart.png")),
+                None,
+                Some("ws-1"),
+                Some("Latency"),
+            )
+            .unwrap(),
+            PresentPlan::MediaPath {
+                path: String::from("/tmp/chart.png"),
+                mime_type: String::from("image/png"),
+                explicit_profile_id: Some(String::from("ws-1")),
+                caption: Some(String::from("Latency")),
+            }
+        );
+
+        assert_eq!(
+            classify_present_target(None, Some(Path::new("/tmp/report.pdf")), None, None, None,)
+                .unwrap(),
+            PresentPlan::WebPath {
+                path: String::from("/tmp/report.pdf"),
+                explicit_profile_id: None,
+                caption: None,
+            }
+        );
+
+        assert_eq!(
+            classify_present_target(
+                Some("https://example.com/spec"),
+                None,
+                None,
+                None,
+                Some("Spec"),
+            )
+            .unwrap(),
+            PresentPlan::WebUrl {
+                url: String::from("https://example.com/spec"),
+                caption: Some(String::from("Spec")),
+            }
+        );
+
+        assert_eq!(
+            classify_present_target(None, None, Some("clip-payload"), None, None).unwrap(),
+            PresentPlan::Clipboard {
+                text: String::from("clip-payload"),
+            }
+        );
+
+        assert!(classify_present_target(None, None, None, None, None).is_err());
+        assert!(
+            classify_present_target(Some("https://example.com"), None, Some("both"), None, None)
+                .is_err()
+        );
+        assert!(
+            classify_present_target(None, Some(Path::new("relative.png")), None, None, None)
+                .is_err()
+        );
     }
 }

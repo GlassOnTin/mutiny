@@ -79,10 +79,10 @@ fn settings_dialog_covers_every_key_and_saves_a_loadable_file() {
         .find(|w| w.title().as_deref() == Some("Settings"))
         .expect("a dialog titled Settings");
 
-    // font 2 + colors 5 + palette 16 + geometry 6 + terminal 1 + sessions 13 + peer 2 + notifications 3
+    // font 2 + colors 5 + palette 16 + geometry 6 + terminal 1 + sessions 14 + peer 3 + notifications 3
     let inputs = count_inputs(dialog.upcast_ref::<gtk4::Widget>());
     assert!(
-        inputs >= 48,
+        inputs >= 50,
         "the dialog must expose every config key, found only {inputs} inputs"
     );
 

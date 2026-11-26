@@ -36,11 +36,12 @@ use crate::notify::{
 };
 use crate::peer_client::{
     HavenAuthPrompt, HavenPeerClientHandle, PeerClientEvent, PeerPollConfig,
-    parse_and_validate_peer_url,
+    classify_present_target, parse_and_validate_peer_url,
 };
 use crate::peers::{
-    self, InboundPeer, InboundPeerTable, LiveInboundPeer, OutboundLimbStatus, OutboundPeerSummary,
-    OutboundPeerTelemetry, PeerAlert, PeerAlertKind, PeerStore, PeersListing, unix_now_secs,
+    self, HavenLimbInventory, InboundPeer, InboundPeerTable, LiveInboundPeer, OutboundLimbStatus,
+    OutboundPeerSummary, OutboundPeerTelemetry, PeerAlert, PeerAlertKind, PeerStore, PeersListing,
+    unix_now_secs,
 };
 use crate::session::{self, SessionState};
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
@@ -196,6 +197,11 @@ pub struct AppController {
     outbound_statuses: RefCell<HashMap<String, OutboundLimbStatus>>,
     pairing_outbound_label: RefCell<Option<String>>,
     pending_pair_replies: RefCell<HashMap<u64, UnixStream>>,
+    pending_handoff_replies: RefCell<HashMap<u64, UnixStream>>,
+    pending_present_replies: RefCell<HashMap<u64, UnixStream>>,
+    limb_inventories: RefCell<HashMap<String, HavenLimbInventory>>,
+    pending_tree_reply: RefCell<Option<UnixStream>>,
+    tree_awaiting_limbs: Cell<bool>,
     next_pair_req_id: Cell<u64>,
     consent_replay_cache: RefCell<crypto::GrantReplayCache>,
     haven_auth_prompts: RefCell<HashMap<String, (String, HavenAuthPrompt)>>,
@@ -351,6 +357,11 @@ impl AppController {
             outbound_statuses: RefCell::new(HashMap::new()),
             pairing_outbound_label: RefCell::new(None),
             pending_pair_replies: RefCell::new(HashMap::new()),
+            pending_handoff_replies: RefCell::new(HashMap::new()),
+            pending_present_replies: RefCell::new(HashMap::new()),
+            limb_inventories: RefCell::new(HashMap::new()),
+            pending_tree_reply: RefCell::new(None),
+            tree_awaiting_limbs: Cell::new(false),
             next_pair_req_id: Cell::new(1),
             consent_replay_cache: RefCell::new(crypto::GrantReplayCache::default()),
             haven_auth_prompts: RefCell::new(HashMap::new()),
@@ -1448,6 +1459,7 @@ impl AppController {
 
         for out_id in &removed_outbound_ids {
             self.outbound_statuses.borrow_mut().remove(out_id);
+            self.limb_inventories.borrow_mut().remove(out_id);
             self.outbound_rate_limiters.borrow_mut().remove(out_id);
             self.peer_shade_statuses.borrow_mut().remove(out_id);
             self.remote_consent_prompts.borrow_mut().remove(out_id);
@@ -1456,6 +1468,10 @@ impl AppController {
             self.dismissed_auth_prompts
                 .borrow_mut()
                 .retain(|(pid, _)| pid != out_id);
+        }
+        if !removed_outbound_ids.is_empty() {
+            self.bump_cache_gen();
+            self.refresh_session_pickers();
         }
         self.peer_alerts.borrow_mut().retain(|a| {
             !removed_outbound_ids.contains(&a.peer_id)
@@ -1520,6 +1536,16 @@ impl AppController {
         for (_, mut stream) in self.pending_pair_replies.borrow_mut().drain() {
             let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
         }
+        for (_, mut stream) in self.pending_handoff_replies.borrow_mut().drain() {
+            let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
+        }
+        for (_, mut stream) in self.pending_present_replies.borrow_mut().drain() {
+            let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
+        }
+        if let Some(mut stream) = self.pending_tree_reply.borrow_mut().take() {
+            let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
+        }
+        self.tree_awaiting_limbs.set(false);
         if let Some(mut client) = self.peer_client.borrow_mut().take() {
             client.stop();
         }
@@ -1772,6 +1798,348 @@ impl AppController {
             return Err(String::from("no outbound Haven peer client active"));
         };
         client.generate_totp_code(peer_id, totp_secret_id, target_pane)
+    }
+
+    pub fn session_tree(&self) -> session::SessionTree {
+        let ws = self.workspace.borrow();
+        let inv = self.session_cache.borrow();
+        let cfg = self.config.borrow();
+        let peers = self.list_peers();
+        let limb_invs = self.limb_inventories.borrow();
+        session::build_session_tree(
+            &ws,
+            &inv,
+            &cfg.session_hosts,
+            cfg.root_session.as_deref(),
+            &peers,
+            &limb_invs,
+        )
+    }
+
+    fn session_tree_response(&self) -> IpcResponse {
+        let mut resp = IpcResponse::empty_ok();
+        if let IpcResponse::Ok { session_tree, .. } = &mut resp {
+            *session_tree = Some(self.session_tree());
+        }
+        resp
+    }
+
+    pub fn refresh_haven_limb_inventories(&self) -> bool {
+        if let Some(client) = self.peer_client.borrow().as_ref() {
+            client.refresh_limb_inventories();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focus_haven_terminal_session(
+        &self,
+        peer_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let guard = self.peer_client.borrow();
+        let Some(client) = guard.as_ref() else {
+            return Err(String::from("no outbound Haven peer client active"));
+        };
+        client.focus_remote_session(peer_id.to_owned(), session_id.to_owned())
+    }
+
+    /// Opens up to `9` multiplexer sessions tiled into a balanced multi-pane
+    /// overview window in one operation (`Q20`).
+    pub fn open_session_grid(
+        self: &Rc<Self>,
+        sessions: Vec<String>,
+        kind: Option<MuxKind>,
+        host: Option<&str>,
+    ) -> io::Result<(WindowId, TabId, PaneId)> {
+        const MAX_GRID_PANES: usize = 9;
+        if let Some(h) = host {
+            mux::validate_host(h).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        }
+        let target_host: Option<String> = host.map(|h| mux::sanitize_text(h, 64));
+        let mut targets: Vec<(MuxKind, String, Option<String>)> = Vec::new();
+        if !sessions.is_empty() {
+            let resolved_kind = kind
+                .or_else(|| self.config.borrow().preferred_mux)
+                .unwrap_or(MuxKind::Tmux);
+            for raw in sessions {
+                let clean = mux::sanitize_text(raw.trim(), 64);
+                if clean.is_empty() || targets.iter().any(|(_, n, _)| n == &clean) {
+                    continue;
+                }
+                targets.push((resolved_kind, clean, target_host.clone()));
+                if targets.len() >= MAX_GRID_PANES {
+                    break;
+                }
+            }
+        } else {
+            let cache = self.session_cache.borrow();
+            let mut candidates: Vec<&MuxSession> = cache
+                .sessions
+                .iter()
+                .filter(|s| {
+                    !s.exited
+                        && s.host.as_deref() == target_host.as_deref()
+                        && kind.is_none_or(|k| s.kind == k)
+                })
+                .collect();
+            candidates.sort_by(|a, b| a.name.cmp(&b.name));
+            let unattached: Vec<&MuxSession> = candidates
+                .iter()
+                .copied()
+                .filter(|s| s.kind != MuxKind::Tmux || s.attached == 0)
+                .collect();
+            let chosen = if !unattached.is_empty() {
+                unattached
+            } else {
+                candidates
+            };
+            for s in chosen.into_iter().take(MAX_GRID_PANES) {
+                if !targets.iter().any(|(k, n, _)| *k == s.kind && n == &s.name) {
+                    targets.push((s.kind, s.name.clone(), s.host.clone()));
+                }
+            }
+        }
+
+        if targets.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no multiplexer sessions available for grid; pass --sessions or start sessions first",
+            ));
+        }
+
+        let opts = self.config.borrow().sessions.clone();
+        let inherited_cwd = if target_host.is_some() {
+            None
+        } else {
+            self.active_cwd(None, None)
+        };
+        let mut entries = Vec::with_capacity(targets.len());
+        for (k, name, h) in targets {
+            let command = match h.as_deref() {
+                None => mux::attach_argv(k, &name, &opts),
+                Some(remote) => mux::remote_attach_argv(remote, k, &name, &opts)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+            };
+            let pid = self.workspace.borrow_mut().reserve_pane_id();
+            let mut engine = self.spawn_engine(pid, inherited_cwd.clone(), Some(command))?;
+            engine.set_title(name.clone());
+            engine.set_mux_session(Some(mux::MuxSessionRef {
+                kind: k,
+                name,
+                host: h,
+            }));
+            entries.push((pid, engine));
+        }
+        let (win_id, tab_id, first_pane) = self
+            .workspace
+            .borrow_mut()
+            .insert_window_with_grid(entries, self.default_menubar.get())
+            .expect("targets validated non-empty");
+        self.ensure_ui_window(win_id);
+        self.sync_ui_window(win_id);
+        Ok((win_id, tab_id, first_pane))
+    }
+
+    pub fn detect_pane_mux_backing(
+        &self,
+        pid: PaneId,
+    ) -> Result<Option<mux::MuxSessionRef>, String> {
+        let ws = self.workspace.borrow();
+        let Some(eng) = ws.pane(pid) else {
+            return Err(format!("pane {pid} not found"));
+        };
+        if let Some(mref) = eng.mux_session() {
+            return Ok(Some(mref.clone()));
+        }
+        if let Some((kind, name)) = eng.pty_raw_fd().and_then(mux::detect_foreground_mux_on_pty) {
+            return Ok(Some(mux::MuxSessionRef {
+                kind,
+                name,
+                host: None,
+            }));
+        }
+        if let Some((kind, name)) = mux::detect_mux_from_text(eng.title()) {
+            return Ok(Some(mux::MuxSessionRef {
+                kind,
+                name,
+                host: None,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn resolve_target_outbound_peer_id(&self, requested: Option<&str>) -> Result<String, String> {
+        let store = self.peer_store.borrow();
+        let statuses = self.outbound_statuses.borrow();
+        if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(peer) = store
+                .outbound_peers
+                .iter()
+                .find(|p| p.id == req || p.label == req)
+            else {
+                return Err(format!("no paired outbound Haven peer matching {req:?}"));
+            };
+            if matches!(
+                statuses.get(&peer.id),
+                Some(OutboundLimbStatus::Offline { .. })
+            ) {
+                return Err(format!("Haven peer '{}' is offline", peer.label));
+            }
+            return Ok(peer.id.clone());
+        }
+        if let Some(connected_id) = store.outbound_peers.iter().find_map(|p| {
+            matches!(
+                statuses.get(&p.id),
+                Some(OutboundLimbStatus::Connected { .. })
+            )
+            .then(|| p.id.clone())
+        }) {
+            return Ok(connected_id);
+        }
+        if let Some(first) = store.outbound_peers.first() {
+            if matches!(
+                statuses.get(&first.id),
+                Some(OutboundLimbStatus::Offline { .. })
+            ) {
+                return Err(format!("Haven peer '{}' is offline", first.label));
+            }
+            return Ok(first.id.clone());
+        }
+        Err(String::from("no paired outbound Haven peer"))
+    }
+
+    pub fn begin_handoff_to_peer(
+        &self,
+        pane: Option<PaneId>,
+        peer: Option<String>,
+        profile_id: Option<String>,
+        reply: Option<UnixStream>,
+    ) -> Result<(), String> {
+        let pid = pane
+            .or_else(|| self.workspace.borrow().active_pane_id())
+            .ok_or_else(|| String::from("no active pane"))?;
+        let Some(mux_ref) = self.detect_pane_mux_backing(pid)? else {
+            let notice = String::from(
+                "Bare non-mux shell cannot be handed off live; attach a tmux or zellij session (Ctrl+Shift+S) first.",
+            );
+            if let Some(eng) = self.workspace.borrow_mut().pane_mut(pid) {
+                eng.set_agent_notice(Some(notice));
+            }
+            self.refresh_all_window_chromes();
+            return Err(format!(
+                "pane {pid} is a bare non-mux shell; attach it to a tmux or zellij session (open-session / new-session) for live handoff to Haven"
+            ));
+        };
+
+        let peer_id = self.resolve_target_outbound_peer_id(peer.as_deref())?;
+        if self.peer_client.borrow().is_none() {
+            let initial = self.peer_store.borrow().outbound_peers.clone();
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+            self.force_push_shade_poll_state();
+        }
+        let req_id = self.next_pair_req_id.get();
+        self.next_pair_req_id.set(req_id + 1);
+        if let Some(stream) = reply {
+            self.pending_handoff_replies
+                .borrow_mut()
+                .insert(req_id, stream);
+        }
+        let default_profile = self.config.borrow().default_haven_ssh_profile.clone();
+        let send_res = self
+            .peer_client
+            .borrow()
+            .as_ref()
+            .expect("peer client spawned")
+            .handoff_to_peer(
+                req_id,
+                peer_id,
+                mux_ref.name,
+                mux_ref.host,
+                profile_id,
+                default_profile,
+                mux::local_hostname(),
+            );
+        if let Err(err) = send_res {
+            self.pending_handoff_replies.borrow_mut().remove(&req_id);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_present_to_peer(
+        &self,
+        peer: Option<String>,
+        url: Option<String>,
+        path: Option<PathBuf>,
+        text: Option<String>,
+        clipboard: bool,
+        profile_id: Option<String>,
+        caption: Option<String>,
+        reply: Option<UnixStream>,
+    ) -> Result<(), String> {
+        let resolved_text = if text.is_some() {
+            text
+        } else if clipboard {
+            let sel = self.workspace.borrow().active_pane_id().and_then(|pid| {
+                self.workspace
+                    .borrow()
+                    .pane(pid)
+                    .and_then(|e| e.selection_text())
+            });
+            match sel {
+                Some(s) if !s.is_empty() => Some(s),
+                _ => {
+                    return Err(String::from(
+                        "no active terminal selection to copy; select text in a pane or pass --text",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let plan = classify_present_target(
+            url.as_deref(),
+            path.as_deref(),
+            resolved_text.as_deref(),
+            profile_id.as_deref(),
+            caption.as_deref(),
+        )?;
+        let peer_id = self.resolve_target_outbound_peer_id(peer.as_deref())?;
+        if self.peer_client.borrow().is_none() {
+            let initial = self.peer_store.borrow().outbound_peers.clone();
+            let cfg = self.peer_poll_config.borrow().clone();
+            *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+            self.force_push_shade_poll_state();
+        }
+        let req_id = self.next_pair_req_id.get();
+        self.next_pair_req_id.set(req_id + 1);
+        if let Some(stream) = reply {
+            self.pending_present_replies
+                .borrow_mut()
+                .insert(req_id, stream);
+        }
+        let default_profile = self.config.borrow().default_haven_ssh_profile.clone();
+        let send_res = self
+            .peer_client
+            .borrow()
+            .as_ref()
+            .expect("peer client spawned")
+            .present_to_peer(
+                req_id,
+                peer_id,
+                plan,
+                default_profile,
+                mux::local_hostname(),
+            );
+        if let Err(err) = send_res {
+            self.pending_present_replies.borrow_mut().remove(&req_id);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Labels of the granted peer identities, for the audit dialog. The grant
@@ -2592,6 +2960,16 @@ impl AppController {
         if let Some(mut stream) = self.pending_session_reply.borrow_mut().take() {
             let _ = write_response(&mut stream, &self.inventory_response());
         }
+        self.maybe_finish_tree_reply();
+    }
+
+    fn maybe_finish_tree_reply(&self) {
+        if self.discovery_in_flight() || self.tree_awaiting_limbs.get() {
+            return;
+        }
+        if let Some(mut stream) = self.pending_tree_reply.borrow_mut().take() {
+            let _ = write_response(&mut stream, &self.session_tree_response());
+        }
     }
 
     fn inventory_response(&self) -> IpcResponse {
@@ -2802,6 +3180,10 @@ impl AppController {
             }
         }
         self.pending_session_reply.borrow_mut().take();
+        if let Some(mut stream) = self.pending_tree_reply.borrow_mut().take() {
+            let _ = write_response(&mut stream, &IpcResponse::err("server shutting down"));
+        }
+        self.tree_awaiting_limbs.set(false);
         self.discovery_deadline.set(None);
     }
 
@@ -3302,6 +3684,23 @@ impl AppController {
                     && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
                 {
                     ui_win.show_session_picker();
+                }
+            }
+            ActionId::OpenSessionGrid => {
+                if let Err(err) = self.open_session_grid(Vec::new(), None, None) {
+                    eprintln!("warning: open-session-grid: {err}");
+                }
+            }
+            ActionId::HandoffToPeer => {
+                if let Err(err) = self.begin_handoff_to_peer(active_pane, None, None, None) {
+                    eprintln!("warning: handoff-to-peer: {err}");
+                }
+            }
+            ActionId::PresentToPeer => {
+                if let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.show_present_to_peer_dialog();
                 }
             }
             ActionId::AgentAudit => {
@@ -4037,6 +4436,78 @@ impl AppController {
             IpcRequest::ClearPeerAlerts => {
                 self.clear_peer_alerts();
                 Some(IpcResponse::empty_ok())
+            }
+            IpcRequest::SessionTree { refresh } => {
+                if !refresh {
+                    return Some(self.session_tree_response());
+                }
+                if self.pending_tree_reply.borrow().is_some() {
+                    return Some(self.session_tree_response());
+                }
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                let awaiting_limbs = self.refresh_haven_limb_inventories();
+                self.tree_awaiting_limbs.set(awaiting_limbs);
+                *self.pending_tree_reply.borrow_mut() = Some(cloned);
+                if !self.discovery_in_flight() {
+                    self.begin_discovery(vec![None], true, None);
+                }
+                self.maybe_finish_tree_reply();
+                None
+            }
+            IpcRequest::OpenSessionGrid {
+                sessions,
+                kind,
+                host,
+            } => match self.open_session_grid(sessions, kind, host.as_deref()) {
+                Ok((w, t, p)) => {
+                    let mut resp = ids_ok(Some(w), Some(t), Some(p));
+                    if let IpcResponse::Ok { workspace, .. } = &mut resp {
+                        *workspace = Some(self.workspace.borrow().summary());
+                    }
+                    Some(resp)
+                }
+                Err(err) => Some(IpcResponse::err(err.to_string())),
+            },
+            IpcRequest::HandoffToPeer {
+                pane,
+                peer,
+                profile_id,
+            } => {
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                match self.begin_handoff_to_peer(pane, peer, profile_id, Some(cloned)) {
+                    Ok(()) => None,
+                    Err(err) => Some(IpcResponse::err(err)),
+                }
+            }
+            IpcRequest::PresentToPeer {
+                peer,
+                url,
+                path,
+                text,
+                clipboard,
+                profile_id,
+                caption,
+            } => {
+                let Ok(cloned) = raw_stream.try_clone() else {
+                    return Some(IpcResponse::err("could not clone the request stream"));
+                };
+                match self.begin_present_to_peer(
+                    peer,
+                    url,
+                    path,
+                    text,
+                    clipboard,
+                    profile_id,
+                    caption,
+                    Some(cloned),
+                ) {
+                    Ok(()) => None,
+                    Err(err) => Some(IpcResponse::err(err)),
+                }
             }
             IpcRequest::EndSession { kind, name, host } => {
                 let Ok(cloned) = raw_stream.try_clone() else {
@@ -4866,6 +5337,11 @@ impl AppController {
                         {
                             entry.last_connected_at = Some(ts);
                         }
+                        if matches!(status, OutboundLimbStatus::Offline { .. })
+                            && self.limb_inventories.borrow_mut().remove(&pid).is_some()
+                        {
+                            self.bump_cache_gen();
+                        }
                         match (&prev, &status) {
                             (
                                 Some(OutboundLimbStatus::Connected { .. }),
@@ -5402,6 +5878,68 @@ impl AppController {
                 PeerClientEvent::TotpError(err) => {
                     eprintln!("warning: Haven TOTP request failed: {err}");
                 }
+                PeerClientEvent::LimbInventoryUpdated { peer_id, inventory } => {
+                    let changed = self
+                        .limb_inventories
+                        .borrow_mut()
+                        .insert(peer_id, inventory.clone())
+                        .as_ref()
+                        != Some(&inventory);
+                    if changed {
+                        self.bump_cache_gen();
+                        self.refresh_session_pickers();
+                    }
+                }
+                PeerClientEvent::LimbInventoriesRefreshed => {
+                    self.tree_awaiting_limbs.set(false);
+                    self.maybe_finish_tree_reply();
+                    self.bump_cache_gen();
+                    self.refresh_session_pickers();
+                }
+                PeerClientEvent::HandoffCompleted { req_id, result } => {
+                    let reply_stream = self.pending_handoff_replies.borrow_mut().remove(&req_id);
+                    match result {
+                        Ok(summary) => {
+                            let _ = self.refresh_haven_limb_inventories();
+                            if let Some(mut stream) = reply_stream {
+                                let mut resp = IpcResponse::empty_ok();
+                                if let IpcResponse::Ok { handoff, .. } = &mut resp {
+                                    *handoff = Some(summary);
+                                }
+                                let _ = write_response(&mut stream, &resp);
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(mut stream) = reply_stream {
+                                let _ = write_response(&mut stream, &IpcResponse::err(err));
+                            } else {
+                                eprintln!("warning: handoff-to-peer failed: {err}");
+                            }
+                        }
+                    }
+                    refresh_ui = true;
+                }
+                PeerClientEvent::PresentCompleted { req_id, result } => {
+                    let reply_stream = self.pending_present_replies.borrow_mut().remove(&req_id);
+                    match result {
+                        Ok(summary) => {
+                            if let Some(mut stream) = reply_stream {
+                                let mut resp = IpcResponse::empty_ok();
+                                if let IpcResponse::Ok { presented, .. } = &mut resp {
+                                    *presented = Some(summary);
+                                }
+                                let _ = write_response(&mut stream, &resp);
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(mut stream) = reply_stream {
+                                let _ = write_response(&mut stream, &IpcResponse::err(err));
+                            } else {
+                                eprintln!("warning: present-to-peer failed: {err}");
+                            }
+                        }
+                    }
+                }
                 PeerClientEvent::ToolCallCompleted { .. } => {}
             }
         }
@@ -5486,6 +6024,9 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         peers: None,
         outbound_peer: None,
         peer_alerts: None,
+        session_tree: None,
+        handoff: None,
+        presented: None,
         visible: None,
     }
 }

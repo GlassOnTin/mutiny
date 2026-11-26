@@ -10,7 +10,7 @@ use gtk4::prelude::*;
 use crate::action::{ACTIONS, ActionId, build_menubar_model, filter_palette};
 use crate::app::{AppController, ConsentResolution};
 use crate::engine::AttentionReason;
-use crate::mux::{HostState, MuxInventory, MuxKind, MuxSession, SessionMode};
+use crate::mux::{HostState, MuxInventory, MuxKind, SessionMode};
 use crate::topology::{PaneId, SplitAxis, SplitNode, TabId, WindowId};
 use crate::ui::terminal_view::TerminalView;
 
@@ -743,6 +743,7 @@ impl MutinyWindow {
         for name in [
             crate::action::CLOSE_TAB_TARGET,
             crate::action::DETACH_TAB_TARGET,
+            crate::action::HANDOFF_TAB_TARGET,
             crate::action::RENAME_TAB_TARGET,
             crate::action::COPY_NAME_TAB_TARGET,
             crate::action::END_TAB_TARGET,
@@ -773,6 +774,20 @@ impl MutinyWindow {
                             .map(|t| t.active_pane);
                         if let Some(pane) = pane {
                             let _ = ctrl.detach_split(Some(pane));
+                        }
+                    }
+                    "handoff-session-tab" => {
+                        let pane = ctrl
+                            .workspace
+                            .borrow()
+                            .window(win_id)
+                            .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                            .map(|t| t.active_pane);
+                        if let Some(pane) = pane
+                            && let Err(err) =
+                                ctrl.begin_handoff_to_peer(Some(pane), None, None, None)
+                        {
+                            eprintln!("warning: handoff-to-peer: {err}");
                         }
                     }
                     "rename-session-tab" => this.show_rename_dialog(tab),
@@ -1000,7 +1015,21 @@ impl MutinyWindow {
 
     pub fn session_picker_selected(&self) -> Option<String> {
         let picker = self.inner.session_picker.borrow().clone()?;
-        picker.selected_row_session().map(|s| s.name)
+        picker.selected_row_item().map(|item| item.name)
+    }
+
+    pub fn session_picker_group_headers(&self) -> Vec<String> {
+        let Some(picker) = self.inner.session_picker.borrow().clone() else {
+            return Vec::new();
+        };
+        picker.group_headers.borrow().clone()
+    }
+
+    pub fn session_picker_item_labels(&self) -> Vec<String> {
+        let Some(picker) = self.inner.session_picker.borrow().clone() else {
+            return Vec::new();
+        };
+        picker.item_labels.borrow().clone()
     }
 
     /// Current tab button labels, including status badges. Exposed so tests
@@ -1981,6 +2010,11 @@ impl MutinyWindow {
             current.sessions.show_exited,
             Box::new(|c, v| c.sessions.show_exited = v),
         );
+        entry(
+            "Constellation root session (blank = none)",
+            &current.sessions.root_session,
+            Box::new(|c, v| c.sessions.root_session = v.trim().to_owned()),
+        );
 
         heading("Peer");
         check(
@@ -1995,6 +2029,21 @@ impl MutinyWindow {
             60_000.0,
             100.0,
             Box::new(|c, v| c.peer.unfocused_grace_ms = v as u64),
+        );
+        entry(
+            "Default Haven SSH profile ID (blank = auto)",
+            current
+                .peer
+                .default_haven_ssh_profile
+                .as_deref()
+                .unwrap_or(""),
+            Box::new(|c, v| {
+                c.peer.default_haven_ssh_profile = if v.trim().is_empty() {
+                    None
+                } else {
+                    Some(v.trim().to_owned())
+                };
+            }),
         );
 
         heading("Notifications");
@@ -2214,10 +2263,9 @@ impl MutinyWindow {
         search.grab_focus();
     }
 
-    /// Lists tmux and zellij sessions, local and remote, and opens the chosen
-    /// one in a new tab (Return) or window (Shift+Return). Cloned from the
-    /// command palette's structure: a separate modal top-level, so a topology
-    /// rebuild cannot tear it down.
+    /// Lists local sessions (with constellation root nesting), SSH hosts, and
+    /// paired Haven limbs (`list_sessions` + `list_bridges`), and opens or
+    /// focuses the chosen item.
     pub fn show_session_picker(&self) {
         let Some(ctrl) = self.inner.controller.upgrade() else {
             return;
@@ -2228,8 +2276,8 @@ impl MutinyWindow {
             .modal(true)
             .destroy_with_parent(true)
             .title("Sessions")
-            .default_width(620)
-            .default_height(440)
+            .default_width(660)
+            .default_height(460)
             .build();
 
         let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -2239,7 +2287,7 @@ impl MutinyWindow {
         vbox.set_margin_end(10);
 
         let search = gtk4::SearchEntry::new();
-        search.set_placeholder_text(Some("Filter by session, host, or multiplexer…"));
+        search.set_placeholder_text(Some("Filter by session, host, limb, or multiplexer…"));
         vbox.append(&search);
 
         let list = gtk4::ListBox::new();
@@ -2256,12 +2304,15 @@ impl MutinyWindow {
         hint.set_xalign(0.0);
         hint.set_hexpand(true);
         hint.add_css_class("dim-label");
+        let open_grid = gtk4::Button::with_label("Open Grid");
+        open_grid.set_can_focus(false);
         let refresh = gtk4::Button::with_label("Refresh");
         refresh.set_can_focus(false);
         let status = gtk4::Label::new(None);
         status.add_css_class("dim-label");
         footer.append(&hint);
         footer.append(&status);
+        footer.append(&open_grid);
         footer.append(&refresh);
         vbox.append(&footer);
         dialog.set_child(Some(&vbox));
@@ -2272,6 +2323,8 @@ impl MutinyWindow {
             search: search.clone(),
             status,
             rows: RefCell::new(Vec::new()),
+            group_headers: RefCell::new(Vec::new()),
+            item_labels: RefCell::new(Vec::new()),
             selected: RefCell::new(None),
             last_gen: Cell::new(u64::MAX),
         });
@@ -2281,30 +2334,68 @@ impl MutinyWindow {
             let picker = Rc::clone(&picker);
             let ctrl = Rc::clone(&ctrl);
             search.connect_search_changed(move |entry| {
+                let tree = ctrl.session_tree();
                 let inventory = ctrl.session_inventory();
-                rebuild_session_rows(&picker, &inventory, &entry.text());
+                rebuild_session_rows(&picker, &tree, &inventory, &entry.text());
             });
         }
 
-        // Open the selected session. The dialog closes BEFORE dispatch, like the
-        // palette, so the rebuild triggered by the new tab finds no live picker.
+        // Activate the selected item. Closes BEFORE dispatch so a topology
+        // rebuild triggered by opening a tab finds no live picker.
         let open_selected = {
             let picker = Rc::clone(&picker);
             let ctrl = Rc::downgrade(&ctrl);
             move |mode: SessionMode| {
-                let chosen = picker.selected_row_session();
+                let chosen = picker.selected_row_item();
                 picker.dialog.close();
-                if let (Some(session), Some(c)) = (chosen, ctrl.upgrade())
-                    && let Err(err) = c.open_session(
-                        session.kind,
-                        &session.name,
-                        session.host.as_deref(),
-                        mode,
-                        Some(win_id),
-                        None,
-                    )
-                {
-                    eprintln!("failed to open session: {err}");
+                let (Some(item), Some(c)) = (chosen, ctrl.upgrade()) else {
+                    return;
+                };
+                match item.node_kind {
+                    crate::session::SessionNodeKind::LocalMux
+                    | crate::session::SessionNodeKind::RemoteMux => {
+                        if let Some(kind) = item.mux_kind
+                            && let Err(err) = c.open_session(
+                                kind,
+                                &item.name,
+                                item.host.as_deref(),
+                                mode,
+                                Some(win_id),
+                                None,
+                            )
+                        {
+                            eprintln!("failed to open session: {err}");
+                        }
+                    }
+                    crate::session::SessionNodeKind::HavenSession => {
+                        if let Some(ref shared_name) = item.chosen_session_name {
+                            let local_match =
+                                c.session_inventory().sessions.into_iter().find(|s| {
+                                    s.host.is_none() && !s.exited && &s.name == shared_name
+                                });
+                            if let Some(local) = local_match {
+                                if let Err(err) = c.open_session(
+                                    local.kind,
+                                    &local.name,
+                                    None,
+                                    mode,
+                                    Some(win_id),
+                                    None,
+                                ) {
+                                    eprintln!("failed to open shared local session: {err}");
+                                }
+                                return;
+                            }
+                        }
+                        if let (Some(peer_id), Some(sid)) =
+                            (item.peer_id.as_deref(), item.haven_session_id.as_deref())
+                            && let Err(err) = c.focus_haven_terminal_session(peer_id, sid)
+                        {
+                            eprintln!("failed to focus Haven session: {err}");
+                        }
+                    }
+                    crate::session::SessionNodeKind::HavenBridge
+                    | crate::session::SessionNodeKind::HostStatus => {}
                 }
             }
         };
@@ -2328,8 +2419,6 @@ impl MutinyWindow {
                 }
             });
         }
-        // Shift+Return opens a window, mirroring the search bar's
-        // Return / Shift+Return idiom.
         {
             let open = open_selected.clone();
             let keys = gtk4::EventControllerKey::new();
@@ -2344,8 +2433,6 @@ impl MutinyWindow {
             });
             dialog.add_controller(keys);
         }
-        // Track selection by identity so results arriving mid-refresh do not
-        // move the highlight under the user.
         {
             let picker = Rc::clone(&picker);
             list.connect_row_selected(move |_, row| {
@@ -2357,13 +2444,24 @@ impl MutinyWindow {
                             .get(r.index() as usize)
                             .and_then(|s| s.clone())
                     })
-                    .map(|s| s.identity());
+                    .map(|item| item.id);
                 *picker.selected.borrow_mut() = identity;
+            });
+        }
+        {
+            let dialog_grid = dialog.clone();
+            let ctrl_grid = Rc::downgrade(&ctrl);
+            open_grid.connect_clicked(move |_| {
+                dialog_grid.close();
+                if let Some(c) = ctrl_grid.upgrade() {
+                    c.execute_action(ActionId::OpenSessionGrid, Some(win_id));
+                }
             });
         }
         {
             let ctrl = Rc::clone(&ctrl);
             refresh.connect_clicked(move |_| {
+                let _ = ctrl.refresh_haven_limb_inventories();
                 let targets = ctrl.discovery_targets_all();
                 ctrl.begin_discovery(targets, true, None);
             });
@@ -2377,9 +2475,6 @@ impl MutinyWindow {
                 glib::Propagation::Proceed
             });
         }
-        // destroy_with_parent destroys the dialog WITHOUT a close-request, so
-        // the slot must also be cleared on destroy. Otherwise the stored picker
-        // outlives its window and later refreshes write into dead widgets.
         {
             let inner_slot = Rc::downgrade(&self.inner);
             dialog.connect_destroy(move |_| {
@@ -2393,8 +2488,10 @@ impl MutinyWindow {
         dialog.present();
         search.grab_focus();
 
+        let tree = ctrl.session_tree();
         let inventory = ctrl.session_inventory();
-        rebuild_session_rows(&picker, &inventory, "");
+        rebuild_session_rows(&picker, &tree, &inventory, "");
+        let _ = ctrl.refresh_haven_limb_inventories();
         let targets = ctrl.discovery_targets_all();
         ctrl.begin_discovery(targets, true, None);
     }
@@ -2412,9 +2509,10 @@ impl MutinyWindow {
         let Some(ctrl) = self.inner.controller.upgrade() else {
             return;
         };
+        let tree = ctrl.session_tree();
         let inventory = ctrl.session_inventory();
         let query = picker.search.text().to_string();
-        rebuild_session_rows(&picker, &inventory, &query);
+        rebuild_session_rows(&picker, &tree, &inventory, &query);
     }
 
     pub fn show_agent_audit(&self) {
@@ -2939,6 +3037,27 @@ impl MutinyWindow {
 
         container.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
         if has_any_outbound {
+            let handoff_btn = gtk4::Button::with_label("Handoff Active Session (Ctrl+Shift+H)");
+            let ctrl_handoff = Rc::downgrade(&ctrl);
+            let pop_handoff = popover.clone();
+            let win_id = self.inner.window_id;
+            handoff_btn.connect_clicked(move |_| {
+                pop_handoff.popdown();
+                if let Some(c) = ctrl_handoff.upgrade() {
+                    c.execute_action(ActionId::HandoffToPeer, Some(win_id));
+                }
+            });
+            container.append(&handoff_btn);
+
+            let present_btn = gtk4::Button::with_label("Present to Haven…");
+            let this_present = self.clone();
+            let pop_present = popover.clone();
+            present_btn.connect_clicked(move |_| {
+                pop_present.popdown();
+                this_present.show_present_to_peer_dialog();
+            });
+            container.append(&present_btn);
+
             let totp_btn = gtk4::Button::with_label("Insert Haven TOTP Code (Ctrl+Shift+Y)");
             let ctrl_totp = Rc::downgrade(&ctrl);
             let pop_totp = popover.clone();
@@ -3066,6 +3185,125 @@ impl MutinyWindow {
 
         attach_escape_to_close(&dialog);
         dialog.present();
+    }
+
+    pub fn show_present_to_peer_dialog(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        let initial_selection = {
+            let ws = ctrl.workspace.borrow();
+            ws.window(self.inner.window_id)
+                .and_then(|w| w.active_pane())
+                .and_then(|pid| ws.pane(pid).and_then(|e| e.selection_text()))
+                .unwrap_or_default()
+        };
+
+        let dialog = gtk4::Window::builder()
+            .transient_for(&self.inner.gtk_window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .title("Present to Haven")
+            .default_width(480)
+            .build();
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        vbox.set_margin_top(12);
+        vbox.set_margin_bottom(12);
+        vbox.set_margin_start(12);
+        vbox.set_margin_end(12);
+
+        let mode_drop = gtk4::DropDown::from_strings(&[
+            "URL or File Path (Media / Web / PDF)",
+            "Clipboard Text",
+        ]);
+        mode_drop.set_selected(if initial_selection.is_empty() { 0 } else { 1 });
+        vbox.append(&mode_drop);
+
+        let target_entry = gtk4::Entry::new();
+        target_entry.set_placeholder_text(Some(
+            "https://example.com, /abs/path/chart.png, or text to copy",
+        ));
+        target_entry.set_text(&initial_selection);
+        target_entry.set_activates_default(true);
+        target_entry.set_hexpand(true);
+        vbox.append(&target_entry);
+
+        let caption_entry = gtk4::Entry::new();
+        caption_entry.set_placeholder_text(Some("Optional caption"));
+        caption_entry.set_hexpand(true);
+        vbox.append(&caption_entry);
+
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+        let cancel = gtk4::Button::with_label("Cancel");
+        let send = gtk4::Button::with_label("Send to Haven");
+        send.add_css_class("suggested-action");
+        buttons.append(&cancel);
+        buttons.append(&send);
+        vbox.append(&buttons);
+
+        dialog.set_child(Some(&vbox));
+        dialog.set_default_widget(Some(&send));
+
+        {
+            let d = dialog.clone();
+            cancel.connect_clicked(move |_| d.close());
+        }
+        {
+            let d = dialog.clone();
+            let ctrl_weak = Rc::downgrade(&ctrl);
+            let target_for_send = target_entry.clone();
+            send.connect_clicked(move |_| {
+                let raw = target_for_send.text().to_string();
+                let cap_raw = caption_entry.text().to_string();
+                let caption = if cap_raw.trim().is_empty() {
+                    None
+                } else {
+                    Some(cap_raw)
+                };
+                let selected_mode = mode_drop.selected();
+                d.close();
+                if raw.trim().is_empty() {
+                    return;
+                }
+                let Some(c) = ctrl_weak.upgrade() else {
+                    return;
+                };
+                let res = if selected_mode == 1 {
+                    c.begin_present_to_peer(None, None, None, Some(raw), false, None, caption, None)
+                } else if raw.trim().starts_with("http://") || raw.trim().starts_with("https://") {
+                    c.begin_present_to_peer(
+                        None,
+                        Some(raw.trim().to_owned()),
+                        None,
+                        None,
+                        false,
+                        None,
+                        caption,
+                        None,
+                    )
+                } else {
+                    c.begin_present_to_peer(
+                        None,
+                        None,
+                        Some(std::path::PathBuf::from(raw.trim())),
+                        None,
+                        false,
+                        None,
+                        caption,
+                        None,
+                    )
+                };
+                if let Err(err) = res {
+                    eprintln!("warning: present-to-peer: {err}");
+                }
+            });
+        }
+
+        attach_escape_to_close(&dialog);
+        dialog.present();
+        target_entry.grab_focus();
     }
 
     pub(crate) fn show_totp_chooser_dialog(
@@ -3222,22 +3460,24 @@ type NumSetter = Box<dyn Fn(&mut crate::config::Config, f64)>;
 type BoolSetter = Box<dyn Fn(&mut crate::config::Config, bool)>;
 
 /// Live state of an open session picker. Stored on the window so the controller
-/// can refresh it when discovery results land, and cleared on close so a stale
-/// dialog cannot open sessions into a dead window.
+/// can refresh it when discovery results or Haven limb inventories land, and
+/// cleared on close so a stale dialog cannot open sessions into a dead window.
 struct SessionPicker {
     dialog: gtk4::Window,
     list: gtk4::ListBox,
     search: gtk4::SearchEntry,
     status: gtk4::Label,
-    /// One entry per ListBox row, `None` for host-status rows, so row indices
-    /// line up with the model.
-    rows: RefCell<Vec<Option<MuxSession>>>,
-    selected: RefCell<Option<(Option<String>, MuxKind, String)>>,
+    /// One entry per ListBox row, `None` for group-header and status rows, so
+    /// row indices line up with the GTK ListBox children.
+    rows: RefCell<Vec<Option<crate::session::SessionTreeItem>>>,
+    group_headers: RefCell<Vec<String>>,
+    item_labels: RefCell<Vec<String>>,
+    selected: RefCell<Option<String>>,
     last_gen: Cell<u64>,
 }
 
 impl SessionPicker {
-    fn selected_row_session(&self) -> Option<MuxSession> {
+    fn selected_row_item(&self) -> Option<crate::session::SessionTreeItem> {
         let row = self.list.selected_row()?;
         let index = row.index();
         if index < 0 {
@@ -3250,74 +3490,67 @@ impl SessionPicker {
     }
 }
 
-/// Rebuilds the picker rows from a snapshot. Rows are built first and the index
-/// borrow is dropped before any `append`/`select_row`, because the selection
-/// handler reads that same index and would otherwise panic on a double borrow.
-fn rebuild_session_rows(picker: &Rc<SessionPicker>, inventory: &MuxInventory, query: &str) {
+/// Rebuilds the hierarchical session tree rows from a snapshot. Rows are built
+/// first and the index borrow is dropped before any `append`/`select_row`, so
+/// the selection handler never hits a double borrow.
+fn rebuild_session_rows(
+    picker: &Rc<SessionPicker>,
+    tree: &crate::session::SessionTree,
+    inventory: &MuxInventory,
+    query: &str,
+) {
     while let Some(child) = picker.list.first_child() {
         picker.list.remove(&child);
     }
     let needle = query.trim().to_ascii_lowercase();
     let terms: Vec<&str> = needle.split_whitespace().collect();
 
-    let mut entries: Vec<Option<MuxSession>> = Vec::new();
+    let mut entries: Vec<Option<crate::session::SessionTreeItem>> = Vec::new();
+    let mut headers_out: Vec<String> = Vec::new();
+    let mut labels_out: Vec<String> = Vec::new();
     let mut widgets: Vec<gtk4::ListBoxRow> = Vec::new();
 
-    for session in inventory.sorted_for_display() {
-        let hay = format!(
-            "{} {} {}",
-            session.name,
-            session.host.clone().unwrap_or_default(),
-            session.kind.label()
-        )
-        .to_ascii_lowercase();
-        if !terms.iter().all(|t| hay.contains(t)) {
-            continue;
-        }
-        // Title is the session name, subtitle is the host, matching the tab
-        // labels and the Haven convention. Multiplexer detail moves to the
-        // trailing column so the two-line shape stays consistent.
-        let subtitle = session
-            .host
-            .clone()
-            .unwrap_or_else(crate::mux::local_hostname);
-        let mut meta = format!(
-            "{} · {} window{}",
-            session.kind.label(),
-            session.windows,
-            if session.windows == 1 { "" } else { "s" }
-        );
-        if session.attached > 0 {
-            meta.push_str(&format!(" · attached ×{}", session.attached));
-        } else if session.kind == MuxKind::Tmux && !session.exited {
-            // Say so explicitly: an orphan a New Tab left behind and a session
-            // deliberately detached look identical otherwise, and the operator
-            // needs to tell them apart before pruning. zellij reports no count,
-            // so it is not guessed at.
-            meta.push_str(" · no clients");
-        }
-        if session.exited {
-            meta.push_str(" · exited");
-        }
-        widgets.push(session_row(&session.name, &subtitle, &meta, true));
-        entries.push(Some(session.clone()));
-    }
+    for group in &tree.groups {
+        let mut group_widgets = Vec::new();
+        let mut group_entries = Vec::new();
+        let mut group_labels = Vec::new();
 
-    for host in &inventory.hosts {
-        if host.state == HostState::Ok {
+        for item in &group.items {
+            let hay = format!(
+                "{} {} {} {}",
+                group.title, item.name, item.subtitle, item.detail
+            )
+            .to_ascii_lowercase();
+            if !terms.is_empty() && !terms.iter().all(|t| hay.contains(t)) {
+                continue;
+            }
+            let display_name = if item.depth > 0 {
+                format!("  ↳ {}", item.name)
+            } else {
+                item.name.clone()
+            };
+            group_labels.push(format!("{} | {}", display_name, item.detail));
+            group_widgets.push(session_item_row(
+                &display_name,
+                &item.subtitle,
+                &item.detail,
+                item.depth,
+                item.activatable,
+            ));
+            group_entries.push(item.activatable.then(|| item.clone()));
+        }
+
+        if group_widgets.is_empty() {
             continue;
         }
-        let where_ = host.host.clone().unwrap_or_else(|| String::from("local"));
-        let detail = match host.state {
-            HostState::Scanning => format!("{} · scanning…", host.kind.label()),
-            _ => format!(
-                "{} · {}",
-                host.kind.label(),
-                host.error.clone().unwrap_or_else(|| String::from("failed"))
-            ),
-        };
-        widgets.push(session_row(&where_, &detail, "", false));
+
+        let header_text = format!("{} ({})", group.title, group.rollup.summary_badge());
+        headers_out.push(header_text.clone());
+        widgets.push(session_group_header_row(&header_text));
         entries.push(None);
+        widgets.extend(group_widgets);
+        entries.extend(group_entries);
+        labels_out.extend(group_labels);
     }
 
     {
@@ -3325,28 +3558,36 @@ fn rebuild_session_rows(picker: &Rc<SessionPicker>, inventory: &MuxInventory, qu
         rows.clear();
         rows.extend(entries);
     }
-    for widget in widgets {
-        picker.list.append(&widget);
+    *picker.group_headers.borrow_mut() = headers_out;
+    *picker.item_labels.borrow_mut() = labels_out;
+
+    for widget in &widgets {
+        picker.list.append(widget);
     }
 
-    // Restore selection by identity, not index: results arriving mid-refresh
-    // must not move the highlight under the user.
+    // Restore selection by stable item ID, falling back to the first
+    // activatable row (never a non-selectable group header).
     let wanted = picker.selected.borrow().clone();
     let index = wanted.and_then(|identity| {
         picker
             .rows
             .borrow()
             .iter()
-            .position(|entry| entry.as_ref().map(|s| s.identity()) == Some(identity.clone()))
+            .position(|entry| entry.as_ref().map(|i| &i.id) == Some(&identity))
     });
+    let first_activatable = picker
+        .rows
+        .borrow()
+        .iter()
+        .position(|entry| entry.is_some());
     let target = index
-        .and_then(|i| picker.list.row_at_index(i as i32))
-        .or_else(|| picker.list.row_at_index(0));
+        .or(first_activatable)
+        .and_then(|i| picker.list.row_at_index(i as i32));
     if let Some(row) = target {
         picker.list.select_row(Some(&row));
     }
 
-    let live = inventory.sessions.len();
+    let live: usize = tree.groups.iter().map(|g| g.rollup.total_count).sum();
     let failed = inventory
         .hosts
         .iter()
@@ -3368,6 +3609,37 @@ fn rebuild_session_rows(picker: &Rc<SessionPicker>, inventory: &MuxInventory, qu
         status.push_str(" · partial");
     }
     picker.status.set_text(&status);
+}
+
+fn session_group_header_row(text: &str) -> gtk4::ListBoxRow {
+    let lbl = gtk4::Label::new(None);
+    lbl.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(text)));
+    lbl.set_xalign(0.0);
+    lbl.set_margin_top(8);
+    lbl.set_margin_bottom(2);
+    lbl.set_margin_start(8);
+    lbl.set_margin_end(8);
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&lbl));
+    row.set_activatable(false);
+    row.set_selectable(false);
+    row
+}
+
+fn session_item_row(
+    title: &str,
+    detail: &str,
+    right: &str,
+    depth: u8,
+    activatable: bool,
+) -> gtk4::ListBoxRow {
+    let row = session_row(title, detail, right, activatable);
+    if depth > 0
+        && let Some(child) = row.child()
+    {
+        child.set_margin_start(8 + i32::from(depth) * 14);
+    }
+    row
 }
 
 fn session_row(title: &str, detail: &str, right: &str, activatable: bool) -> gtk4::ListBoxRow {

@@ -42,6 +42,42 @@ pub enum SplitNode {
 }
 
 impl SplitNode {
+    /// Builds a balanced `cols x rows` binary split tree for `1..=N` panes.
+    pub fn balanced_grid(panes: &[PaneId]) -> Option<SplitNode> {
+        if panes.is_empty() {
+            return None;
+        }
+        let cols = (panes.len() as f64).sqrt().ceil() as usize;
+        let cols = cols.max(1);
+        let row_nodes: Vec<SplitNode> = panes
+            .chunks(cols)
+            .filter_map(|row| {
+                let leaves: Vec<SplitNode> = row.iter().copied().map(SplitNode::Leaf).collect();
+                Self::chain_balanced(leaves, SplitAxis::Horizontal)
+            })
+            .collect();
+        Self::chain_balanced(row_nodes, SplitAxis::Vertical)
+    }
+
+    fn chain_balanced(mut items: Vec<SplitNode>, axis: SplitAxis) -> Option<SplitNode> {
+        let len = items.len();
+        if len == 0 {
+            return None;
+        }
+        let first = items.remove(0);
+        if items.is_empty() {
+            return Some(first);
+        }
+        let ratio = (1.0 / (len as f64)).clamp(0.05, 0.95);
+        let rest = Self::chain_balanced(items, axis)?;
+        Some(SplitNode::Split {
+            axis,
+            ratio,
+            first: Box::new(first),
+            second: Box::new(rest),
+        })
+    }
+
     pub fn leaves(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         self.collect_leaves(&mut out);
@@ -441,6 +477,34 @@ impl Workspace {
         self.windows.push(win);
         self.active_window = Some(win_id);
         (win_id, tab_id)
+    }
+
+    pub fn insert_window_with_grid(
+        &mut self,
+        entries: Vec<(PaneId, PaneEngine)>,
+        menubar_visible: bool,
+    ) -> Option<(WindowId, TabId, PaneId)> {
+        let pane_ids: Vec<PaneId> = entries.iter().map(|(id, _)| *id).collect();
+        let root = SplitNode::balanced_grid(&pane_ids)?;
+        let first_pane = pane_ids[0];
+        for (pid, engine) in entries {
+            self.panes.insert(pid, engine);
+        }
+        let tab_id = self.alloc_tab_id();
+        let win_id = self.alloc_window_id();
+        self.windows.push(WindowModel {
+            id: win_id,
+            tabs: vec![TabModel {
+                id: tab_id,
+                root,
+                active_pane: first_pane,
+            }],
+            active_tab: tab_id,
+            menubar_visible,
+            quick: false,
+        });
+        self.active_window = Some(win_id);
+        Some((win_id, tab_id, first_pane))
     }
 
     pub fn insert_tab_with_pane(
@@ -1046,5 +1110,36 @@ mod tests {
 
         assert!(ws.reorder_tab(w1, TabId(999), 0).is_err());
         assert!(ws.reorder_tab(WindowId(999), t1, 0).is_err());
+    }
+
+    #[test]
+    fn balanced_grid_preserves_pane_order_for_1_to_9_panes() {
+        assert!(SplitNode::balanced_grid(&[]).is_none());
+        for count in [1usize, 2, 3, 4, 6, 9] {
+            let ids: Vec<PaneId> = (1..=count as u64).map(PaneId).collect();
+            let grid = SplitNode::balanced_grid(&ids).expect("non-empty grid");
+            assert_eq!(grid.leaves(), ids, "leaf order must hold for {count} panes");
+        }
+
+        let mut ws = Workspace::new();
+        let mut entries = Vec::new();
+        for _ in 0..4 {
+            let pid = ws.reserve_pane_id();
+            entries.push((pid, PaneEngine::new_headless(30, 8)));
+        }
+        let expected: Vec<PaneId> = entries.iter().map(|(id, _)| *id).collect();
+        let (win_id, _tab_id, first) = ws
+            .insert_window_with_grid(entries, true)
+            .expect("grid window");
+        assert_eq!(first, expected[0]);
+        assert_eq!(
+            ws.window(win_id)
+                .unwrap()
+                .active_tab_ref()
+                .unwrap()
+                .root
+                .leaves(),
+            expected
+        );
     }
 }

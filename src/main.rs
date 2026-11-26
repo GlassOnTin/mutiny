@@ -358,6 +358,48 @@ enum CtlVerb {
         #[arg(long)]
         unattached_only: bool,
     },
+    /// Inspect the unified hierarchical session tree across Local, SSH, and Haven limbs
+    SessionTree {
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Open a tiled multi-pane overview window attached to multiplexer sessions
+    OpenSessionGrid {
+        /// Comma-separated session names (up to 9); omit to tile live local sessions
+        #[arg(long, value_delimiter = ',')]
+        sessions: Vec<String>,
+        /// tmux or zellij (defaults to config [sessions] preferred or tmux)
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Hand off a mux-backed pane (tmux/zellij) to a connected Haven limb
+    HandoffToPeer {
+        #[arg(long)]
+        pane: Option<u64>,
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        profile_id: Option<String>,
+    },
+    /// Present media, web/HTML/SVG/PDF, or clipboard text on a connected Haven limb
+    PresentToPeer {
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        clipboard: bool,
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long)]
+        caption: Option<String>,
+    },
     /// Attach a pane to a tmux or zellij session, locally or over SSH
     OpenSession {
         name: String,
@@ -518,6 +560,8 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
             enroll_signer: false,
             ..
         } => Duration::from_secs(20),
+        CtlVerb::HandoffToPeer { .. } | CtlVerb::PresentToPeer { .. } => Duration::from_secs(70),
+        CtlVerb::SessionTree { .. } | CtlVerb::OpenSessionGrid { .. } => Duration::from_secs(20),
         CtlVerb::RevokePeer { .. } => Duration::from_secs(15),
         _ => Duration::from_secs(5),
     };
@@ -673,6 +717,53 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         CtlVerb::RevokePeer { id_or_label } => IpcRequest::RevokePeer { id_or_label },
         CtlVerb::ListPeerAlerts => IpcRequest::ListPeerAlerts,
         CtlVerb::ClearPeerAlerts => IpcRequest::ClearPeerAlerts,
+        CtlVerb::SessionTree { refresh } => IpcRequest::SessionTree { refresh },
+        CtlVerb::OpenSessionGrid {
+            sessions,
+            kind,
+            host,
+        } => {
+            let parsed_kind = match kind.as_deref() {
+                None => None,
+                Some("tmux") => Some(mutiny::mux::MuxKind::Tmux),
+                Some("zellij") => Some(mutiny::mux::MuxKind::Zellij),
+                Some(other) => {
+                    eprintln!("unknown kind {other:?}: expected tmux or zellij");
+                    return ExitCode::from(2);
+                }
+            };
+            IpcRequest::OpenSessionGrid {
+                sessions,
+                kind: parsed_kind,
+                host,
+            }
+        }
+        CtlVerb::HandoffToPeer {
+            pane,
+            peer,
+            profile_id,
+        } => IpcRequest::HandoffToPeer {
+            pane: pane.map(PaneId),
+            peer,
+            profile_id,
+        },
+        CtlVerb::PresentToPeer {
+            peer,
+            url,
+            path,
+            text,
+            clipboard,
+            profile_id,
+            caption,
+        } => IpcRequest::PresentToPeer {
+            peer,
+            url,
+            path,
+            text,
+            clipboard,
+            profile_id,
+            caption,
+        },
         CtlVerb::EndSession { name, kind, host } => {
             let kind = match kind.as_str() {
                 "tmux" => mutiny::mux::MuxKind::Tmux,

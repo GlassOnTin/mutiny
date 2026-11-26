@@ -21,6 +21,9 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("session-picker", "Ctrl+Shift+S", "Session"),
     // No chord: reachable from the Session menu, the tab menu, and the palette.
     ("new-session", "", "Session"),
+    ("open-session-grid", "", "Session"),
+    ("handoff-to-peer", "Ctrl+Shift+H", "Session"),
+    ("present-to-peer", "", "Session"),
     ("pair-haven", "", "Session"),
     ("settings", "Ctrl+Shift+,", "Edit"),
     ("quick-terminal", "Ctrl+Shift+`", "Session"),
@@ -242,7 +245,7 @@ fn every_tab_menu_item_carries_its_tab_target() {
     let items = flatten(
         mutiny::action::build_tab_menu_model(true, 42).upcast_ref::<gtk4::gio::MenuModel>(),
     );
-    assert_eq!(items.len(), 5, "rename, copy, close, move, end");
+    assert_eq!(items.len(), 6, "rename, copy, handoff, close, move, end");
     for (label, action, target) in &items {
         assert!(
             action.ends_with("-tab") || action.ends_with("-tab-target"),
