@@ -582,13 +582,14 @@ fn outbound_haven_client_tap_to_pair_liveness_transitions_and_public_ip_refusal(
     let tool_text = tool_val["content"][0]["text"].as_str().unwrap();
     assert!(tool_text.contains("\"ping\":42"), "got {tool_text}");
 
-    // 4. Take mock server offline -> status transitions to `◌ haven:pixel`.
+    // 4. Take mock server offline -> status transitions to offline pill (`◌ !haven:pixel (1)`).
     mock.healthy.store(false, Ordering::Relaxed);
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut saw_offline = false;
     while Instant::now() < deadline {
         if let Ok(Some(lbl)) = pill_rx.recv_timeout(Duration::from_millis(200))
-            && lbl == "◌ haven:pixel"
+            && lbl.starts_with('◌')
+            && lbl.contains("haven:pixel")
         {
             saw_offline = true;
             break;
@@ -596,7 +597,7 @@ fn outbound_haven_client_tap_to_pair_liveness_transitions_and_public_ip_refusal(
     }
     assert!(
         saw_offline,
-        "expected transition to offline pill `◌ haven:pixel`"
+        "expected transition to offline pill `◌ ...haven:pixel...`"
     );
 
     // 5. Bring mock server back -> recovers to `● haven:pixel`.

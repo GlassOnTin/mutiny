@@ -43,6 +43,7 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("toggle-menubar", "Ctrl+Shift+M", "View"),
     ("command-palette", "Ctrl+Shift+P", "View"),
     ("agent-audit", "Ctrl+Shift+J", "View"),
+    ("clear-peer-alerts", "", "View"),
     ("keybind-cheatsheet", "Ctrl+Shift+?", "View"),
 ];
 

@@ -180,6 +180,50 @@ impl Default for PeerConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerRelayMode {
+    #[default]
+    Unfocused,
+    Always,
+    Off,
+}
+
+impl PeerRelayMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unfocused => "unfocused",
+            Self::Always => "always",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// Seconds before a finished unfocused OSC 133;D command raises an
+    /// attention badge and notification (0 disables).
+    pub long_command_secs: u64,
+    /// When local notifications relay to connected Haven limbs:
+    /// "unfocused", "always", or "off".
+    pub peer_relay_mode: String,
+    /// Case-insensitive package-name substrings opting into Android shade
+    /// polling via Haven's `list_notifications`. Empty means Haven-own events
+    /// only (zero `list_notifications` calls).
+    pub inbound_shade_allowlist: Vec<String>,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            long_command_secs: 20,
+            peer_relay_mode: String::from("unfocused"),
+            inbound_shade_allowlist: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -189,6 +233,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub sessions: SessionsConfig,
     pub peer: PeerConfig,
+    pub notifications: NotificationsConfig,
 }
 
 /// CLI flags that shadow config keys. Applied after the file on every load.
@@ -235,6 +280,9 @@ pub struct ResolvedConfig {
     pub discovery_timeout_ms: u64,
     pub relay_unfocused_consent: bool,
     pub unfocused_grace_ms: u64,
+    pub long_command_secs: u64,
+    pub peer_relay_mode: PeerRelayMode,
+    pub inbound_shade_allowlist: Vec<String>,
 }
 
 impl Default for ResolvedConfig {
@@ -328,6 +376,21 @@ fn parse_preferred(text: &str) -> Option<crate::mux::MuxKind> {
                  New Tab will open a plain shell"
             );
             None
+        }
+    }
+}
+
+fn parse_peer_relay_mode(text: &str) -> PeerRelayMode {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "unfocused" | "" => PeerRelayMode::Unfocused,
+        "always" => PeerRelayMode::Always,
+        "off" => PeerRelayMode::Off,
+        other => {
+            eprintln!(
+                "warning: config notifications.peer_relay_mode {other:?} is not unfocused, always, or off; \
+                 defaulting to unfocused"
+            );
+            PeerRelayMode::Unfocused
         }
     }
 }
@@ -431,6 +494,20 @@ pub fn resolve(config: &Config, overrides: &Overrides) -> ResolvedConfig {
         discovery_timeout_ms: config.sessions.discovery_timeout_ms.clamp(200, 60_000),
         relay_unfocused_consent: config.peer.relay_unfocused_consent,
         unfocused_grace_ms: config.peer.unfocused_grace_ms.min(60_000),
+        long_command_secs: config.notifications.long_command_secs.min(86_400),
+        peer_relay_mode: parse_peer_relay_mode(&config.notifications.peer_relay_mode),
+        inbound_shade_allowlist: {
+            let mut list: Vec<String> = config
+                .notifications
+                .inbound_shade_allowlist
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .take(32)
+                .collect();
+            list.dedup();
+            list
+        },
     }
 }
 

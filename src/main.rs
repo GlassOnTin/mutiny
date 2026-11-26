@@ -301,6 +301,11 @@ enum CtlVerb {
         #[arg(long)]
         id_or_label: String,
     },
+    /// List recent Haven limb transitions, peer notices, and opt-in shade alerts
+    #[command(alias = "peer-alerts")]
+    ListPeerAlerts,
+    /// Mark all unread Haven limb and notification alerts as read
+    ClearPeerAlerts,
     /// END a multiplexer session: everything running inside it stops
     EndSession {
         name: String,
@@ -666,6 +671,8 @@ fn run_ctl(socket_path: &Path, verb: CtlVerb) -> ExitCode {
         },
         CtlVerb::EnrollHavenSigner { id_or_label } => IpcRequest::EnrollHavenSigner { id_or_label },
         CtlVerb::RevokePeer { id_or_label } => IpcRequest::RevokePeer { id_or_label },
+        CtlVerb::ListPeerAlerts => IpcRequest::ListPeerAlerts,
+        CtlVerb::ClearPeerAlerts => IpcRequest::ClearPeerAlerts,
         CtlVerb::EndSession { name, kind, host } => {
             let kind = match kind.as_str() {
                 "tmux" => mutiny::mux::MuxKind::Tmux,

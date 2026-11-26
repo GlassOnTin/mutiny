@@ -75,6 +75,16 @@ pub struct TotpSecretItem {
     pub account_name: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HavenShadeRecord {
+    pub package_name: String,
+    pub app_name: Option<String>,
+    pub post_time_ms: u64,
+    pub title: String,
+    pub text: String,
+    pub removed: bool,
+}
+
 /// Checks whether a plaintext HTTP target IP is permitted.
 pub fn is_allowed_plaintext_ip(ip: IpAddr, allow_lan: bool) -> bool {
     match ip {
@@ -612,6 +622,16 @@ pub enum PeerClientCommand {
         totp_secret_id: String,
         target_pane: PaneId,
     },
+    RaiseNotification {
+        peer_id: String,
+        title: String,
+        body: String,
+        priority: String,
+    },
+    SetShadePollState {
+        allowlist: Vec<String>,
+        window_active: bool,
+    },
     PollNow,
     CallTool {
         req_id: u64,
@@ -647,6 +667,20 @@ pub enum PeerClientEvent {
         peer_id: String,
         peer_label: String,
         prompt: Option<HavenAuthPrompt>,
+    },
+    RemoteConsentPromptChanged {
+        peer_id: String,
+        peer_label: String,
+        summary: Option<String>,
+    },
+    ShadeNotificationsPolled {
+        peer_id: String,
+        peer_label: String,
+        records: Vec<HavenShadeRecord>,
+    },
+    ShadeStatusChanged {
+        peer_id: String,
+        status_note: Option<String>,
     },
     TotpChoicesReady {
         peer_id: String,
@@ -800,6 +834,30 @@ impl HavenPeerClientHandle {
             .map_err(|e| format!("peer client busy or unavailable: {e}"))
     }
 
+    pub fn raise_notification(
+        &self,
+        peer_id: String,
+        title: String,
+        body: String,
+        priority: String,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .try_send(PeerClientCommand::RaiseNotification {
+                peer_id,
+                title,
+                body,
+                priority,
+            })
+            .map_err(|e| format!("peer client busy or unavailable: {e}"))
+    }
+
+    pub fn set_shade_poll_state(&self, allowlist: Vec<String>, window_active: bool) {
+        let _ = self.cmd_tx.try_send(PeerClientCommand::SetShadePollState {
+            allowlist,
+            window_active,
+        });
+    }
+
     /// Asynchronous non-blocking `tools/call` dispatch whose result arrives via
     /// `PeerClientEvent::ToolCallCompleted` on the 4 ms tick.
     pub fn send_call_tool(
@@ -866,6 +924,9 @@ struct TrackedPeer {
     /// `Some(true)` if peer's `tools/list` advertises `request_peer_consent`,
     /// `Some(false)` if it uses `request_egress_grant`, `None` before discovery.
     has_request_peer_consent: Option<bool>,
+    last_seen_shade_ms: Option<u64>,
+    shade_backoff_until: Option<Instant>,
+    shade_failures: u32,
 }
 
 struct InteractiveSlotGuard(Arc<AtomicUsize>);
@@ -916,6 +977,8 @@ fn worker_loop(
 ) {
     let mut rpc_seq: u64 = 1;
     let interactive_inflight = Arc::new(AtomicUsize::new(0));
+    let mut shade_allowlist: Vec<String> = Vec::new();
+    let mut window_active = false;
     let mut tracked: HashMap<String, TrackedPeer> = HashMap::new();
     let now = Instant::now();
     for p in initial_peers {
@@ -927,6 +990,9 @@ fn worker_loop(
                 failures: 0,
                 remote_version: None,
                 has_request_peer_consent: None,
+                last_seen_shade_ms: None,
+                shade_backoff_until: None,
+                shade_failures: 0,
             },
         );
     }
@@ -971,6 +1037,9 @@ fn worker_loop(
                                 failures: 0,
                                 remote_version: None,
                                 has_request_peer_consent: None,
+                                last_seen_shade_ms: None,
+                                shade_backoff_until: None,
+                                shade_failures: 0,
                             },
                         );
                     }
@@ -1273,6 +1342,59 @@ fn worker_loop(
                     }
                 });
             }
+            Ok(PeerClientCommand::RaiseNotification {
+                peer_id,
+                title,
+                body,
+                priority,
+            }) => {
+                if let Some(entry) = find_tracked(&tracked, &peer_id) {
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    let _ = call_remote_tool(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        "raise_notification",
+                        json!({
+                            "title": title,
+                            "body": body,
+                            "priority": priority,
+                            "ongoing": false,
+                        }),
+                        cfg.allow_lan,
+                    );
+                }
+            }
+            Ok(PeerClientCommand::SetShadePollState {
+                allowlist,
+                window_active: active,
+            }) => {
+                let allow_changed = shade_allowlist != allowlist;
+                let became_active = !window_active && active;
+                shade_allowlist = allowlist;
+                window_active = active;
+                if shade_allowlist.is_empty() {
+                    for entry in tracked.values_mut() {
+                        entry.shade_backoff_until = None;
+                        entry.shade_failures = 0;
+                        let _ = evt_tx.try_send(PeerClientEvent::ShadeStatusChanged {
+                            peer_id: entry.peer.id.clone(),
+                            status_note: None,
+                        });
+                    }
+                } else if (allow_changed || became_active) && window_active {
+                    let t_now = Instant::now();
+                    for entry in tracked.values_mut() {
+                        if allow_changed {
+                            entry.shade_backoff_until = None;
+                            entry.shade_failures = 0;
+                        }
+                        if entry.shade_backoff_until.is_none_or(|u| t_now >= u) {
+                            entry.next_poll = t_now;
+                        }
+                    }
+                }
+            }
             Ok(PeerClientCommand::CallTool {
                 req_id,
                 peer_id,
@@ -1367,6 +1489,93 @@ fn worker_loop(
                             prompt: prompt_opt,
                         });
                     }
+
+                    // Poll read-only `get_pending_consent` (`ConsentLevel.NEVER` on Haven).
+                    rpc_seq = rpc_seq.wrapping_add(1);
+                    if let Ok(summary_opt) = poll_pending_remote_consent(
+                        &entry.peer.url,
+                        &entry.peer.bearer_token,
+                        rpc_seq,
+                        cfg.allow_lan,
+                    ) {
+                        let _ = evt_tx.try_send(PeerClientEvent::RemoteConsentPromptChanged {
+                            peer_id: entry.peer.id.clone(),
+                            peer_label: entry.peer.label.clone(),
+                            summary: summary_opt,
+                        });
+                    }
+
+                    // Opt-in Android shade polling: NEVER invoke `list_notifications`
+                    // unless `shade_allowlist` is non-empty, a Mutiny window is active,
+                    // `inbound_notify_scope` permits it, and backoff has elapsed.
+                    let now_check = Instant::now();
+                    if !shade_allowlist.is_empty()
+                        && window_active
+                        && entry.peer.inbound_notify_scope != InboundNotifyScope::None
+                        && entry.shade_backoff_until.is_none_or(|u| now_check >= u)
+                    {
+                        rpc_seq = rpc_seq.wrapping_add(1);
+                        let since_ms = entry
+                            .last_seen_shade_ms
+                            .map_or(0, |ms| ms.saturating_add(1));
+                        match poll_shade_notifications(
+                            &entry.peer.url,
+                            &entry.peer.bearer_token,
+                            rpc_seq,
+                            since_ms,
+                            cfg.allow_lan,
+                        ) {
+                            Ok(ShadePollOutcome::Connected {
+                                records,
+                                max_post_time_ms,
+                            }) => {
+                                if let Some(max_ms) = max_post_time_ms {
+                                    entry.last_seen_shade_ms = Some(
+                                        entry.last_seen_shade_ms.map_or(max_ms, |p| p.max(max_ms)),
+                                    );
+                                }
+                                if entry.shade_failures > 0 || entry.shade_backoff_until.is_some() {
+                                    entry.shade_failures = 0;
+                                    entry.shade_backoff_until = None;
+                                    let _ = evt_tx.try_send(PeerClientEvent::ShadeStatusChanged {
+                                        peer_id: entry.peer.id.clone(),
+                                        status_note: None,
+                                    });
+                                }
+                                let filtered: Vec<HavenShadeRecord> = records
+                                    .into_iter()
+                                    .filter(|r| {
+                                        let pkg_lc = r.package_name.to_ascii_lowercase();
+                                        shade_allowlist
+                                            .iter()
+                                            .any(|pat| pkg_lc.contains(pat.as_str()))
+                                    })
+                                    .collect();
+                                if !filtered.is_empty() {
+                                    let _ = evt_tx.try_send(
+                                        PeerClientEvent::ShadeNotificationsPolled {
+                                            peer_id: entry.peer.id.clone(),
+                                            peer_label: entry.peer.label.clone(),
+                                            records: filtered,
+                                        },
+                                    );
+                                }
+                            }
+                            Ok(ShadePollOutcome::NotReady(note)) | Err(note) => {
+                                entry.shade_failures = entry.shade_failures.saturating_add(1);
+                                let shift = entry.shade_failures.saturating_sub(1).min(2);
+                                let pause = cfg
+                                    .offline_max_backoff
+                                    .max(Duration::from_millis(250))
+                                    .saturating_mul(1u32 << shift);
+                                entry.shade_backoff_until = Some(Instant::now() + pause);
+                                let _ = evt_tx.try_send(PeerClientEvent::ShadeStatusChanged {
+                                    peer_id: entry.peer.id.clone(),
+                                    status_note: Some(format!("Shade paused: {note}")),
+                                });
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     entry.failures = entry.failures.saturating_add(1);
@@ -1390,6 +1599,11 @@ fn worker_loop(
                         peer_id: entry.peer.id.clone(),
                         peer_label: entry.peer.label.clone(),
                         prompt: None,
+                    });
+                    let _ = evt_tx.try_send(PeerClientEvent::RemoteConsentPromptChanged {
+                        peer_id: entry.peer.id.clone(),
+                        peer_label: entry.peer.label.clone(),
+                        summary: None,
                     });
                 }
             }
@@ -1614,6 +1828,143 @@ fn poll_pending_auth_prompt(
         label,
         requires_passphrase,
     }))
+}
+
+fn poll_pending_remote_consent(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    allow_lan: bool,
+) -> Result<Option<String>, ()> {
+    let res = jsonrpc_call(
+        url,
+        Some(bearer_token),
+        rpc_id,
+        "tools/call",
+        json!({
+            "name": "get_pending_consent",
+            "arguments": {},
+        }),
+        NORMAL_READ_TIMEOUT,
+        allow_lan,
+    );
+    let Ok(val) = res else {
+        return Err(());
+    };
+    let Ok(obj) = extract_mcp_tool_json(&val) else {
+        return Err(());
+    };
+    let pending = obj.get("pending").and_then(Value::as_bool).unwrap_or(false);
+    if !pending {
+        return Ok(None);
+    }
+    let summary = obj
+        .get("requests")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|r| {
+            r.get("summary")
+                .and_then(Value::as_str)
+                .or_else(|| r.get("toolName").and_then(Value::as_str))
+        })
+        .unwrap_or("Awaiting approval on Haven")
+        .to_owned();
+    Ok(Some(summary))
+}
+
+enum ShadePollOutcome {
+    Connected {
+        records: Vec<HavenShadeRecord>,
+        max_post_time_ms: Option<u64>,
+    },
+    NotReady(String),
+}
+
+fn poll_shade_notifications(
+    url: &str,
+    bearer_token: &str,
+    rpc_id: u64,
+    since_ms: u64,
+    allow_lan: bool,
+) -> Result<ShadePollOutcome, String> {
+    let val = jsonrpc_call(
+        url,
+        Some(bearer_token),
+        rpc_id,
+        "tools/call",
+        json!({
+            "name": "list_notifications",
+            "arguments": {
+                "sinceMs": since_ms,
+                "limit": 25,
+            },
+        }),
+        NORMAL_READ_TIMEOUT,
+        allow_lan,
+    )
+    .map_err(|(_, msg)| msg)?;
+    let obj = extract_mcp_tool_json(&val)?;
+    let connected = obj
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !connected {
+        let note = obj
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or("notification listener binding asynchronously")
+            .to_owned();
+        return Ok(ShadePollOutcome::NotReady(note));
+    }
+    let arr = obj
+        .get("notifications")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut records = Vec::with_capacity(arr.len());
+    let mut max_post: Option<u64> = None;
+    for item in arr {
+        let Some(pkg) = item
+            .get("packageName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let post_ms = item.get("postTimeMs").and_then(Value::as_u64).unwrap_or(0);
+        max_post = Some(max_post.map_or(post_ms, |m| m.max(post_ms)));
+        let app_name = item
+            .get("appName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(pkg)
+            .to_owned();
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let removed = item
+            .get("removed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        records.push(HavenShadeRecord {
+            package_name: pkg.to_owned(),
+            app_name,
+            post_time_ms: post_ms,
+            title,
+            text,
+            removed,
+        });
+    }
+    Ok(ShadePollOutcome::Connected {
+        records,
+        max_post_time_ms: max_post,
+    })
 }
 
 fn fetch_totp_list(

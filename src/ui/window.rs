@@ -418,11 +418,12 @@ impl MutinyWindow {
 
         let ctrl_weak = Rc::downgrade(&controller);
         gtk_window.connect_is_active_notify(move |win| {
-            if win.is_active()
-                && let Some(ctrl) = ctrl_weak.upgrade()
-            {
-                ctrl.workspace.borrow_mut().set_active_window(window_id);
-                ctrl.poll_haven_peers_now();
+            if let Some(ctrl) = ctrl_weak.upgrade() {
+                if win.is_active() {
+                    ctrl.workspace.borrow_mut().set_active_window(window_id);
+                    ctrl.poll_haven_peers_now();
+                }
+                ctrl.sync_shade_poll_state();
             }
         });
 
@@ -1996,6 +1997,56 @@ impl MutinyWindow {
             Box::new(|c, v| c.peer.unfocused_grace_ms = v as u64),
         );
 
+        heading("Notifications");
+        spin(
+            "Long command threshold s (0 = off)",
+            current.notifications.long_command_secs as f64,
+            0.0,
+            86_400.0,
+            1.0,
+            Box::new(|c, v| c.notifications.long_command_secs = v as u64),
+        );
+        let relay_mode = gtk4::DropDown::from_strings(&["unfocused", "always", "off"]);
+        relay_mode.set_selected(
+            match current
+                .notifications
+                .peer_relay_mode
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "always" => 1,
+                "off" => 2,
+                _ => 0,
+            },
+        );
+        let relay_lbl = gtk4::Label::new(Some("Peer notification relay mode"));
+        relay_lbl.set_xalign(0.0);
+        grid.attach(&relay_lbl, 0, row.get(), 1, 1);
+        grid.attach(&relay_mode, 1, row.get(), 1, 1);
+        row.set(row.get() + 1);
+        {
+            let relay_mode = relay_mode.clone();
+            setters.borrow_mut().push(Box::new(move |c| {
+                c.notifications.peer_relay_mode = match relay_mode.selected() {
+                    1 => String::from("always"),
+                    2 => String::from("off"),
+                    _ => String::from("unfocused"),
+                };
+            }));
+        }
+        entry(
+            "Inbound Android shade allowlist (comma separated)",
+            &current.notifications.inbound_shade_allowlist.join(", "),
+            Box::new(|c, v| {
+                c.notifications.inbound_shade_allowlist = v
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }),
+        );
+
         let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         buttons.set_halign(gtk4::Align::End);
         let defaults = gtk4::Button::with_label("Reset to Defaults");
@@ -2762,6 +2813,24 @@ impl MutinyWindow {
             });
             row.append(&revoke_btn);
             container.append(&row);
+
+            if out.rate_limited_count > 0 {
+                let rl_note = gtk4::Label::new(Some(&format!(
+                    "  Outbound notifications rate-limited: {}",
+                    out.rate_limited_count
+                )));
+                rl_note.add_css_class("dim-label");
+                rl_note.set_xalign(0.0);
+                container.append(&rl_note);
+            }
+            if let Some(shade_note) = &out.shade_status {
+                let note_lbl = gtk4::Label::new(Some(&format!("  {shade_note}")));
+                note_lbl.add_css_class("dim-label");
+                note_lbl.set_xalign(0.0);
+                note_lbl.set_wrap(true);
+                note_lbl.set_max_width_chars(56);
+                container.append(&note_lbl);
+            }
         }
 
         for inb in listing.inbound {
@@ -2791,6 +2860,81 @@ impl MutinyWindow {
             });
             row.append(&revoke_btn);
             container.append(&row);
+        }
+
+        let alerts = ctrl.list_peer_alerts();
+        let unread_count = alerts.iter().filter(|a| a.unread).count();
+        container.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+        let alerts_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let alerts_title = gtk4::Label::new(None);
+        if unread_count > 0 {
+            alerts_title.set_markup(&format!("<b>Haven Alerts ({unread_count} unread)</b>"));
+        } else {
+            alerts_title.set_markup("<b>Haven Alerts</b>");
+        }
+        alerts_title.set_xalign(0.0);
+        alerts_title.set_hexpand(true);
+        alerts_header.append(&alerts_title);
+
+        if !alerts.is_empty() {
+            let clear_btn = gtk4::Button::with_label("Clear / Mark Read");
+            clear_btn.set_sensitive(unread_count > 0);
+            let this_clear = self.clone();
+            let ctrl_clear = Rc::downgrade(&ctrl);
+            let pop_clear = popover.clone();
+            let box_clear = container.clone();
+            clear_btn.connect_clicked(move |_| {
+                if let Some(c) = ctrl_clear.upgrade() {
+                    c.clear_peer_alerts();
+                    this_clear.rebuild_limb_popover(&pop_clear, &box_clear);
+                }
+            });
+            alerts_header.append(&clear_btn);
+        }
+        container.append(&alerts_header);
+
+        if alerts.is_empty() {
+            let none_lbl = gtk4::Label::new(Some("No Haven alerts."));
+            none_lbl.add_css_class("dim-label");
+            none_lbl.set_xalign(0.0);
+            container.append(&none_lbl);
+        } else {
+            for alert in alerts.iter().take(8) {
+                let tag = alert.package_name.as_deref().unwrap_or(match alert.kind {
+                    crate::peers::PeerAlertKind::LimbOffline => "offline",
+                    crate::peers::PeerAlertKind::LimbReconnected => "reconnected",
+                    crate::peers::PeerAlertKind::AuthPrompt => "ssh-auth",
+                    crate::peers::PeerAlertKind::PendingConsent => "consent",
+                    crate::peers::PeerAlertKind::PeerNotice => "notice",
+                    crate::peers::PeerAlertKind::AndroidShade => "shade",
+                });
+                let summary_raw = if alert.body.is_empty() {
+                    format!("[{}:{}] {}", alert.peer_label, tag, alert.title)
+                } else {
+                    format!(
+                        "[{}:{}] {}: {}",
+                        alert.peer_label,
+                        tag,
+                        alert.title,
+                        truncate_label(&alert.body, 56)
+                    )
+                };
+                let item_lbl = gtk4::Label::new(None);
+                item_lbl.set_xalign(0.0);
+                item_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                item_lbl.set_max_width_chars(64);
+                if alert.unread {
+                    item_lbl.set_markup(&format!(
+                        "<b>• {}</b>",
+                        glib::markup_escape_text(&summary_raw)
+                    ));
+                } else {
+                    item_lbl.set_text(&format!("  {summary_raw}"));
+                    item_lbl.add_css_class("dim-label");
+                }
+                container.append(&item_lbl);
+            }
         }
 
         container.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
@@ -3063,6 +3207,10 @@ impl MutinyWindow {
             .label()
             .map(|s| s.to_string())
             .unwrap_or_default()
+    }
+
+    pub fn popup_limb_popover(&self) {
+        self.inner.limb_pill_btn.popup();
     }
 }
 

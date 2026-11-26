@@ -85,6 +85,8 @@ pub fn mcp_surface_for(req: &IpcRequest) -> Option<McpSurface> {
         IpcRequest::InstallPolicy { .. } => Some(McpSurface::Tool("install_policy")),
         IpcRequest::RevokePolicy { .. } => Some(McpSurface::Tool("revoke_policy")),
         IpcRequest::ListPeers => Some(McpSurface::Tool("list_peers")),
+        IpcRequest::ListPeerAlerts => Some(McpSurface::Tool("list_peer_alerts")),
+        IpcRequest::ClearPeerAlerts => Some(McpSurface::Tool("clear_peer_alerts")),
         IpcRequest::PairHaven { .. } => Some(McpSurface::Tool("pair_haven")),
         IpcRequest::EnrollHavenSigner { .. } => Some(McpSurface::Tool("enroll_haven_signer")),
         IpcRequest::RevokePeer { .. } => Some(McpSurface::Tool("revoke_peer")),
@@ -634,6 +636,8 @@ impl McpBridge {
                 Duration::from_secs(70),
             ),
             "list_peers" => (IpcRequest::ListPeers, Duration::from_secs(5)),
+            "list_peer_alerts" => (IpcRequest::ListPeerAlerts, Duration::from_secs(5)),
+            "clear_peer_alerts" => (IpcRequest::ClearPeerAlerts, Duration::from_secs(15)),
             "pair_haven" => {
                 let label = args
                     .get("label")
@@ -929,7 +933,7 @@ fn resource_metadata(uri: &str) -> (&'static str, &'static str) {
 }
 
 pub fn tool_definitions() -> Value {
-    json!([
+    let mut tools = match json!([
         {
             "name": "list_workspace",
             "description": "Tier-1 Observe: list windows, tabs, split trees, working directories, prompt/output counters, and attention state.",
@@ -1151,10 +1155,25 @@ pub fn tool_definitions() -> Value {
                 "required": ["id"],
                 "properties": { "id": { "type": "integer" } }
             }
-        },
+        }
+    ]) {
+        Value::Array(v) => v,
+        _ => Vec::new(),
+    };
+    if let Value::Array(rest) = json!([
         {
             "name": "list_peers",
-            "description": "Tier-1 Observe: list paired inbound HTTP MCP peers and paired outbound Haven limbs with live connection status and signer enrollment metadata (redacted, never token hashes, bearer secrets, or signing_secret_b64).",
+            "description": "Tier-1 Observe: list paired inbound HTTP MCP peers and paired outbound Haven limbs with live connection status, rate_limited_count, unread_alert_count, and signer enrollment metadata (redacted, never token hashes, bearer secrets, or signing_secret_b64).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "list_peer_alerts",
+            "description": "Tier-1 Observe: list recent Haven limb transitions, stalled auth/consent alerts, inbound peer notices, and opt-in Android shade alerts.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "clear_peer_alerts",
+            "description": "Tier-2 Act: mark all unread Haven limb and notification alerts as read and clear the !haven chrome badge.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -1312,7 +1331,10 @@ pub fn tool_definitions() -> Value {
                 }
             }
         }
-    ])
+    ]) {
+        tools.extend(rest);
+    }
+    Value::Array(tools)
 }
 
 #[cfg(test)]

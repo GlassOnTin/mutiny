@@ -101,6 +101,8 @@ pub struct CommandRecord {
     pub seq: u64,
     pub output: String,
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +303,7 @@ enum OscScanState {
 struct ActiveCommandStart {
     line_from_history_top: i32,
     column: Column,
+    started_at: Instant,
 }
 
 pub struct PaneEngine {
@@ -697,6 +700,12 @@ impl PaneEngine {
     pub fn clear_attention(&mut self) {
         self.attention = None;
         self.agent_notice = None;
+    }
+
+    pub fn mark_osc_notification_attention(&mut self) {
+        if self.attention.is_none() {
+            self.attention = Some(AttentionReason::OscNotification);
+        }
     }
 
     pub fn set_agent_notice(&mut self, message: Option<String>) {
@@ -1216,22 +1225,26 @@ impl PaneEngine {
                 self.active_cmd_start = Some(ActiveCommandStart {
                     line_from_history_top: line_from_top,
                     column: cursor.column,
+                    started_at: Instant::now(),
                 });
             }
             "D" => {
                 let exit_code = parts.next().and_then(|s| s.parse::<i32>().ok());
                 self.command_running = false;
-                let output = self
-                    .active_cmd_start
-                    .take()
-                    .map(|start| self.extract_command_output(start))
-                    .unwrap_or_default();
+                let (output, duration_ms) = match self.active_cmd_start.take() {
+                    Some(start) => {
+                        let elapsed = start.started_at.elapsed().as_millis() as u64;
+                        (self.extract_command_output(start), Some(elapsed))
+                    }
+                    None => (String::new(), None),
+                };
 
                 self.command_seq += 1;
                 let record = CommandRecord {
                     seq: self.command_seq,
                     output,
                     exit_code,
+                    duration_ms,
                 };
                 if let Some(code) = exit_code.filter(|&c| c != 0) {
                     self.attention = Some(AttentionReason::CommandFailed(code));

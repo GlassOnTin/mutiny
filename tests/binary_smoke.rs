@@ -320,6 +320,8 @@ fn every_ipc_verb_name_is_accepted_by_the_cli() {
         "close-window",
         "quit",
         "list-peers",
+        "list-peer-alerts",
+        "clear-peer-alerts",
         "pair-haven",
         "enroll-haven-signer",
         "revoke-peer",

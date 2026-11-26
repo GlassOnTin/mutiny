@@ -595,6 +595,8 @@ fn every_advertised_mcp_tool_dispatches() {
             "install_policy" => json!({"id": 999999}),
             "revoke_policy" => json!({"id": 999999}),
             "list_peers" => json!({}),
+            "list_peer_alerts" => json!({}),
+            "clear_peer_alerts" => json!({}),
             "pair_haven" => {
                 json!({"label": "probe", "url": "http://127.0.0.1:1/mcp", "token": "probe"})
             }

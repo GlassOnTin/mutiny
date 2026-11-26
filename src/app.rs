@@ -30,20 +30,24 @@ use crate::mux::{
     self, DISCOVERY_BYTES_PER_TICK, HostState, MAX_CONCURRENT_DISCOVERIES, MAX_DISCOVERY_BYTES,
     MuxHostStatus, MuxInventory, MuxKind, MuxSession,
 };
-use crate::notify::{DBusNotifier, DesktopNotifier};
+use crate::notify::{
+    CompositeNotifier, DBusNotifier, DesktopNotifier, NotificationPriority, OutboundNotification,
+    TokenBucket,
+};
 use crate::peer_client::{
     HavenAuthPrompt, HavenPeerClientHandle, PeerClientEvent, PeerPollConfig,
     parse_and_validate_peer_url,
 };
 use crate::peers::{
     self, InboundPeer, InboundPeerTable, LiveInboundPeer, OutboundLimbStatus, OutboundPeerSummary,
-    PeerStore, PeersListing, unix_now_secs,
+    OutboundPeerTelemetry, PeerAlert, PeerAlertKind, PeerStore, PeersListing, unix_now_secs,
 };
 use crate::session::{self, SessionState};
 use crate::topology::{PaneId, SplitAxis, TabId, TopologyError, WindowId, Workspace};
 use crate::ui::window::MutinyWindow;
 
 const MAX_AUDIT_ENTRIES: usize = 256;
+const MAX_PEER_ALERTS: usize = 64;
 /// Rotate the durable trail past this size, keeping one previous generation.
 const AUDIT_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -196,6 +200,12 @@ pub struct AppController {
     consent_replay_cache: RefCell<crypto::GrantReplayCache>,
     haven_auth_prompts: RefCell<HashMap<String, (String, HavenAuthPrompt)>>,
     dismissed_auth_prompts: RefCell<HashSet<(String, String)>>,
+    remote_consent_prompts: RefCell<HashMap<String, String>>,
+    outbound_rate_limiters: RefCell<HashMap<String, TokenBucket>>,
+    peer_alerts: RefCell<VecDeque<PeerAlert>>,
+    next_peer_alert_id: Cell<u64>,
+    peer_shade_statuses: RefCell<HashMap<String, String>>,
+    last_pushed_shade_state: RefCell<(Vec<String>, bool)>,
     force_window_focused_for_test: Cell<Option<bool>>,
     next_peer_sock_seq: Cell<usize>,
     discovery_jobs: RefCell<Vec<PendingDiscovery>>,
@@ -222,6 +232,8 @@ pub struct AppController {
     /// so a handler can bind a proposal to the verified peer, including the
     /// token-derived identity of an HTTP peer rather than this process's pid.
     dispatch_peer: Cell<PeerIdentity>,
+    dispatch_carrier: Cell<ConsentMode>,
+    dispatch_client_label: RefCell<String>,
     unattached_filter: Cell<bool>,
     /// Whether the quick terminal is currently summoned. The controller owns
     /// this rather than reading GTK, so the toggle is testable headlessly.
@@ -252,7 +264,7 @@ pub struct AppController {
     recent_agent: RefCell<Option<(String, Instant)>>,
     shell_override: RefCell<Option<(String, Vec<String>)>>,
     default_menubar: Cell<bool>,
-    notifier: RefCell<Rc<dyn DesktopNotifier>>,
+    notifier: RefCell<CompositeNotifier>,
     session_path: RefCell<PathBuf>,
 }
 
@@ -307,13 +319,16 @@ impl AppController {
             }
         };
         let poll_cfg = PeerPollConfig::default();
+        let initial_shade_state = (resolved.inbound_shade_allowlist.clone(), false);
         let initial_client = if initial_peers.outbound_peers.is_empty() {
             None
         } else {
-            Some(HavenPeerClientHandle::spawn(
+            let client = HavenPeerClientHandle::spawn(
                 initial_peers.outbound_peers.clone(),
                 poll_cfg.clone(),
-            ))
+            );
+            client.set_shade_poll_state(initial_shade_state.0.clone(), initial_shade_state.1);
+            Some(client)
         };
         Rc::new(Self {
             workspace: RefCell::new(Workspace::new()),
@@ -339,6 +354,12 @@ impl AppController {
             consent_replay_cache: RefCell::new(crypto::GrantReplayCache::default()),
             haven_auth_prompts: RefCell::new(HashMap::new()),
             dismissed_auth_prompts: RefCell::new(HashSet::new()),
+            remote_consent_prompts: RefCell::new(HashMap::new()),
+            outbound_rate_limiters: RefCell::new(HashMap::new()),
+            peer_alerts: RefCell::new(VecDeque::new()),
+            next_peer_alert_id: Cell::new(1),
+            peer_shade_statuses: RefCell::new(HashMap::new()),
+            last_pushed_shade_state: RefCell::new(initial_shade_state),
             force_window_focused_for_test: Cell::new(None),
             next_peer_sock_seq: Cell::new(1000),
             discovery_jobs: RefCell::new(Vec::new()),
@@ -355,6 +376,8 @@ impl AppController {
             next_policy_id: Cell::new(1),
             pending_policies: RefCell::new(Vec::new()),
             dispatch_peer: Cell::new(PeerIdentity::default()),
+            dispatch_carrier: Cell::new(ConsentMode::Operator),
+            dispatch_client_label: RefCell::new(String::new()),
             unattached_filter: Cell::new(false),
             quick_visible: Cell::new(false),
             last_discovery_started: Cell::new(None),
@@ -378,7 +401,7 @@ impl AppController {
             recent_agent: RefCell::new(None),
             shell_override: RefCell::new(shell_override),
             default_menubar: Cell::new(true),
-            notifier: RefCell::new(Rc::new(DBusNotifier)),
+            notifier: RefCell::new(CompositeNotifier::new(Rc::new(DBusNotifier))),
             session_path: RefCell::new(session::session_path()),
         })
     }
@@ -481,7 +504,7 @@ impl AppController {
     /// Replaces the desktop notifier. Tests inject a recorder so forwarding
     /// can be asserted without a session bus.
     pub fn set_notifier(&self, notifier: Rc<dyn DesktopNotifier>) {
-        *self.notifier.borrow_mut() = notifier;
+        self.notifier.borrow_mut().set_desktop(notifier);
     }
 
     /// Zero-copy read of the effective config, for the renderer.
@@ -522,6 +545,7 @@ impl AppController {
             return false;
         }
         *self.config.borrow_mut() = resolved;
+        self.sync_shade_poll_state();
         self.apply_config_to_views();
         true
     }
@@ -633,6 +657,7 @@ impl AppController {
 
     pub fn set_force_window_focused_for_test(&self, focused: Option<bool>) {
         self.force_window_focused_for_test.set(focused);
+        self.sync_shade_poll_state();
     }
 
     pub fn any_window_focused(&self) -> bool {
@@ -643,6 +668,30 @@ impl AppController {
             .borrow()
             .values()
             .any(|w| w.gtk_window().is_active())
+    }
+
+    pub(crate) fn sync_shade_poll_state(&self) {
+        let desired = (
+            self.config.borrow().inbound_shade_allowlist.clone(),
+            self.any_window_focused(),
+        );
+        if *self.last_pushed_shade_state.borrow() != desired {
+            *self.last_pushed_shade_state.borrow_mut() = desired.clone();
+            if let Some(client) = self.peer_client.borrow().as_ref() {
+                client.set_shade_poll_state(desired.0, desired.1);
+            }
+        }
+    }
+
+    fn force_push_shade_poll_state(&self) {
+        let desired = (
+            self.config.borrow().inbound_shade_allowlist.clone(),
+            self.any_window_focused(),
+        );
+        *self.last_pushed_shade_state.borrow_mut() = desired.clone();
+        if let Some(client) = self.peer_client.borrow().as_ref() {
+            client.set_shade_poll_state(desired.0, desired.1);
+        }
     }
 
     pub fn poll_haven_peers_now(&self) {
@@ -680,6 +729,7 @@ impl AppController {
             }
             let cfg = self.peer_poll_config.borrow().clone();
             *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(outbound, cfg));
+            self.force_push_shade_poll_state();
         }
     }
 
@@ -691,6 +741,7 @@ impl AppController {
         }
         if !outbound.is_empty() {
             *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(outbound, cfg));
+            self.force_push_shade_poll_state();
         }
     }
 
@@ -705,6 +756,7 @@ impl AppController {
             let cfg = self.peer_poll_config.borrow().clone();
             *self.peer_client.borrow_mut() =
                 Some(HavenPeerClientHandle::spawn(store.outbound_peers, cfg));
+            self.force_push_shade_poll_state();
         }
         Ok(())
     }
@@ -948,7 +1000,158 @@ impl AppController {
             }
         }
         let statuses = self.outbound_statuses.borrow();
-        peers::build_listing(&inbound, &store.outbound_peers, &statuses)
+        let limiters = self.outbound_rate_limiters.borrow();
+        let alerts = self.peer_alerts.borrow();
+        let shade_statuses = self.peer_shade_statuses.borrow();
+        let mut telemetry = HashMap::with_capacity(store.outbound_peers.len());
+        for p in &store.outbound_peers {
+            let unread = alerts
+                .iter()
+                .filter(|a| a.unread && (a.peer_id == p.id || a.peer_label == p.label))
+                .count();
+            telemetry.insert(
+                p.id.clone(),
+                OutboundPeerTelemetry {
+                    rate_limited_count: limiters
+                        .get(&p.id)
+                        .map(|b| b.rate_limited_count())
+                        .unwrap_or(0),
+                    unread_alert_count: unread,
+                    shade_status: shade_statuses.get(&p.id).cloned(),
+                },
+            );
+        }
+        peers::build_listing(&inbound, &store.outbound_peers, &statuses, &telemetry)
+    }
+
+    pub fn list_peer_alerts(&self) -> Vec<PeerAlert> {
+        self.peer_alerts.borrow().iter().rev().cloned().collect()
+    }
+
+    pub fn unread_peer_alert_count(&self) -> usize {
+        self.peer_alerts
+            .borrow()
+            .iter()
+            .filter(|a| a.unread)
+            .count()
+    }
+
+    pub fn clear_peer_alerts(&self) {
+        let mut changed = false;
+        for alert in self.peer_alerts.borrow_mut().iter_mut() {
+            if alert.unread {
+                alert.unread = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_all_window_chromes();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_peer_alert(
+        &self,
+        peer_id: String,
+        peer_label: String,
+        kind: PeerAlertKind,
+        package_name: Option<String>,
+        title: String,
+        body: String,
+        timestamp_ms: u64,
+        unread: bool,
+    ) {
+        let id = self.next_peer_alert_id.get();
+        self.next_peer_alert_id.set(id + 1);
+        let mut ring = self.peer_alerts.borrow_mut();
+        if ring.len() >= MAX_PEER_ALERTS {
+            ring.pop_front();
+        }
+        ring.push_back(PeerAlert {
+            id,
+            peer_id,
+            peer_label,
+            kind,
+            package_name,
+            title,
+            body,
+            timestamp_ms,
+            unread,
+        });
+    }
+
+    fn mark_peer_alerts_read_by_kind(&self, peer_id: &str, kind: PeerAlertKind) -> bool {
+        let mut changed = false;
+        for alert in self.peer_alerts.borrow_mut().iter_mut() {
+            if alert.unread && alert.peer_id == peer_id && alert.kind == kind {
+                alert.unread = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn is_pane_focused_by_operator(&self, pid: PaneId) -> bool {
+        if !self.any_window_focused() {
+            return false;
+        }
+        let ws = self.workspace.borrow();
+        let Some((win_id, tab_id)) = ws.locate_pane(pid) else {
+            return false;
+        };
+        let win_focused = match self.force_window_focused_for_test.get() {
+            Some(true) => ws.active_window_id() == Some(win_id),
+            Some(false) => false,
+            None => self
+                .ui_windows
+                .borrow()
+                .get(&win_id)
+                .is_some_and(|w| w.gtk_window().is_active()),
+        };
+        win_focused
+            && ws
+                .window(win_id)
+                .is_some_and(|wm| wm.active_tab == tab_id && wm.active_pane() == Some(pid))
+    }
+
+    fn dispatch_outbound_notification(&self, event: &OutboundNotification) {
+        let relay_mode = self.config.borrow().peer_relay_mode;
+        let any_focused = self.any_window_focused();
+        self.notifier
+            .borrow()
+            .dispatch("mutiny", event, relay_mode, any_focused, |ev| {
+                let connected_ids: Vec<String> = self
+                    .outbound_statuses
+                    .borrow()
+                    .iter()
+                    .filter_map(|(id, st)| match st {
+                        OutboundLimbStatus::Connected { .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if connected_ids.is_empty() {
+                    return;
+                }
+                let now = Instant::now();
+                let client_guard = self.peer_client.borrow();
+                let Some(client) = client_guard.as_ref() else {
+                    return;
+                };
+                let mut limiters = self.outbound_rate_limiters.borrow_mut();
+                for pid in connected_ids {
+                    let bucket = limiters
+                        .entry(pid.clone())
+                        .or_insert_with(|| TokenBucket::haven_default(now));
+                    if bucket.try_acquire(now) {
+                        let _ = client.raise_notification(
+                            pid,
+                            ev.title.clone(),
+                            ev.body.clone(),
+                            ev.priority.as_str().to_owned(),
+                        );
+                    }
+                }
+            });
     }
 
     pub fn pairing_outbound_label(&self) -> Option<String> {
@@ -965,6 +1168,7 @@ impl AppController {
                 format!("Pairing outbound Haven limb '{lbl}'…"),
             ));
         }
+        let total_unread = self.unread_peer_alert_count();
         let listing = self.list_peers();
         if let Some(primary) = listing
             .outbound
@@ -988,10 +1192,21 @@ impl AppController {
                     } else {
                         ""
                     };
-                    Some((
-                        format!("● haven:{label}"),
-                        format!("Haven limb '{label}'{ver} connected ({rtt_ms} ms RTT{signer})"),
-                    ))
+                    if total_unread > 0 {
+                        Some((
+                            format!("!haven:{label} ({total_unread})"),
+                            format!(
+                                "{total_unread} unread Haven alert(s) on '{label}'{ver} ({rtt_ms} ms RTT{signer})"
+                            ),
+                        ))
+                    } else {
+                        Some((
+                            format!("● haven:{label}"),
+                            format!(
+                                "Haven limb '{label}'{ver} connected ({rtt_ms} ms RTT{signer})"
+                            ),
+                        ))
+                    }
                 }
                 OutboundLimbStatus::Pairing { label } => Some((
                     String::from("◐ pairing…"),
@@ -1001,15 +1216,38 @@ impl AppController {
                     label, last_error, ..
                 } => {
                     let detail = last_error.as_deref().unwrap_or("unreachable");
-                    Some((
-                        format!("◌ haven:{label}"),
-                        format!("Haven limb '{label}' offline: {detail}"),
-                    ))
+                    if total_unread > 0 {
+                        Some((
+                            format!("◌ !haven:{label} ({total_unread})"),
+                            format!(
+                                "Haven limb '{label}' offline ({total_unread} unread alert(s)): {detail}"
+                            ),
+                        ))
+                    } else {
+                        Some((
+                            format!("◌ haven:{label}"),
+                            format!("Haven limb '{label}' offline: {detail}"),
+                        ))
+                    }
                 }
             };
         }
         if !listing.inbound.is_empty() {
             let first = &listing.inbound[0];
+            if total_unread > 0 {
+                let alert_label = self
+                    .peer_alerts
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|a| a.unread)
+                    .map(|a| a.peer_label.clone())
+                    .unwrap_or_else(|| first.label.clone());
+                return Some((
+                    format!("!haven:{alert_label} ({total_unread})"),
+                    format!("{total_unread} unread peer alert(s) from '{alert_label}'"),
+                ));
+            }
             if listing.inbound.len() == 1 {
                 return Some((
                     format!("● limb:{}", first.label),
@@ -1022,6 +1260,20 @@ impl AppController {
             return Some((
                 format!("● limbs:{}", listing.inbound.len()),
                 format!("{} inbound paired peers", listing.inbound.len()),
+            ));
+        }
+        if total_unread > 0 {
+            let alert_label = self
+                .peer_alerts
+                .borrow()
+                .iter()
+                .rev()
+                .find(|a| a.unread)
+                .map(|a| a.peer_label.clone())
+                .unwrap_or_else(|| String::from("peer"));
+            return Some((
+                format!("!haven:{alert_label} ({total_unread})"),
+                format!("{total_unread} unread peer alert(s)"),
             ));
         }
         None
@@ -1046,6 +1298,7 @@ impl AppController {
             let initial = self.peer_store.borrow().outbound_peers.clone();
             let cfg = self.peer_poll_config.borrow().clone();
             *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+            self.force_push_shade_poll_state();
         }
         let req_id = self.next_pair_req_id.get();
         self.next_pair_req_id.set(req_id + 1);
@@ -1093,6 +1346,7 @@ impl AppController {
             let initial = self.peer_store.borrow().outbound_peers.clone();
             let cfg = self.peer_poll_config.borrow().clone();
             *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+            self.force_push_shade_poll_state();
         }
         let req_id = self.next_pair_req_id.get();
         self.next_pair_req_id.set(req_id + 1);
@@ -1130,6 +1384,7 @@ impl AppController {
             removed_any = true;
         }
         let removed_ids: Vec<String> = removed_live.iter().map(|e| e.id.clone()).collect();
+        let removed_labels: Vec<String> = removed_live.iter().map(|e| e.label.clone()).collect();
 
         // Tear down matching per-peer Unix relay sockets and purge any standing
         // grants/policies keyed on that peer's token identity.
@@ -1191,11 +1446,20 @@ impl AppController {
 
         for out_id in &removed_outbound_ids {
             self.outbound_statuses.borrow_mut().remove(out_id);
+            self.outbound_rate_limiters.borrow_mut().remove(out_id);
+            self.peer_shade_statuses.borrow_mut().remove(out_id);
+            self.remote_consent_prompts.borrow_mut().remove(out_id);
             self.haven_auth_prompts.borrow_mut().remove(out_id);
             self.dismissed_auth_prompts
                 .borrow_mut()
                 .retain(|(pid, _)| pid != out_id);
         }
+        self.peer_alerts.borrow_mut().retain(|a| {
+            !removed_outbound_ids.contains(&a.peer_id)
+                && a.peer_id != target
+                && a.peer_label != target
+                && !removed_labels.contains(&a.peer_label)
+        });
         if !removed_outbound_ids.is_empty()
             && let Some(client) = self.peer_client.borrow().as_ref()
         {
@@ -1434,6 +1698,7 @@ impl AppController {
         self.dismissed_auth_prompts
             .borrow_mut()
             .remove(&(peer_id.to_owned(), profile_id.to_owned()));
+        self.mark_peer_alerts_read_by_kind(peer_id, PeerAlertKind::AuthPrompt);
         let res = match self.peer_client.borrow().as_ref() {
             Some(client) => {
                 client.answer_auth_prompt(peer_id.to_owned(), password, remember_password)
@@ -1448,6 +1713,7 @@ impl AppController {
         self.dismissed_auth_prompts
             .borrow_mut()
             .insert((peer_id.to_owned(), profile_id.to_owned()));
+        self.mark_peer_alerts_read_by_kind(peer_id, PeerAlertKind::AuthPrompt);
         self.refresh_all_window_chromes();
     }
 
@@ -1477,6 +1743,7 @@ impl AppController {
             let initial = self.peer_store.borrow().outbound_peers.clone();
             let cfg = self.peer_poll_config.borrow().clone();
             *self.peer_client.borrow_mut() = Some(HavenPeerClientHandle::spawn(initial, cfg));
+            self.force_push_shade_poll_state();
         }
         self.peer_client
             .borrow()
@@ -1615,6 +1882,9 @@ impl AppController {
                     item.carrier,
                     item.peer,
                 );
+                self.dispatch_peer.set(item.peer);
+                self.dispatch_carrier.set(item.carrier);
+                *self.dispatch_client_label.borrow_mut() = item.client.clone();
                 if let Some(resp) = self.execute_ipc_request(item.request, &item.stream) {
                     let _ = write_response(&mut item.stream, &resp);
                 }
@@ -1642,6 +1912,9 @@ impl AppController {
                     item.carrier,
                     item.peer,
                 );
+                self.dispatch_peer.set(item.peer);
+                self.dispatch_carrier.set(item.carrier);
+                *self.dispatch_client_label.borrow_mut() = item.client.clone();
                 if let Some(resp) = self.execute_ipc_request(item.request, &item.stream) {
                     let _ = write_response(&mut item.stream, &resp);
                 }
@@ -2895,7 +3168,16 @@ impl AppController {
                     if let Some(ui_win) = self.ui_windows.borrow().get(&win_id) {
                         ui_win.present();
                     }
+                } else if self.unread_peer_alert_count() > 0
+                    && let Some(win_id) = active_win
+                    && let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned()
+                {
+                    ui_win.present();
+                    ui_win.popup_limb_popover();
                 }
+            }
+            ActionId::ClearPeerAlerts => {
+                self.clear_peer_alerts();
             }
             ActionId::Copy => {
                 if let Some(pid) = active_pane {
@@ -3131,6 +3413,7 @@ impl AppController {
     /// Single non-blocking tick: drains PTYs, updates UI badges/draws, and services IPC/MCP sockets.
     pub fn poll_once(self: &Rc<Self>) {
         self.reload_config_if_changed();
+        self.sync_shade_poll_state();
         let pane_ids = self.workspace.borrow().pane_ids();
         let mut panes_exited = Vec::new();
         let mut windows_needing_chrome_refresh = Vec::new();
@@ -3152,7 +3435,61 @@ impl AppController {
             for note in notifications {
                 match note {
                     EngineNotification::DesktopNotification { title, body } => {
-                        self.notifier.borrow().notify("mutiny", &title, &body);
+                        self.dispatch_outbound_notification(&OutboundNotification {
+                            title,
+                            body,
+                            priority: NotificationPriority::Default,
+                        });
+                        if let Some((wid, _)) = self.workspace.borrow().locate_pane(pid)
+                            && !windows_needing_chrome_refresh.contains(&wid)
+                        {
+                            windows_needing_chrome_refresh.push(wid);
+                        }
+                    }
+                    EngineNotification::CommandFinished(record) => {
+                        let threshold_secs = self.config.borrow().long_command_secs;
+                        if threshold_secs > 0
+                            && record.duration_ms.unwrap_or(0)
+                                >= threshold_secs.saturating_mul(1_000)
+                            && !self.is_pane_focused_by_operator(pid)
+                        {
+                            let label = {
+                                let mut ws = self.workspace.borrow_mut();
+                                if let Some(eng) = ws.pane_mut(pid) {
+                                    eng.mark_osc_notification_attention();
+                                    let clean = mux::sanitize_text(eng.title(), 32);
+                                    if clean.is_empty() {
+                                        String::from("mutiny")
+                                    } else {
+                                        clean
+                                    }
+                                } else {
+                                    String::from("mutiny")
+                                }
+                            };
+                            let secs =
+                                (record.duration_ms.unwrap_or(0) / 1_000).max(threshold_secs);
+                            let code = record.exit_code.unwrap_or(0);
+                            let (title, priority) = if code == 0 {
+                                (
+                                    String::from("Command finished (exit 0)"),
+                                    NotificationPriority::Default,
+                                )
+                            } else {
+                                (
+                                    format!("Command failed (exit {code})"),
+                                    NotificationPriority::High,
+                                )
+                            };
+                            // Strictly session/tab/pane label + elapsed duration;
+                            // NEVER include `record.output` or any scrollback text.
+                            let body = format!("{label} · pane {} · {secs}s", pid.0);
+                            self.dispatch_outbound_notification(&OutboundNotification {
+                                title,
+                                body,
+                                priority,
+                            });
+                        }
                         if let Some((wid, _)) = self.workspace.borrow().locate_pane(pid)
                             && !windows_needing_chrome_refresh.contains(&wid)
                         {
@@ -3161,8 +3498,7 @@ impl AppController {
                     }
                     EngineNotification::TitleChanged(_)
                     | EngineNotification::Bell
-                    | EngineNotification::PromptReached { .. }
-                    | EngineNotification::CommandFinished(_) => {
+                    | EngineNotification::PromptReached { .. } => {
                         if let Some((wid, _)) = self.workspace.borrow().locate_pane(pid)
                             && !windows_needing_chrome_refresh.contains(&wid)
                         {
@@ -3371,6 +3707,8 @@ impl AppController {
         // carrier would raise. It never escalates a carrier, so it is consulted
         // only for ask + Act and returns None otherwise.
         self.dispatch_peer.set(peer);
+        self.dispatch_carrier.set(carrier);
+        *self.dispatch_client_label.borrow_mut() = client_label.clone();
         let tier = env_req.request.consent_tier();
         let verb = env_req.request.verb_name();
         let pins = env_req.request.pin_fields();
@@ -3680,6 +4018,17 @@ impl AppController {
                 Ok(()) => Some(IpcResponse::empty_ok()),
                 Err(err) => Some(IpcResponse::err(err)),
             },
+            IpcRequest::ListPeerAlerts => {
+                let mut resp = IpcResponse::empty_ok();
+                if let IpcResponse::Ok { peer_alerts, .. } = &mut resp {
+                    *peer_alerts = Some(self.list_peer_alerts());
+                }
+                Some(resp)
+            }
+            IpcRequest::ClearPeerAlerts => {
+                self.clear_peer_alerts();
+                Some(IpcResponse::empty_ok())
+            }
             IpcRequest::EndSession { kind, name, host } => {
                 let Ok(cloned) = raw_stream.try_clone() else {
                     return Some(IpcResponse::err("could not clone the request stream"));
@@ -4026,12 +4375,54 @@ impl AppController {
                 let Some(pid) = pid else {
                     return Some(IpcResponse::err("no active pane"));
                 };
+                let clean_msg = message
+                    .as_deref()
+                    .map(|m| mux::sanitize_text(m.trim(), 240))
+                    .filter(|m| !m.is_empty());
+                let carrier = self.dispatch_carrier.get();
+                let caller = {
+                    let raw = mux::sanitize_text(self.dispatch_client_label.borrow().trim(), 48);
+                    if raw.is_empty() {
+                        String::from("peer")
+                    } else {
+                        raw
+                    }
+                };
+                let pane_notice = match (&clean_msg, carrier.carrier_role()) {
+                    (Some(msg), CarrierRole::Peer) => Some(format!("[{caller}] {msg}")),
+                    (Some(msg), CarrierRole::Operator) => Some(msg.clone()),
+                    (None, _) => None,
+                };
                 {
                     let mut ws = self.workspace.borrow_mut();
                     let Some(eng) = ws.pane_mut(pid) else {
                         return Some(IpcResponse::err(format!("pane {pid} not found")));
                     };
-                    eng.set_agent_notice(message);
+                    eng.set_agent_notice(pane_notice);
+                }
+                if let Some(msg) = clean_msg {
+                    if carrier.carrier_role() == CarrierRole::Peer {
+                        self.push_peer_alert(
+                            format!("peer:{caller}"),
+                            caller.clone(),
+                            PeerAlertKind::PeerNotice,
+                            None,
+                            format!("Notice from {caller}"),
+                            msg.clone(),
+                            now_ms(),
+                            true,
+                        );
+                    }
+                    // Avoid ping-pong echo back to an HTTP token peer that pushed
+                    // this notice; local operator / stdio MCP notices mirror via
+                    // CompositeNotifier.
+                    if !self.dispatch_peer.get().is_token_peer() {
+                        self.dispatch_outbound_notification(&OutboundNotification {
+                            title: format!("Notice on pane {}", pid.0),
+                            body: msg,
+                            priority: NotificationPriority::Default,
+                        });
+                    }
                 }
                 self.refresh_all_window_chromes();
                 Some(ids_ok(None, None, Some(pid)))
@@ -4445,9 +4836,17 @@ impl AppController {
                     connected_at,
                 } => {
                     if let Some(pid) = peer_id {
-                        self.outbound_statuses
+                        let prev = self
+                            .outbound_statuses
                             .borrow_mut()
-                            .insert(pid.clone(), status);
+                            .insert(pid.clone(), status.clone());
+                        let had_ever_connected = self
+                            .peer_store
+                            .borrow()
+                            .outbound_peers
+                            .iter()
+                            .find(|p| p.id == pid)
+                            .is_some_and(|p| p.last_connected_at.is_some());
                         if let Some(ts) = connected_at
                             && let Some(entry) = self
                                 .peer_store
@@ -4457,6 +4856,57 @@ impl AppController {
                                 .find(|p| p.id == pid)
                         {
                             entry.last_connected_at = Some(ts);
+                        }
+                        match (&prev, &status) {
+                            (
+                                Some(OutboundLimbStatus::Connected { .. }),
+                                OutboundLimbStatus::Offline {
+                                    label, last_error, ..
+                                },
+                            ) => {
+                                self.mark_peer_alerts_read_by_kind(
+                                    &pid,
+                                    PeerAlertKind::LimbOffline,
+                                );
+                                self.push_peer_alert(
+                                    pid,
+                                    label.clone(),
+                                    PeerAlertKind::LimbOffline,
+                                    None,
+                                    format!("Haven limb '{label}' disconnected"),
+                                    last_error
+                                        .clone()
+                                        .unwrap_or_else(|| String::from("connection lost")),
+                                    now_ms(),
+                                    true,
+                                );
+                            }
+                            (
+                                Some(OutboundLimbStatus::Offline { .. }),
+                                OutboundLimbStatus::Connected { label, .. },
+                            ) if had_ever_connected => {
+                                self.mark_peer_alerts_read_by_kind(
+                                    &pid,
+                                    PeerAlertKind::LimbOffline,
+                                );
+                                self.push_peer_alert(
+                                    pid,
+                                    label.clone(),
+                                    PeerAlertKind::LimbReconnected,
+                                    None,
+                                    format!("Haven limb '{label}' reconnected"),
+                                    String::from("tunnel restored"),
+                                    now_ms(),
+                                    false,
+                                );
+                            }
+                            (_, OutboundLimbStatus::Connected { .. }) => {
+                                self.mark_peer_alerts_read_by_kind(
+                                    &pid,
+                                    PeerAlertKind::LimbOffline,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     refresh_ui = true;
@@ -4475,6 +4925,9 @@ impl AppController {
                                 last_connected_at: peer.last_connected_at,
                                 has_signing_key: peer.signing_secret_b64.is_some(),
                                 signing_key_id: peer.signing_key_id.clone(),
+                                rate_limited_count: 0,
+                                unread_alert_count: 0,
+                                shade_status: None,
                                 status: status.clone(),
                             };
                             let save_res = {
@@ -4539,6 +4992,20 @@ impl AppController {
                                             label: entry.label.clone(),
                                             last_error: None,
                                         });
+                                    let rl_count = self
+                                        .outbound_rate_limiters
+                                        .borrow()
+                                        .get(&entry.id)
+                                        .map(|b| b.rate_limited_count())
+                                        .unwrap_or(0);
+                                    let unread_count = self
+                                        .peer_alerts
+                                        .borrow()
+                                        .iter()
+                                        .filter(|a| a.unread && a.peer_id == entry.id)
+                                        .count();
+                                    let shade_note =
+                                        self.peer_shade_statuses.borrow().get(&entry.id).cloned();
                                     summary_opt = Some(OutboundPeerSummary {
                                         id: entry.id.clone(),
                                         label: entry.label.clone(),
@@ -4548,6 +5015,9 @@ impl AppController {
                                         last_connected_at: entry.last_connected_at,
                                         has_signing_key: true,
                                         signing_key_id: Some(key_id),
+                                        rate_limited_count: rl_count,
+                                        unread_alert_count: unread_count,
+                                        shade_status: shade_note,
                                         status,
                                     });
                                     let res = peers::save(&self.peers_path.borrow(), &store);
@@ -4683,16 +5153,160 @@ impl AppController {
                     peer_id,
                     peer_label,
                     prompt,
-                } => {
-                    let mut map = self.haven_auth_prompts.borrow_mut();
-                    match prompt {
-                        Some(p) => {
-                            let changed = map
+                } => match prompt {
+                    Some(p) => {
+                        let changed = {
+                            let mut map = self.haven_auth_prompts.borrow_mut();
+                            let c = map
                                 .get(&peer_id)
                                 .map(|(lbl, old)| lbl != &peer_label || old != &p)
                                 .unwrap_or(true);
-                            map.insert(peer_id, (peer_label, p));
-                            if changed {
+                            map.insert(peer_id.clone(), (peer_label.clone(), p.clone()));
+                            c
+                        };
+                        if changed {
+                            self.mark_peer_alerts_read_by_kind(&peer_id, PeerAlertKind::AuthPrompt);
+                            self.push_peer_alert(
+                                peer_id,
+                                peer_label.clone(),
+                                PeerAlertKind::AuthPrompt,
+                                None,
+                                format!("SSH auth needed on '{peer_label}'"),
+                                format!("Profile '{}' awaits credentials", p.label),
+                                now_ms(),
+                                true,
+                            );
+                            refresh_ui = true;
+                        }
+                    }
+                    None => {
+                        let removed = self
+                            .haven_auth_prompts
+                            .borrow_mut()
+                            .remove(&peer_id)
+                            .is_some();
+                        let cleared =
+                            self.mark_peer_alerts_read_by_kind(&peer_id, PeerAlertKind::AuthPrompt);
+                        if removed || cleared {
+                            refresh_ui = true;
+                        }
+                        self.dismissed_auth_prompts
+                            .borrow_mut()
+                            .retain(|(pid, _)| pid != &peer_id);
+                    }
+                },
+                PeerClientEvent::RemoteConsentPromptChanged {
+                    peer_id,
+                    peer_label,
+                    summary,
+                } => match summary {
+                    Some(s) => {
+                        let changed = {
+                            let mut map = self.remote_consent_prompts.borrow_mut();
+                            let c = map.get(&peer_id).map(|old| old != &s).unwrap_or(true);
+                            map.insert(peer_id.clone(), s.clone());
+                            c
+                        };
+                        if changed {
+                            self.mark_peer_alerts_read_by_kind(
+                                &peer_id,
+                                PeerAlertKind::PendingConsent,
+                            );
+                            self.push_peer_alert(
+                                peer_id,
+                                peer_label.clone(),
+                                PeerAlertKind::PendingConsent,
+                                None,
+                                format!("Consent pending on '{peer_label}'"),
+                                s,
+                                now_ms(),
+                                true,
+                            );
+                            refresh_ui = true;
+                        }
+                    }
+                    None => {
+                        let removed = self
+                            .remote_consent_prompts
+                            .borrow_mut()
+                            .remove(&peer_id)
+                            .is_some();
+                        let cleared = self
+                            .mark_peer_alerts_read_by_kind(&peer_id, PeerAlertKind::PendingConsent);
+                        if removed || cleared {
+                            refresh_ui = true;
+                        }
+                    }
+                },
+                PeerClientEvent::ShadeNotificationsPolled {
+                    peer_id,
+                    peer_label,
+                    records,
+                } => {
+                    if self
+                        .peer_shade_statuses
+                        .borrow_mut()
+                        .remove(&peer_id)
+                        .is_some()
+                    {
+                        refresh_ui = true;
+                    }
+                    for rec in records {
+                        if rec.removed {
+                            let mut alerts = self.peer_alerts.borrow_mut();
+                            for a in alerts.iter_mut() {
+                                if a.unread
+                                    && a.peer_id == peer_id
+                                    && a.kind == PeerAlertKind::AndroidShade
+                                    && a.package_name.as_deref() == Some(rec.package_name.as_str())
+                                    && (a.timestamp_ms == rec.post_time_ms
+                                        || (a.title == rec.title && a.body == rec.text))
+                                {
+                                    a.unread = false;
+                                    refresh_ui = true;
+                                }
+                            }
+                        } else {
+                            let dup = self.peer_alerts.borrow().iter().any(|a| {
+                                a.unread
+                                    && a.peer_id == peer_id
+                                    && a.kind == PeerAlertKind::AndroidShade
+                                    && a.package_name.as_deref() == Some(rec.package_name.as_str())
+                                    && a.timestamp_ms == rec.post_time_ms
+                                    && a.title == rec.title
+                                    && a.body == rec.text
+                            });
+                            if !dup {
+                                let title = if rec.title.is_empty() {
+                                    rec.app_name
+                                        .clone()
+                                        .unwrap_or_else(|| rec.package_name.clone())
+                                } else {
+                                    rec.title.clone()
+                                };
+                                self.push_peer_alert(
+                                    peer_id.clone(),
+                                    peer_label.clone(),
+                                    PeerAlertKind::AndroidShade,
+                                    Some(rec.package_name),
+                                    title,
+                                    rec.text,
+                                    rec.post_time_ms,
+                                    true,
+                                );
+                                refresh_ui = true;
+                            }
+                        }
+                    }
+                }
+                PeerClientEvent::ShadeStatusChanged {
+                    peer_id,
+                    status_note,
+                } => {
+                    let mut map = self.peer_shade_statuses.borrow_mut();
+                    match status_note {
+                        Some(note) => {
+                            if map.insert(peer_id, note.clone()).as_ref() != Some(&note) {
                                 refresh_ui = true;
                             }
                         }
@@ -4700,9 +5314,6 @@ impl AppController {
                             if map.remove(&peer_id).is_some() {
                                 refresh_ui = true;
                             }
-                            self.dismissed_auth_prompts
-                                .borrow_mut()
-                                .retain(|(pid, _)| pid != &peer_id);
                         }
                     }
                 }
@@ -4815,6 +5426,7 @@ fn ids_ok(window: Option<WindowId>, tab: Option<TabId>, pane: Option<PaneId>) ->
         pending_policies: None,
         peers: None,
         outbound_peer: None,
+        peer_alerts: None,
         visible: None,
     }
 }

@@ -224,6 +224,10 @@ pub enum IpcRequest {
     RevokePeer {
         id_or_label: String,
     },
+    /// Lists recent Haven limb state, notice, and opt-in shade alerts.
+    ListPeerAlerts,
+    /// Marks all unread Haven limb and notification alerts as read.
+    ClearPeerAlerts,
     /// ENDS a multiplexer session. Destructive: everything running inside it
     /// stops, on every device. Distinct from closing a tab, which only ends
     /// this client and leaves the session running. Tier-4 Irreversible: never
@@ -371,6 +375,8 @@ impl IpcRequest {
             IpcRequest::InstallPolicy { .. } => ConsentTier::PolicyChange,
             IpcRequest::RevokePolicy { .. } => ConsentTier::PolicyChange,
             IpcRequest::ListPeers => ConsentTier::Observe,
+            IpcRequest::ListPeerAlerts => ConsentTier::Observe,
+            IpcRequest::ClearPeerAlerts => ConsentTier::Act,
             IpcRequest::PairHaven { .. } => ConsentTier::PolicyChange,
             IpcRequest::EnrollHavenSigner { .. } => ConsentTier::PolicyChange,
             IpcRequest::RevokePeer { .. } => ConsentTier::PolicyChange,
@@ -455,6 +461,8 @@ impl IpcRequest {
             IpcRequest::InstallPolicy { .. } => "install-policy",
             IpcRequest::RevokePolicy { .. } => "revoke-policy",
             IpcRequest::ListPeers => "list-peers",
+            IpcRequest::ListPeerAlerts => "list-peer-alerts",
+            IpcRequest::ClearPeerAlerts => "clear-peer-alerts",
             IpcRequest::PairHaven { .. } => "pair-haven",
             IpcRequest::EnrollHavenSigner { .. } => "enroll-haven-signer",
             IpcRequest::RevokePeer { .. } => "revoke-peer",
@@ -713,6 +721,8 @@ pub enum IpcResponse {
         peers: Option<crate::peers::PeersListing>,
         #[serde(skip_serializing_if = "Option::is_none")]
         outbound_peer: Option<crate::peers::OutboundPeerSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer_alerts: Option<Vec<crate::peers::PeerAlert>>,
         /// Whether a toggled window is now showing rather than dismissed.
         #[serde(skip_serializing_if = "Option::is_none")]
         visible: Option<bool>,
@@ -748,6 +758,7 @@ impl IpcResponse {
             pending_policies: None,
             peers: None,
             outbound_peer: None,
+            peer_alerts: None,
             visible: None,
         }
     }
@@ -1321,6 +1332,8 @@ pub fn verb_samples() -> Vec<IpcRequest> {
         IpcRequest::EnrollHavenSigner {
             id_or_label: String::from("absent-peer"),
         },
+        IpcRequest::ListPeerAlerts,
+        IpcRequest::ClearPeerAlerts,
     ]
 }
 
@@ -1366,6 +1379,8 @@ pub fn variant_ordinal(req: &IpcRequest) -> usize {
         IpcRequest::PairHaven { .. } => 38,
         IpcRequest::RevokePeer { .. } => 39,
         IpcRequest::EnrollHavenSigner { .. } => 40,
+        IpcRequest::ListPeerAlerts => 41,
+        IpcRequest::ClearPeerAlerts => 42,
         IpcRequest::EndSession { .. } => 31,
         IpcRequest::ClosePane { .. } => 25,
         IpcRequest::CloseTab { .. } => 27,

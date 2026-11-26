@@ -144,7 +144,45 @@ pub struct OutboundPeerSummary {
     pub has_signing_key: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing_key_id: Option<String>,
+    #[serde(default)]
+    pub rate_limited_count: u64,
+    #[serde(default)]
+    pub unread_alert_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shade_status: Option<String>,
     pub status: OutboundLimbStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboundPeerTelemetry {
+    pub rate_limited_count: u64,
+    pub unread_alert_count: usize,
+    pub shade_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PeerAlertKind {
+    LimbOffline,
+    LimbReconnected,
+    AuthPrompt,
+    PendingConsent,
+    PeerNotice,
+    AndroidShade,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAlert {
+    pub id: u64,
+    pub peer_id: String,
+    pub peer_label: String,
+    pub kind: PeerAlertKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub timestamp_ms: u64,
+    pub unread: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +437,7 @@ pub fn build_listing(
     inbound: &[InboundPeerSummary],
     outbound_store: &[OutboundHavenPeer],
     outbound_statuses: &HashMap<String, OutboundLimbStatus>,
+    telemetry: &HashMap<String, OutboundPeerTelemetry>,
 ) -> PeersListing {
     let outbound = outbound_store
         .iter()
@@ -410,6 +449,7 @@ pub fn build_listing(
                     last_error: None,
                 }
             });
+            let telem = telemetry.get(&p.id).cloned().unwrap_or_default();
             OutboundPeerSummary {
                 id: p.id.clone(),
                 label: p.label.clone(),
@@ -419,6 +459,9 @@ pub fn build_listing(
                 last_connected_at: p.last_connected_at,
                 has_signing_key: p.signing_secret_b64.is_some(),
                 signing_key_id: p.signing_key_id.clone(),
+                rate_limited_count: telem.rate_limited_count,
+                unread_alert_count: telem.unread_alert_count,
+                shade_status: telem.shade_status,
                 status,
             }
         })
