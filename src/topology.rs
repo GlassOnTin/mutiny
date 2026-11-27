@@ -223,12 +223,20 @@ pub struct TabModel {
     pub active_pane: PaneId,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowModel {
     pub id: WindowId,
     pub tabs: Vec<TabModel>,
     pub active_tab: TabId,
     pub menubar_visible: bool,
+    /// Whether the second-line hostname / plain-shell subtitle is shown on each
+    /// session tab button. Hiding it halves tab label height.
+    #[serde(default = "default_true")]
+    pub tab_hostnames_visible: bool,
     /// The summonable quick terminal. A WM close dismisses it instead of
     /// ending its shell, so the flag travels with the saved layout.
     #[serde(default)]
@@ -291,6 +299,8 @@ pub struct WindowSummary {
     pub id: WindowId,
     pub active_tab: TabId,
     pub menubar_visible: bool,
+    #[serde(default = "default_true")]
+    pub tab_hostnames_visible: bool,
     /// The summonable scratch window, whose WM close dismisses rather than ends it.
     #[serde(default)]
     pub quick: bool,
@@ -472,6 +482,7 @@ impl Workspace {
             tabs: vec![tab],
             active_tab: tab_id,
             menubar_visible,
+            tab_hostnames_visible: true,
             quick: false,
         };
         self.windows.push(win);
@@ -501,6 +512,7 @@ impl Workspace {
             }],
             active_tab: tab_id,
             menubar_visible,
+            tab_hostnames_visible: true,
             quick: false,
         });
         self.active_window = Some(win_id);
@@ -556,13 +568,13 @@ impl Workspace {
             return Err(TopologyError::PaneNotFound(pane_id));
         };
 
-        let menubar_visible = {
+        let (menubar_visible, tab_hostnames_visible) = {
             let src_win = self.window(src_win_id).unwrap();
             let src_tab = src_win.tabs.iter().find(|t| t.id == src_tab_id).unwrap();
             if src_win.tabs.len() == 1 && src_tab.root == SplitNode::Leaf(pane_id) {
                 return Err(TopologyError::AlreadyStandaloneWindow(pane_id));
             }
-            src_win.menubar_visible
+            (src_win.menubar_visible, src_win.tab_hostnames_visible)
         };
 
         self.unlink_pane_from_tree(src_win_id, src_tab_id, pane_id);
@@ -578,6 +590,7 @@ impl Workspace {
             }],
             active_tab: new_tab_id,
             menubar_visible,
+            tab_hostnames_visible,
             quick: false,
         });
         self.active_window = Some(new_win_id);
@@ -754,6 +767,7 @@ impl Workspace {
             return Err(TopologyError::AlreadyStandaloneWindow(pid));
         }
         let menubar_visible = self.windows[src_win_idx].menubar_visible;
+        let tab_hostnames_visible = self.windows[src_win_idx].tab_hostnames_visible;
         let moved_tab = self.windows[src_win_idx].tabs.remove(src_tab_pos);
         if self.windows[src_win_idx].active_tab == tab_id {
             let next_idx = src_tab_pos.min(self.windows[src_win_idx].tabs.len() - 1);
@@ -765,6 +779,7 @@ impl Workspace {
             tabs: vec![moved_tab],
             active_tab: tab_id,
             menubar_visible,
+            tab_hostnames_visible,
             quick: false,
         });
         self.active_window = Some(new_win_id);
@@ -951,6 +966,7 @@ impl Workspace {
                 id: w.id,
                 active_tab: w.active_tab,
                 menubar_visible: w.menubar_visible,
+                tab_hostnames_visible: w.tab_hostnames_visible,
                 quick: w.quick,
                 tabs: w
                     .tabs

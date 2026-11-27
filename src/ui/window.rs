@@ -1177,7 +1177,7 @@ impl MutinyWindow {
             return;
         };
 
-        let (menubar_vis, active_tab_id, active_pane_id, active_tree, win_title) = {
+        let (menubar_vis, tab_hostnames_vis, active_tab_id, active_pane_id, active_tree, win_title) = {
             let ws = ctrl.workspace.borrow();
             let Some(wm) = ws.window(self.inner.window_id) else {
                 return;
@@ -1194,6 +1194,7 @@ impl MutinyWindow {
                 .unwrap_or_else(|| String::from("Mutiny"));
             (
                 wm.menubar_visible,
+                wm.tab_hostnames_visible,
                 wm.active_tab,
                 tab.active_pane,
                 tab.root.clone(),
@@ -1224,6 +1225,7 @@ impl MutinyWindow {
             sub_label.set_max_width_chars(24);
             sub_label.add_css_class("dim-label");
             sub_label.add_css_class("tab-subtitle");
+            sub_label.set_visible(tab_hostnames_vis);
             lines.append(&title_label);
             lines.append(&sub_label);
             btn.set_child(Some(&lines));

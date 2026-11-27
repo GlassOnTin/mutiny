@@ -226,6 +226,42 @@ fn many_tabs_wrap_without_stretching_the_window() {
         "resetting zoom must restore baseline session tab width"
     );
 
+    // View -> Toggle Tab Hostnames hides the second-line hostname/shell subtitle
+    // and drops each tab button's vertical minimum height significantly.
+    let two_line_btn_h = window
+        .tab_button(target)
+        .unwrap()
+        .measure(gtk4::Orientation::Vertical, -1)
+        .0;
+    ctrl.execute_action(mutiny::action::ActionId::ToggleTabHostnames, Some(w));
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        settle(&ctrl, 5);
+    }
+    let one_line_btn_h = window
+        .tab_button(target)
+        .unwrap()
+        .measure(gtk4::Orientation::Vertical, -1)
+        .0;
+    assert!(
+        one_line_btn_h < (two_line_btn_h * 3) / 4,
+        "hiding tab hostnames must drop tab height substantially: {two_line_btn_h} -> {one_line_btn_h}"
+    );
+    ctrl.execute_action(mutiny::action::ActionId::ToggleTabHostnames, Some(w));
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        settle(&ctrl, 5);
+    }
+    assert_eq!(
+        window
+            .tab_button(target)
+            .unwrap()
+            .measure(gtk4::Orientation::Vertical, -1)
+            .0,
+        two_line_btn_h,
+        "re-enabling tab hostnames must restore two-line tab height"
+    );
+
     // Removing tabs must not leave the window stretched either.
     // Closing a tab's last pane removes the tab, which is the only close path.
     let panes: Vec<mutiny::topology::PaneId> = {

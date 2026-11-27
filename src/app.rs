@@ -274,6 +274,7 @@ pub struct AppController {
     recent_agent: RefCell<Option<(String, Instant)>>,
     shell_override: RefCell<Option<(String, Vec<String>)>>,
     default_menubar: Cell<bool>,
+    default_tab_hostnames: Cell<bool>,
     notifier: RefCell<CompositeNotifier>,
     session_path: RefCell<PathBuf>,
 }
@@ -418,6 +419,7 @@ impl AppController {
             recent_agent: RefCell::new(None),
             shell_override: RefCell::new(shell_override),
             default_menubar: Cell::new(true),
+            default_tab_hostnames: Cell::new(true),
             notifier: RefCell::new(CompositeNotifier::new(Rc::new(DBusNotifier))),
             session_path: RefCell::new(session::session_path()),
         })
@@ -2008,11 +2010,16 @@ impl AppController {
             }));
             entries.push((pid, engine));
         }
-        let (win_id, tab_id, first_pane) = self
-            .workspace
-            .borrow_mut()
-            .insert_window_with_grid(entries, self.default_menubar.get())
-            .expect("targets validated non-empty");
+        let (win_id, tab_id, first_pane) = {
+            let mut ws = self.workspace.borrow_mut();
+            let out = ws
+                .insert_window_with_grid(entries, self.default_menubar.get())
+                .expect("targets validated non-empty");
+            if let Some(w) = ws.window_mut(out.0) {
+                w.tab_hostnames_visible = self.default_tab_hostnames.get();
+            }
+            out
+        };
         self.ensure_ui_window(win_id);
         self.sync_ui_window(win_id);
         Ok((win_id, tab_id, first_pane))
@@ -3406,11 +3413,14 @@ impl AppController {
         let inherited_cwd = cwd.or_else(|| self.active_cwd(None, None));
         let pane_id = self.workspace.borrow_mut().reserve_pane_id();
         let engine = self.spawn_engine(pane_id, inherited_cwd, command)?;
-        let (win_id, tab_id) = self.workspace.borrow_mut().insert_window_with_pane(
-            pane_id,
-            engine,
-            self.default_menubar.get(),
-        );
+        let (win_id, tab_id) = {
+            let mut ws = self.workspace.borrow_mut();
+            let out = ws.insert_window_with_pane(pane_id, engine, self.default_menubar.get());
+            if let Some(w) = ws.window_mut(out.0) {
+                w.tab_hostnames_visible = self.default_tab_hostnames.get();
+            }
+            out
+        };
         self.ensure_ui_window(win_id);
         self.sync_ui_window(win_id);
         Ok((win_id, tab_id, pane_id))
@@ -3866,6 +3876,23 @@ impl AppController {
                     };
                     if let Some(vis) = next {
                         self.default_menubar.set(vis);
+                        self.sync_ui_window(win_id);
+                    }
+                }
+            }
+            ActionId::ToggleTabHostnames => {
+                if let Some(win_id) = active_win {
+                    let next = {
+                        let mut ws = self.workspace.borrow_mut();
+                        if let Some(w) = ws.window_mut(win_id) {
+                            w.tab_hostnames_visible = !w.tab_hostnames_visible;
+                            Some(w.tab_hostnames_visible)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(vis) = next {
+                        self.default_tab_hostnames.set(vis);
                         self.sync_ui_window(win_id);
                     }
                 }
