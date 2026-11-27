@@ -3489,6 +3489,29 @@ impl AppController {
         true
     }
 
+    /// Tears an entire tab out of a multi-tab window into a new top-level window
+    /// (used when dragging a tab outside all Mutiny windows or invoking Move to
+    /// New Window on a tab).
+    pub fn detach_tab(self: &Rc<Self>, tab_id: TabId) -> Result<WindowId, TopologyError> {
+        let src_win = self
+            .workspace
+            .borrow()
+            .windows()
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == tab_id))
+            .map(|w| w.id);
+        let new_win = self.workspace.borrow_mut().detach_tab(tab_id)?;
+        if let Some(old_win) = src_win {
+            self.reconcile_or_close_ui_window(old_win);
+        }
+        self.ensure_ui_window(new_win);
+        self.sync_ui_window(new_win);
+        if let Some(ui_win) = self.ui_windows.borrow().get(&new_win).cloned() {
+            ui_win.present();
+        }
+        Ok(new_win)
+    }
+
     pub fn close_pane(self: &Rc<Self>, pane_id: PaneId) {
         self.save_before_last_window_goes();
         let src_win = self.workspace.borrow().locate_pane(pane_id).map(|(w, _)| w);

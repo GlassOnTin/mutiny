@@ -731,6 +731,46 @@ impl Workspace {
         Ok(src_win_id)
     }
 
+    /// Tears an entire `TabModel` (including any split tree and ratios) out of
+    /// a multi-tab window into a brand-new top-level `WindowModel` without
+    /// restarting any shell. Refuses when `tab_id` is already the sole tab in
+    /// its window (`AlreadyStandaloneWindow`).
+    pub fn detach_tab(&mut self, tab_id: TabId) -> Result<WindowId, TopologyError> {
+        let Some((src_win_idx, src_tab_pos)) =
+            self.windows.iter().enumerate().find_map(|(wi, w)| {
+                w.tabs
+                    .iter()
+                    .position(|t| t.id == tab_id)
+                    .map(|ti| (wi, ti))
+            })
+        else {
+            return Err(TopologyError::TabNotFound(tab_id));
+        };
+        if self.windows[src_win_idx].quick || self.windows[src_win_idx].tabs.len() <= 1 {
+            let pid = self.windows[src_win_idx]
+                .tabs
+                .get(src_tab_pos)
+                .map_or(PaneId(0), |t| t.active_pane);
+            return Err(TopologyError::AlreadyStandaloneWindow(pid));
+        }
+        let menubar_visible = self.windows[src_win_idx].menubar_visible;
+        let moved_tab = self.windows[src_win_idx].tabs.remove(src_tab_pos);
+        if self.windows[src_win_idx].active_tab == tab_id {
+            let next_idx = src_tab_pos.min(self.windows[src_win_idx].tabs.len() - 1);
+            self.windows[src_win_idx].active_tab = self.windows[src_win_idx].tabs[next_idx].id;
+        }
+        let new_win_id = self.alloc_window_id();
+        self.windows.push(WindowModel {
+            id: new_win_id,
+            tabs: vec![moved_tab],
+            active_tab: tab_id,
+            menubar_visible,
+            quick: false,
+        });
+        self.active_window = Some(new_win_id);
+        Ok(new_win_id)
+    }
+
     pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<(WindowId, TabId), TopologyError> {
         let Some((win_id, tab_id)) = self.locate_pane(pane_id) else {
             return Err(TopologyError::PaneNotFound(pane_id));
@@ -1235,6 +1275,21 @@ mod tests {
             vec![t1, t3, t2]
         );
         assert_eq!(ws.window(w2).unwrap().active_tab, t2);
+
+        // 3. Tear `t1` (with its 2-pane split) back out into a brand-new window,
+        //    and verify tearing off the sole tab in that new window is refused.
+        let w3 = ws.detach_tab(t1).unwrap();
+        assert_ne!(w3, w2);
+        assert_eq!(ws.window(w3).unwrap().tabs.len(), 1);
+        assert_eq!(ws.window(w3).unwrap().tabs[0].id, t1);
+        assert_eq!(
+            ws.window(w3).unwrap().tabs[0].root.leaves(),
+            vec![p1, p1_split]
+        );
+        assert!(matches!(
+            ws.detach_tab(t1),
+            Err(TopologyError::AlreadyStandaloneWindow(_))
+        ));
     }
 
     #[test]

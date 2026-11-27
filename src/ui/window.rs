@@ -363,10 +363,16 @@ impl MutinyWindow {
                     Some(w) if w != win_for_detach => {
                         c.move_tab_to_window(dragged_tab, win_for_detach, None)
                     }
-                    Some(_) => match active_pane {
-                        Some(p) => c.detach_split(Some(p)).is_ok(),
-                        None => false,
-                    },
+                    Some(_) => {
+                        if c.detach_tab(dragged_tab).is_ok() {
+                            true
+                        } else {
+                            match active_pane {
+                                Some(p) => c.detach_split(Some(p)).is_ok(),
+                                None => false,
+                            }
+                        }
+                    }
                     None => false,
                 }
             });
@@ -795,14 +801,16 @@ impl MutinyWindow {
                         ctrl.close_tab(win_id, tab);
                     }
                     "detach-tab-target" => {
-                        let pane = ctrl
-                            .workspace
-                            .borrow()
-                            .window(win_id)
-                            .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
-                            .map(|t| t.active_pane);
-                        if let Some(pane) = pane {
-                            let _ = ctrl.detach_split(Some(pane));
+                        if ctrl.detach_tab(tab).is_err() {
+                            let pane = ctrl
+                                .workspace
+                                .borrow()
+                                .window(win_id)
+                                .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                                .map(|t| t.active_pane);
+                            if let Some(pane) = pane {
+                                let _ = ctrl.detach_split(Some(pane));
+                            }
                         }
                     }
                     "handoff-session-tab" => {
@@ -1169,13 +1177,10 @@ impl MutinyWindow {
                     }
                 }
             });
-            // Drag-to-reorder and cross-window drag-to-redock: the tab carries
-            // both an in-process GValue(u64) and a private Wayland/X11 MIME
-            // payload (`application/x-mutiny-tab`) so compositors negotiate
-            // cross-surface MOVE cleanly without exposing text/plain to other
-            // apps. Dropping on a tab in the same or another window moves it to
-            // that slot.
-            attach_tab_drag_source(&btn, tid);
+            // Drag-to-reorder, cross-window drag-to-redock, and drag-out tear-off:
+            // releasing outside any Mutiny drop target (`DragCancelReason::NoTarget`)
+            // tears the tab out into a new Mutiny window.
+            attach_tab_drag_source(&btn, tid, &ctrl);
             {
                 let ctrl_drop = Rc::downgrade(&ctrl);
                 let win_for_drop = self.inner.window_id;
@@ -3834,7 +3839,7 @@ fn attach_escape_to_close(dialog: &gtk4::Window) {
 
 const TAB_DND_MIME: &str = "application/x-mutiny-tab";
 
-fn attach_tab_drag_source(btn: &gtk4::Button, tid: TabId) {
+fn attach_tab_drag_source(btn: &gtk4::Button, tid: TabId, ctrl: &Rc<AppController>) {
     let drag = gtk4::DragSource::new();
     drag.set_actions(gdk::DragAction::MOVE);
     let dragged_id = tid.0;
@@ -3853,6 +3858,34 @@ fn attach_tab_drag_source(btn: &gtk4::Button, tid: TabId) {
     drag.connect_drag_begin(move |src, _| {
         let paintable = gtk4::WidgetPaintable::new(Some(&btn_for_icon));
         src.set_icon(Some(&paintable), 12, 12);
+    });
+    // Tear-off: releasing the dragged tab outside all Mutiny drop targets fires
+    // `DragCancelReason::NoTarget` (pressing Escape fires `UserCancelled`, which
+    // returns `false` and cancels without detaching). Deferring `detach_tab` onto
+    // an idle callback lets GTK finish unwinding `drag-cancel` / `drag-end` on
+    // `btn` before `rebuild_from_model` replaces the source tab strip.
+    let ctrl_cancel = Rc::downgrade(ctrl);
+    drag.connect_drag_cancel(move |_, _, reason| {
+        if reason != gdk::DragCancelReason::NoTarget {
+            return false;
+        }
+        let Some(c) = ctrl_cancel.upgrade() else {
+            return false;
+        };
+        let can_tear_off = c
+            .workspace
+            .borrow()
+            .windows()
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| t.id == tid))
+            .is_some_and(|w| !w.quick && w.tabs.len() > 1);
+        if !can_tear_off {
+            return false;
+        }
+        glib::idle_add_local_once(move || {
+            let _ = c.detach_tab(tid);
+        });
+        true
     });
     btn.add_controller(drag);
 }

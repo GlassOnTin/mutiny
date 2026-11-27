@@ -193,5 +193,14 @@ fn drag_operations_work_through_the_controller() {
     assert_eq!(order(), vec![t3, detached.1, t1, t2]);
     assert!(ctrl.workspace.borrow().pane(p2).is_some());
 
+    // Drag-out tear-off (`DragCancelReason::NoTarget` -> `detach_tab`): tears an
+    // entire tab out of a multi-tab window into a fresh window, and refuses if
+    // already the sole tab in that window.
+    let torn_win = ctrl.detach_tab(detached.1).expect("tear off tab");
+    assert_ne!(torn_win, w);
+    assert_eq!(ctrl.workspace.borrow().windows().len(), before + 1);
+    assert_eq!(order(), vec![t3, t1, t2]);
+    assert!(ctrl.detach_tab(detached.1).is_err());
+
     let _ = std::fs::remove_dir_all(&dir);
 }
