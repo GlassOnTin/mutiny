@@ -194,6 +194,44 @@ impl MutinyWindow {
                 c.move_tab_to_window(dragged_tab, win_for_chrome_drop, None)
             });
         }
+        {
+            // Allow `Ctrl+Scroll` directly over the session tab strip too, while
+            // leaving plain vertical wheel events alone so wrapped tabs scroll.
+            let tab_zoom_scroll =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            tab_zoom_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let ctrl_zoom = Rc::downgrade(&controller);
+            let win_for_zoom = window_id;
+            let acc = Rc::new(Cell::new(0.0f64));
+            tab_zoom_scroll.connect_scroll(move |sc, _dx, dy| {
+                let ctrl_held = sc
+                    .current_event()
+                    .is_some_and(|e| e.modifier_state().contains(gdk::ModifierType::CONTROL_MASK));
+                if !ctrl_held {
+                    acc.set(0.0);
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(c) = ctrl_zoom.upgrade() {
+                    let raw = -dy;
+                    if raw != 0.0 {
+                        let prev = acc.get();
+                        let base = if (prev > 0.0 && raw < 0.0) || (prev < 0.0 && raw > 0.0) {
+                            0.0
+                        } else {
+                            prev
+                        };
+                        let total = base + raw;
+                        let steps = total.trunc() as i32;
+                        acc.set(total - f64::from(steps));
+                        if steps != 0 {
+                            c.zoom_window(win_for_zoom, steps);
+                        }
+                    }
+                }
+                glib::Propagation::Stop
+            });
+            chrome_bar.add_controller(tab_zoom_scroll);
+        }
 
         // Symmetric inbound `initialize` tap-to-pair bar
         let pairing_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -1094,7 +1132,34 @@ impl MutinyWindow {
         for view in views {
             view.refresh_font();
         }
+        self.refresh_tab_strip_scale();
         self.apply_tab_strip_height_cap();
+    }
+
+    /// Scales session tab title/subtitle Pango font sizes and button padding in
+    /// proportion to this window's effective terminal font size (`config.font.size`
+    /// plus any `Ctrl+Scroll` zoom offset), so zooming out packs more tabs per row
+    /// and zooming in keeps tab labels legible.
+    fn refresh_tab_strip_scale(&self) {
+        let Some(ctrl) = self.inner.controller.upgrade() else {
+            return;
+        };
+        ensure_compact_toolbar_css();
+        let term_pt = ctrl.effective_font_size_for_window(Some(self.inner.window_id));
+        let gap = if term_pt <= 9 {
+            2
+        } else if term_pt >= 15 {
+            6
+        } else {
+            4
+        };
+        self.inner.tab_buttons_box.set_row_spacing(gap);
+        self.inner.tab_buttons_box.set_column_spacing(gap);
+        for (_, btn, title_label, sub_label) in self.inner.tab_buttons.borrow().iter() {
+            apply_session_tab_scale(btn, title_label, sub_label, term_pt);
+        }
+        self.inner.tab_buttons_box.queue_resize();
+        self.inner.tab_scroller.queue_resize();
     }
 
     /// Applies the configured height cap to the wrapping strip.
@@ -1245,6 +1310,7 @@ impl MutinyWindow {
                 .push((tid, btn, title_label, sub_label));
         }
 
+        self.refresh_tab_strip_scale();
         self.apply_tab_strip_height_cap();
         self.scroll_active_tab_into_view();
         self.sync_banners(&ctrl);
@@ -3947,8 +4013,8 @@ where
     widget.add_controller(target);
 }
 
-/// Tight padding for the glyph-only toolbar buttons and subtle drop-target
-/// highlight when dragging tabs within or across windows.
+/// Tight padding for the glyph-only toolbar buttons, scalable session tab
+/// buttons, and subtle drop-target highlight when dragging tabs.
 fn ensure_compact_toolbar_css() {
     use std::cell::Cell;
     thread_local! { static INSTALLED: Cell<bool> = const { Cell::new(false) }; }
@@ -3962,6 +4028,11 @@ fn ensure_compact_toolbar_css() {
     provider.load_from_string(
         "button.compact-toolbar { padding-left: 6px; padding-right: 6px; \
          padding-top: 2px; padding-bottom: 2px; min-width: 0; } \
+         button.session-tab { min-width: 0; min-height: 0; } \
+         button.session-tab-compact { padding-left: 4px; padding-right: 4px; \
+         padding-top: 1px; padding-bottom: 1px; } \
+         button.session-tab-large { padding-left: 10px; padding-right: 10px; \
+         padding-top: 4px; padding-bottom: 4px; } \
          label.tab-subtitle { font-size: 0.82em; } \
          *:drop(active) { outline: 1px solid @theme_selected_bg_color; outline-offset: -1px; }",
     );
@@ -3971,6 +4042,41 @@ fn ensure_compact_toolbar_css() {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
     INSTALLED.set(true);
+}
+
+fn apply_session_tab_scale(
+    btn: &gtk4::Button,
+    title_label: &gtk4::Label,
+    sub_label: &gtk4::Label,
+    term_font_pt: u32,
+) {
+    let term_pt = f64::from(term_font_pt);
+    let title_pt = (term_pt * (10.0 / 11.0)).clamp(5.5, 26.0);
+    let sub_pt = (title_pt * 0.80).clamp(4.5, 20.0);
+
+    let title_attrs = gtk4::pango::AttrList::new();
+    title_attrs.insert(gtk4::pango::AttrSize::new(
+        (title_pt * f64::from(gtk4::pango::SCALE)).round() as i32,
+    ));
+    title_label.set_attributes(Some(&title_attrs));
+
+    let sub_attrs = gtk4::pango::AttrList::new();
+    sub_attrs.insert(gtk4::pango::AttrSize::new(
+        (sub_pt * f64::from(gtk4::pango::SCALE)).round() as i32,
+    ));
+    sub_label.set_attributes(Some(&sub_attrs));
+
+    btn.add_css_class("session-tab");
+    if term_font_pt <= 9 {
+        btn.add_css_class("session-tab-compact");
+        btn.remove_css_class("session-tab-large");
+    } else if term_font_pt >= 15 {
+        btn.add_css_class("session-tab-large");
+        btn.remove_css_class("session-tab-compact");
+    } else {
+        btn.remove_css_class("session-tab-compact");
+        btn.remove_css_class("session-tab-large");
+    }
 }
 
 fn make_action_button(label: &str, action_name: &str, tooltip: &str) -> gtk4::Button {

@@ -183,6 +183,49 @@ fn many_tabs_wrap_without_stretching_the_window() {
         "no tab may be unlabelled: {labels:?}"
     );
 
+    // Session tab labels and padding scale with the window's terminal font size:
+    // zooming out shrinks individual tab width and total strip height (packing
+    // more tabs per row), zooming in widens them, and reset restores baseline.
+    let base_tab_w = window.widest_tab_minimum_width();
+    let base_content_h = window.tab_strip_content_height();
+    ctrl.zoom_window(w, -4);
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        settle(&ctrl, 5);
+    }
+    let zoomed_out_tab_w = window.widest_tab_minimum_width();
+    let zoomed_out_content_h = window.tab_strip_content_height();
+    assert!(
+        zoomed_out_tab_w < base_tab_w,
+        "zooming out must shrink session tab width: {base_tab_w} -> {zoomed_out_tab_w}"
+    );
+    assert!(
+        zoomed_out_content_h < base_content_h,
+        "zooming out must reduce wrapped tab strip content height: {base_content_h} -> {zoomed_out_content_h}"
+    );
+
+    ctrl.zoom_window(w, 12);
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        settle(&ctrl, 5);
+    }
+    let zoomed_in_tab_w = window.widest_tab_minimum_width();
+    assert!(
+        zoomed_in_tab_w > base_tab_w,
+        "zooming in must grow session tab width: {base_tab_w} -> {zoomed_in_tab_w}"
+    );
+
+    ctrl.reset_window_zoom(w);
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        settle(&ctrl, 5);
+    }
+    assert_eq!(
+        window.widest_tab_minimum_width(),
+        base_tab_w,
+        "resetting zoom must restore baseline session tab width"
+    );
+
     // Removing tabs must not leave the window stretched either.
     // Closing a tab's last pane removes the tab, which is the only close path.
     let panes: Vec<mutiny::topology::PaneId> = {
