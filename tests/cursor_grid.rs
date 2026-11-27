@@ -36,7 +36,7 @@ fn glyphs_and_cursor_land_exactly_on_the_cell_grid() {
         dir.join("config.toml"),
         Overrides::default(),
     );
-    let (_w, _t, pid) = ctrl.create_window(None).expect("pane");
+    let (w, _t, pid) = ctrl.create_window(None).expect("pane");
     let view = TerminalView::new(pid, &ctrl);
     view.size_allocate(&gtk4::gdk::Rectangle::new(0, 0, 900, 600), -1);
     while gtk4::glib::MainContext::default().iteration(false) {}
@@ -166,6 +166,66 @@ fn glyphs_and_cursor_land_exactly_on_the_cell_grid() {
             "wide glyph at row {row} col {col} off-grid: {x} vs {expected}"
         );
     }
+
+    // Per-window transient zoom (`Ctrl+Scroll` / `Ctrl+0`):
+    // 1. Zooming in (+8 pt) grows cell metrics, shrinks grid cols/rows to reflow
+    //    within the 900x600 viewport, keeps glyphs aligned to the zoomed cell
+    //    grid, and leaves `config.font_size` untouched.
+    let base_font_size = ctrl.config_ref().font_size;
+    let (base_cw, base_ch) = view.cell_size();
+    let (base_cols, base_rows) = {
+        let ws = ctrl.workspace.borrow();
+        let s = ws.pane(pid).unwrap().size();
+        (s.cols, s.rows)
+    };
+    assert_eq!(ctrl.zoom_pane_window(pid, 8), Some(base_font_size + 8));
+    assert_eq!(ctrl.config_ref().font_size, base_font_size);
+    view.refresh_font();
+    let (zoom_cw, zoom_ch) = view.cell_size();
+    assert!(
+        zoom_cw > base_cw && zoom_ch > base_ch,
+        "zooming in must grow cell size: ({base_cw}, {base_ch}) -> ({zoom_cw}, {zoom_ch})"
+    );
+    let (zoom_cols, zoom_rows) = {
+        let ws = ctrl.workspace.borrow();
+        let s = ws.pane(pid).unwrap().size();
+        (s.cols, s.rows)
+    };
+    assert!(
+        zoom_cols < base_cols && zoom_rows < base_rows,
+        "zooming in must reflow grid to fewer cols/rows: ({base_cols}x{base_rows}) -> ({zoom_cols}x{zoom_rows})"
+    );
+    view.record_glyph_positions(true);
+    render(&view);
+    for (row, col, x) in view.glyph_positions() {
+        let expected = padding + (col as f32) * zoom_cw;
+        assert!(
+            (x - expected).abs() < 0.01,
+            "zoomed glyph at row {row} col {col} off-grid: {x} vs {expected}"
+        );
+    }
+
+    // 2. Clamping at 72 pt and 6 pt has no dead-zone unwind on reversal.
+    assert_eq!(ctrl.zoom_window(w, 200), 72);
+    assert_eq!(ctrl.zoom_window(w, -1), 71);
+    assert_eq!(ctrl.zoom_window(w, -200), 6);
+    view.refresh_font();
+    let (min_cw, min_ch) = view.cell_size();
+    assert!(
+        min_cw < base_cw && min_ch < base_ch,
+        "zooming out to 6 pt must shrink cell metrics below baseline: ({min_cw}, {min_ch}) vs ({base_cw}, {base_ch})"
+    );
+
+    // 3. Reset (`Ctrl+0`) restores exact baseline font size, cell metrics, and grid.
+    assert_eq!(ctrl.reset_window_zoom(w), base_font_size);
+    view.refresh_font();
+    assert_eq!(view.cell_size(), (base_cw, base_ch));
+    let (reset_cols, reset_rows) = {
+        let ws = ctrl.workspace.borrow();
+        let s = ws.pane(pid).unwrap().size();
+        (s.cols, s.rows)
+    };
+    assert_eq!((reset_cols, reset_rows), (base_cols, base_rows));
 
     ctrl.shutdown_ipc();
     let _ = std::fs::remove_dir_all(&dir);

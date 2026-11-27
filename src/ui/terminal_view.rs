@@ -40,6 +40,9 @@ mod imp {
         pub drag_origin_px: Cell<(f64, f64)>,
         /// Last pointer position, so a wheel event knows which cell it is over.
         pub pointer_px: Cell<(f64, f64)>,
+        /// Fractional vertical wheel accumulator for `Ctrl+Scroll` zoom on
+        /// smooth/high-resolution wheels and touchpads.
+        pub zoom_scroll_acc: Cell<f64>,
         pub context_popover: RefCell<Option<gtk4::PopoverMenu>>,
         pub im_context: RefCell<Option<gtk4::IMMulticontext>>,
         /// In-progress composition text, drawn at the cursor until committed.
@@ -121,29 +124,44 @@ impl TerminalView {
         view
     }
 
-    /// Rebuilds the Pango font and cell metrics from the config store. Called
-    /// at construction and again on live reload, so a font change takes effect
-    /// without recreating the pane.
+    /// Rebuilds the Pango font and cell metrics from the config store (plus any
+    /// per-window transient zoom offset). Called at construction, on live reload,
+    /// and on `Ctrl+Scroll` / `Ctrl+0` zoom so font changes reflow without
+    /// recreating the pane.
     pub fn refresh_font(&self) {
         let Some(ctrl) = self.upgrade_controller() else {
             return;
         };
-        let desc = pango::FontDescription::from_string(&ctrl.config_ref().font_description);
+        let win_id = self
+            .pane_id()
+            .and_then(|pid| ctrl.workspace.borrow().locate_pane(pid).map(|(w, _)| w));
+        let desc = pango::FontDescription::from_string(
+            &ctrl.effective_font_description_for_window(win_id),
+        );
         let ctx = self.pango_context();
         let metrics = ctx.metrics(Some(&desc), None);
         let cw = ((metrics.approximate_char_width() as f32) / (pango::SCALE as f32))
             .ceil()
-            .max(7.0);
+            .max(3.0);
         let ch = (((metrics.ascent() + metrics.descent()) as f32) / (pango::SCALE as f32))
             .ceil()
-            .max(14.0);
+            .max(6.0);
         self.imp().cell_w.set(cw);
         self.imp().cell_h.set(ch);
         *self.imp().font_desc.borrow_mut() = Some(desc);
+        // Force cached Pango glyph layouts and row render nodes to rebuild at
+        // the new font size even if two adjacent point sizes share ceil() metrics.
+        self.imp().cache_key.borrow_mut().take();
+        self.imp().layout_cache.borrow_mut().clear();
+        self.imp().row_cache.borrow_mut().clear();
         // Cell size changed, so the grid must be recomputed and the PTY resized.
         self.recompute_grid_dimensions(self.width(), self.height());
         self.update_im_cursor_location();
         self.queue_draw();
+    }
+
+    pub fn cell_size(&self) -> (f32, f32) {
+        (self.imp().cell_w.get(), self.imp().cell_h.get())
     }
 
     pub fn pane_id(&self) -> Option<PaneId> {
@@ -499,11 +517,35 @@ impl TerminalView {
             let Some(view) = view_weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            let shift = controller
+            let mods = controller
                 .current_event()
-                .map(|e| e.modifier_state().contains(gdk::ModifierType::SHIFT_MASK))
-                .unwrap_or(false);
+                .map(|e| e.modifier_state())
+                .unwrap_or_else(gdk::ModifierType::empty);
+            let ctrl_held = mods.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
             if let (Some(pid), Some(ctrl)) = (view.pane_id(), view.upgrade_controller()) {
+                if ctrl_held {
+                    // `dy < 0` is wheel-up (zoom in); `dy > 0` is wheel-down (zoom out).
+                    // Accumulate fractional deltas so both discrete notches (`±1.0`)
+                    // and smooth/high-res wheels step 1 pt per whole unit.
+                    let raw = -dy;
+                    if raw != 0.0 {
+                        let prev = view.imp().zoom_scroll_acc.get();
+                        let base = if (prev > 0.0 && raw < 0.0) || (prev < 0.0 && raw > 0.0) {
+                            0.0
+                        } else {
+                            prev
+                        };
+                        let total = base + raw;
+                        let steps = total.trunc() as i32;
+                        view.imp().zoom_scroll_acc.set(total - f64::from(steps));
+                        if steps != 0 {
+                            let _ = ctrl.zoom_pane_window(pid, steps);
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
+                view.imp().zoom_scroll_acc.set(0.0);
                 let (px, py) = view.imp().pointer_px.get();
                 let (col, row) = view.px_to_cell(px, py);
                 let mut ws = ctrl.workspace.borrow_mut();
@@ -536,6 +578,20 @@ impl TerminalView {
         let shift_mod = state.contains(gdk::ModifierType::SHIFT_MASK);
         let alt_mod = state.contains(gdk::ModifierType::ALT_MASK);
         let super_mod = state.contains(gdk::ModifierType::SUPER_MASK);
+
+        // `Ctrl+0` resets transient `Ctrl+Scroll` window zoom back to 100%
+        // (`config.font.size`) without colliding with any ASCII control code.
+        if ctrl_mod
+            && !shift_mod
+            && !alt_mod
+            && !super_mod
+            && matches!(keyval, gdk::Key::_0 | gdk::Key::KP_0)
+            && let (Some(pid), Some(ctrl)) = (self.pane_id(), self.upgrade_controller())
+            && let Some((win_id, _)) = ctrl.workspace.borrow().locate_pane(pid)
+        {
+            ctrl.reset_window_zoom(win_id);
+            return glib::Propagation::Stop;
+        }
 
         let Some(kind) = map_gdk_key(keyval) else {
             return glib::Propagation::Proceed;

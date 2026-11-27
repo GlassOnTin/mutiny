@@ -254,6 +254,9 @@ pub struct AppController {
     agent_mode: Cell<ConsentMode>,
     audit_path: RefCell<Option<PathBuf>>,
     config: RefCell<ResolvedConfig>,
+    /// Per-window transient zoom offsets in points (`Ctrl+Scroll` / `Ctrl+0`),
+    /// clamped with `config.font_size` to `6..=72` without rewriting `config.toml`.
+    window_zoom_pt: RefCell<HashMap<WindowId, i32>>,
     config_path: PathBuf,
     config_overrides: Overrides,
     config_mtime: Cell<Option<SystemTime>>,
@@ -399,6 +402,7 @@ impl AppController {
             agent_mode: Cell::new(ConsentMode::Ask),
             audit_path: RefCell::new(Some(audit_path)),
             config: RefCell::new(resolved),
+            window_zoom_pt: RefCell::new(HashMap::new()),
             config_path,
             config_overrides: overrides,
             config_mtime: Cell::new(mtime),
@@ -523,6 +527,78 @@ impl AppController {
     /// Zero-copy read of the effective config, for the renderer.
     pub fn config_ref(&self) -> std::cell::Ref<'_, ResolvedConfig> {
         self.config.borrow()
+    }
+
+    pub fn effective_font_size_for_window(&self, win_id: Option<WindowId>) -> u32 {
+        let base = self.config.borrow().font_size as i32;
+        let delta = win_id
+            .and_then(|w| self.window_zoom_pt.borrow().get(&w).copied())
+            .unwrap_or(0);
+        (base + delta).clamp(6, 72) as u32
+    }
+
+    pub fn effective_font_description_for_window(&self, win_id: Option<WindowId>) -> String {
+        let family = self.config.borrow().font_family.clone();
+        let size = self.effective_font_size_for_window(win_id);
+        format!("{family} {size}")
+    }
+
+    /// Steps `win_id`'s font size by `step_pt` points (clamped to `6..=72`) and
+    /// refreshes every live pane in that window so Pango metrics, cell dimensions,
+    /// and PTY grid sizes (`SIGWINCH`) reflow immediately.
+    pub fn zoom_window(self: &Rc<Self>, win_id: WindowId, step_pt: i32) -> u32 {
+        let base = self.config.borrow().font_size as i32;
+        let cur = self.effective_font_size_for_window(Some(win_id)) as i32;
+        let next = (cur + step_pt).clamp(6, 72);
+        let new_delta = next - base;
+        if new_delta == 0 {
+            self.window_zoom_pt.borrow_mut().remove(&win_id);
+        } else {
+            self.window_zoom_pt.borrow_mut().insert(win_id, new_delta);
+        }
+        if next != cur {
+            if let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned() {
+                ui_win.refresh_from_config();
+            }
+            let panes: Vec<PaneId> = self
+                .workspace
+                .borrow()
+                .window(win_id)
+                .map(|w| w.tabs.iter().flat_map(|t| t.root.leaves()).collect())
+                .unwrap_or_default();
+            for pid in panes {
+                self.queue_redraw_pane(pid);
+            }
+        }
+        next as u32
+    }
+
+    pub fn reset_window_zoom(self: &Rc<Self>, win_id: WindowId) -> u32 {
+        let had_zoom = self.window_zoom_pt.borrow_mut().remove(&win_id).is_some();
+        if had_zoom {
+            if let Some(ui_win) = self.ui_windows.borrow().get(&win_id).cloned() {
+                ui_win.refresh_from_config();
+            }
+            let panes: Vec<PaneId> = self
+                .workspace
+                .borrow()
+                .window(win_id)
+                .map(|w| w.tabs.iter().flat_map(|t| t.root.leaves()).collect())
+                .unwrap_or_default();
+            for pid in panes {
+                self.queue_redraw_pane(pid);
+            }
+        }
+        self.effective_font_size_for_window(Some(win_id))
+    }
+
+    pub fn zoom_pane_window(self: &Rc<Self>, pane_id: PaneId, step_pt: i32) -> Option<u32> {
+        let win_id = self
+            .workspace
+            .borrow()
+            .locate_pane(pane_id)
+            .map(|(w, _)| w)?;
+        Some(self.zoom_window(win_id, step_pt))
     }
 
     pub fn config_path(&self) -> &Path {
@@ -3413,6 +3489,9 @@ impl AppController {
         let (new_win, new_tab) = self.workspace.borrow_mut().detach_split(pane_id)?;
 
         if let Some(old_win) = src_win {
+            if let Some(&delta) = self.window_zoom_pt.borrow().get(&old_win) {
+                self.window_zoom_pt.borrow_mut().insert(new_win, delta);
+            }
             self.reconcile_or_close_ui_window(old_win);
         }
         self.ensure_ui_window(new_win);
@@ -3502,6 +3581,9 @@ impl AppController {
             .map(|w| w.id);
         let new_win = self.workspace.borrow_mut().detach_tab(tab_id)?;
         if let Some(old_win) = src_win {
+            if let Some(&delta) = self.window_zoom_pt.borrow().get(&old_win) {
+                self.window_zoom_pt.borrow_mut().insert(new_win, delta);
+            }
             self.reconcile_or_close_ui_window(old_win);
         }
         self.ensure_ui_window(new_win);
@@ -3958,6 +4040,7 @@ impl AppController {
         if still_exists {
             self.sync_ui_window(win_id);
         } else if let Some(ui_win) = self.ui_windows.borrow_mut().remove(&win_id) {
+            self.window_zoom_pt.borrow_mut().remove(&win_id);
             self.sessions_menus
                 .borrow_mut()
                 .retain(|(w, _)| *w != Some(win_id));
